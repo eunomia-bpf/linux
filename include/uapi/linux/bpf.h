@@ -1456,6 +1456,40 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+/* BPF JIT directive blob FD is passed in BPF_PROG_LOAD */
+	BPF_F_JIT_DIRECTIVES_FD	= (1U << 20),
+};
+
+enum bpf_jit_directives_load_flags {
+	BPF_F_JIT_DIRECTIVES_LOG = (1U << 0),
+};
+
+enum bpf_jit_directive_kind {
+	BPF_JIT_DIRECTIVE_WIDE_LOAD = 1,
+};
+
+#define BPF_JIT_DIRECTIVE_MAGIC		0x4a445243
+#define BPF_JIT_DIRECTIVE_VERSION	1
+
+struct bpf_jit_directive_hdr {
+	__u32	magic;
+	__u16	version;
+	__u16	rec_size;
+	__u32	rec_cnt;
+	__u32	insn_cnt;
+};
+
+struct bpf_jit_directive_rec {
+	__u16	kind;
+	__u16	reserved;
+	__u32	site_idx;
+	__u64	payload;
+};
+
+struct bpf_jit_directive_wide_load {
+	__u32	width;
+	__u32	reserved;
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -1647,6 +1681,9 @@ union bpf_attr {
 		 * verification.
 		 */
 		__s32		keyring_id;
+		/* Sealed memfd with one BPF JIT directive blob. */
+		__s32		jit_directives_fd;
+		__u32		jit_directives_flags;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */

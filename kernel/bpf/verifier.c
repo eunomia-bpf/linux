@@ -27,6 +27,7 @@
 #include <linux/module.h>
 #include <linux/cpumask.h>
 #include <linux/bpf_mem_alloc.h>
+#include <linux/bpf_jit_directives.h>
 #include <net/xdp.h>
 #include <linux/trace_events.h>
 #include <linux/kallsyms.h>
@@ -22250,6 +22251,287 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
 	return 0;
 }
 
+#define BPF_JIT_WIDE_LOAD_MAX_WIDTH		8
+#define BPF_JIT_WIDE_LOAD_PATTERN_LEN(width)	((width) * 3 - 2)
+
+struct bpf_jit_wide_load_expr {
+	u8 lane_mask;
+	u8 base_reg;
+	s16 mem_off[BPF_JIT_WIDE_LOAD_MAX_WIDTH];
+	bool valid;
+};
+
+static int bpf_jit_directive_find_site(const struct bpf_verifier_env *env,
+				       u32 site_idx)
+{
+	int i;
+
+	for (i = 0; i < env->prog->len; i++) {
+		if (env->insn_aux_data[i].orig_idx == site_idx &&
+		    env->prog->insnsi[i].code == (BPF_LDX | BPF_MEM | BPF_B))
+			return i;
+	}
+
+	return -ENOENT;
+}
+
+static bool bpf_jit_is_direct_byte_load(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_LDX | BPF_MEM | BPF_B) &&
+	       insn->dst_reg != insn->src_reg &&
+	       insn->imm == 0;
+}
+
+static bool bpf_jit_is_lsh_imm(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
+	       insn->src_reg == 0 &&
+	       insn->off == 0;
+}
+
+static bool bpf_jit_is_or_reg(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_OR | BPF_X) &&
+	       insn->dst_reg != insn->src_reg &&
+	       insn->off == 0 &&
+	       insn->imm == 0;
+}
+
+static bool bpf_jit_wide_load_ptr_ok(enum bpf_reg_type ptr_type)
+{
+	switch (base_type(ptr_type)) {
+	case PTR_TO_STACK:
+	case PTR_TO_MAP_VALUE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool
+bpf_jit_wide_load_expr_from_insn(struct bpf_jit_wide_load_expr *expr,
+				 const struct bpf_insn *insn)
+{
+	memset(expr, 0, sizeof(*expr));
+	expr->valid = true;
+	expr->base_reg = insn->src_reg;
+	expr->lane_mask = BIT(0);
+	expr->mem_off[0] = insn->off;
+	return true;
+}
+
+static bool
+bpf_jit_wide_load_expr_shift(struct bpf_jit_wide_load_expr *expr,
+			     const struct bpf_insn *insn, u8 width)
+{
+	u8 shift_bytes;
+	s16 off;
+
+	if (!expr->valid || expr->lane_mask != BIT(0) || !bpf_jit_is_lsh_imm(insn))
+		return false;
+	if (insn->imm <= 0 || insn->imm % 8)
+		return false;
+
+	shift_bytes = insn->imm / 8;
+	if (shift_bytes >= width)
+		return false;
+
+	off = expr->mem_off[0];
+	expr->lane_mask = BIT(shift_bytes);
+	expr->mem_off[shift_bytes] = off;
+	return true;
+}
+
+static bool
+bpf_jit_wide_load_expr_merge(struct bpf_jit_wide_load_expr *dst,
+			     const struct bpf_jit_wide_load_expr *src, u8 width)
+{
+	u8 merged_mask;
+	int lane;
+
+	if (!dst->valid || !src->valid || dst->base_reg != src->base_reg)
+		return false;
+	if (dst->lane_mask & src->lane_mask)
+		return false;
+
+	merged_mask = dst->lane_mask | src->lane_mask;
+	if (merged_mask & ~GENMASK(width - 1, 0))
+		return false;
+
+	for (lane = 0; lane < width; lane++) {
+		if (!(src->lane_mask & BIT(lane)))
+			continue;
+		dst->mem_off[lane] = src->mem_off[lane];
+	}
+	dst->lane_mask = merged_mask;
+	return true;
+}
+
+static bool
+bpf_jit_wide_load_expr_complete(const struct bpf_jit_wide_load_expr *expr, u8 width,
+				u8 *base_reg, s16 *base_off)
+{
+	s16 off;
+	int lane;
+
+	if (!expr->valid || expr->lane_mask != GENMASK(width - 1, 0))
+		return false;
+
+	off = expr->mem_off[0];
+	for (lane = 1; lane < width; lane++) {
+		if (expr->mem_off[lane] != off + lane)
+			return false;
+	}
+
+	*base_reg = expr->base_reg;
+	*base_off = off;
+	return true;
+}
+
+static bool
+bpf_jit_wide_load_align_ok(const struct bpf_verifier_env *env,
+			   enum bpf_reg_type ptr_type, u8 base_reg, s16 off, u8 width)
+{
+	switch (base_type(ptr_type)) {
+	case PTR_TO_STACK:
+		return base_reg == BPF_REG_FP && IS_ALIGNED((long)off, width);
+	case PTR_TO_MAP_VALUE:
+		/* We don't retain reg->off/var_off facts yet, so only adopt
+		 * widened map-value loads on relaxed-alignment targets.
+		 */
+		return !env->strict_alignment;
+	default:
+		return false;
+	}
+}
+
+static int
+bpf_jit_match_wide_load_pattern(struct bpf_verifier_env *env, int idx, u8 width,
+				struct bpf_insn *wide_load)
+{
+	struct bpf_jit_wide_load_expr exprs[MAX_BPF_REG] = {};
+	struct bpf_insn *insns = env->prog->insnsi;
+	enum bpf_reg_type ptr_type = NOT_INIT;
+	u16 live_after = 0, def_mask = 0;
+	u8 dst_reg = 0, base_reg = 0;
+	s16 base_off = 0;
+	int end = -1, pos;
+
+	for (pos = idx;
+	     pos < env->prog->len && pos < idx + BPF_JIT_WIDE_LOAD_PATTERN_LEN(width);
+	     pos++) {
+		const struct bpf_insn *insn = &insns[pos];
+
+		if (pos > idx && env->insn_aux_data[pos].jmp_point)
+			return 0;
+
+		if (bpf_jit_is_direct_byte_load(insn)) {
+			enum bpf_reg_type load_ptr_type = env->insn_aux_data[pos].ptr_type;
+
+			if (!bpf_jit_wide_load_ptr_ok(load_ptr_type))
+				return 0;
+			if (pos == idx)
+				ptr_type = load_ptr_type;
+			else if (base_type(load_ptr_type) != base_type(ptr_type))
+				return 0;
+
+			bpf_jit_wide_load_expr_from_insn(&exprs[insn->dst_reg], insn);
+			def_mask |= BIT(insn->dst_reg);
+			continue;
+		}
+
+		if (bpf_jit_is_lsh_imm(insn)) {
+			if (!bpf_jit_wide_load_expr_shift(&exprs[insn->dst_reg], insn, width))
+				return 0;
+			def_mask |= BIT(insn->dst_reg);
+			continue;
+		}
+
+		if (bpf_jit_is_or_reg(insn)) {
+			if (!bpf_jit_wide_load_expr_merge(&exprs[insn->dst_reg],
+							  &exprs[insn->src_reg], width))
+				return 0;
+			def_mask |= BIT(insn->dst_reg);
+			if (bpf_jit_wide_load_expr_complete(&exprs[insn->dst_reg], width,
+							    &base_reg, &base_off)) {
+				dst_reg = insn->dst_reg;
+				end = pos;
+				break;
+			}
+			continue;
+		}
+
+		return 0;
+	}
+
+	if (end < 0 || !bpf_jit_wide_load_align_ok(env, ptr_type, base_reg, base_off, width))
+		return 0;
+
+	if (end + 1 < env->prog->len)
+		live_after = env->insn_aux_data[end + 1].live_regs_before;
+	if (live_after & (def_mask & ~BIT(dst_reg)))
+		return 0;
+
+	*wide_load = width == 4 ? BPF_LDX_MEM(BPF_W, dst_reg, base_reg, base_off)
+				: BPF_LDX_MEM(BPF_DW, dst_reg, base_reg, base_off);
+	return end - idx + 1;
+}
+
+static int bpf_jit_apply_wide_load_directive(struct bpf_verifier_env *env,
+					     struct bpf_jit_directive *dir)
+{
+	const struct bpf_jit_directive_wide_load *payload;
+	struct bpf_insn *insns = env->prog->insnsi;
+	struct bpf_insn wide_load;
+	int idx, pattern_len, err;
+
+	payload = (const struct bpf_jit_directive_wide_load *)&dir->payload;
+	if ((payload->width != 4 && payload->width != 8) || payload->reserved)
+		return 0;
+
+	idx = bpf_jit_directive_find_site(env, dir->site_idx);
+	if (idx < 0)
+		return 0;
+
+	pattern_len = bpf_jit_match_wide_load_pattern(env, idx, payload->width, &wide_load);
+	if (!pattern_len)
+		return 0;
+
+	insns[idx] = wide_load;
+	env->insn_aux_data[idx].zext_dst = payload->width == 4;
+
+	err = verifier_remove_insns(env, idx + 1, pattern_len - 1);
+	if (err)
+		return err;
+
+	env->prog->aux->jit_directives->applied_cnt++;
+	return 1;
+}
+
+int bpf_jit_directives_apply(struct bpf_verifier_env *env)
+{
+	struct bpf_jit_directive_state *state = env->prog->aux->jit_directives;
+	u32 i;
+	int ret;
+
+	if (!state)
+		return 0;
+
+	for (i = 0; i < state->rec_cnt; i++) {
+		switch (state->recs[i].kind) {
+		case BPF_JIT_DIRECTIVE_WIDE_LOAD:
+			ret = bpf_jit_apply_wide_load_directive(env, &state->recs[i]);
+			if (ret < 0)
+				return ret;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return 0;
+}
+
 /* The verifier does more data flow analysis than llvm and will not
  * explore branches that are dead at run time. Malicious programs can
  * have dead code too. Therefore replace all dead at-run-time code
@@ -26086,6 +26368,9 @@ skip_full_check:
 		if (ret == 0)
 			sanitize_dead_code(env);
 	}
+
+	if (ret == 0)
+		ret = bpf_jit_directives_apply(env);
 
 	if (ret == 0)
 		/* program is valid, convert *(u32*)(ctx + off) accesses */

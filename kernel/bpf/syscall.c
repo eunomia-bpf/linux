@@ -41,6 +41,7 @@
 #include <linux/overflow.h>
 #include <linux/cookie.h>
 #include <linux/verification.h>
+#include <linux/bpf_jit_directives.h>
 
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
@@ -2866,7 +2867,7 @@ static int bpf_prog_mark_insn_arrays_ready(struct bpf_prog *prog)
 }
 
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_LOAD_LAST_FIELD keyring_id
+#define BPF_PROG_LOAD_LAST_FIELD jit_directives_flags
 
 static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 {
@@ -2889,7 +2890,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 				 BPF_F_XDP_HAS_FRAGS |
 				 BPF_F_XDP_DEV_BOUND_ONLY |
 				 BPF_F_TEST_REG_INVARIANTS |
-				 BPF_F_TOKEN_FD))
+				 BPF_F_TOKEN_FD |
+				 BPF_F_JIT_DIRECTIVES_FD))
 		return -EINVAL;
 
 	bpf_prog_load_fixup_attach_type(attr);
@@ -3040,6 +3042,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	prog->jited = 0;
 
 	atomic64_set(&prog->aux->refcnt, 1);
+	if (attr->prog_flags & BPF_F_JIT_DIRECTIVES_FD)
+		prog->aux->jit_directives =
+			bpf_jit_directives_load(prog, attr->jit_directives_fd,
+						attr->jit_directives_flags);
 
 	if (bpf_prog_is_dev_bound(prog->aux)) {
 		err = bpf_prog_dev_bound_init(prog, attr);

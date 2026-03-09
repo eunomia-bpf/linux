@@ -10,6 +10,7 @@
 #include <linux/if_vlan.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_jit_directives.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
@@ -1661,6 +1662,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	void __percpu *priv_frame_ptr = NULL;
 	u64 arena_vm_start, user_vm_start;
 	void __percpu *priv_stack_ptr;
+	bool directive_rewrites;
 	int i, excnt = 0;
 	int ilen, proglen = 0;
 	u8 *prog = temp;
@@ -1676,6 +1678,8 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 	arena_vm_start = bpf_arena_get_kern_vm_start(bpf_prog->aux->arena);
 	user_vm_start = bpf_arena_get_user_vm_start(bpf_prog->aux->arena);
+	directive_rewrites = bpf_prog->aux->jit_directives &&
+			     bpf_prog->aux->jit_directives->applied_cnt;
 
 	detect_reg_usage(insn, insn_cnt, callee_regs_used);
 
@@ -2243,6 +2247,14 @@ populate_extable:
 		case BPF_LDX | BPF_PROBE_MEMSX | BPF_H:
 		case BPF_LDX | BPF_PROBE_MEMSX | BPF_W:
 			insn_off = insn->off;
+			if (directive_rewrites &&
+			    insn->code == (BPF_LDX | BPF_MEM | BPF_W)) {
+				/* Verifier-side wide_load rewrites intentionally
+				 * reuse the stock 32-bit load emitter here.
+				 */
+				emit_ldx(&prog, BPF_W, dst_reg, src_reg, insn_off);
+				break;
+			}
 
 			if (BPF_MODE(insn->code) == BPF_PROBE_MEM ||
 			    BPF_MODE(insn->code) == BPF_PROBE_MEMSX) {
