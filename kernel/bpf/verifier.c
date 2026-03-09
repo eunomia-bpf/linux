@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_jit_directives.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
@@ -21928,6 +21929,7 @@ static void adjust_insn_aux_data(struct bpf_verifier_env *env,
 {
 	struct bpf_insn_aux_data *data = env->insn_aux_data;
 	struct bpf_insn *insn = new_prog->insnsi;
+	unsigned int orig_idx = data[off].orig_idx;
 	u32 old_seen = data[off].seen;
 	u32 prog_len;
 	int i;
@@ -21947,6 +21949,7 @@ static void adjust_insn_aux_data(struct bpf_verifier_env *env,
 	memset(data + off, 0, sizeof(struct bpf_insn_aux_data) * (cnt - 1));
 	for (i = off; i < off + cnt - 1; i++) {
 		/* Expand insni[off]'s seen count to the patched range. */
+		data[i].orig_idx = orig_idx;
 		data[i].seen = old_seen;
 		data[i].zext_dst = insn_has_def32(insn + i);
 	}
@@ -26102,6 +26105,9 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
+
+	if (ret == 0)
+		ret = bpf_jit_directives_validate(env);
 
 	if (ret == 0)
 		ret = fixup_call_args(env);

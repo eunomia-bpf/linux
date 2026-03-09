@@ -59,6 +59,7 @@ struct bpf_token;
 struct user_namespace;
 struct super_block;
 struct inode;
+struct bpf_jit_directive_state;
 
 extern struct idr btf_idr;
 extern spinlock_t btf_idr_lock;
@@ -1707,6 +1708,7 @@ struct bpf_prog_aux {
 	struct bpf_prog **func;
 	struct bpf_prog_aux *main_prog_aux;
 	void *jit_data; /* JIT specific data. arch dependent */
+	struct bpf_jit_directive_state *jit_directives;
 	struct bpf_jit_poke_descriptor *poke_tab;
 	struct bpf_kfunc_desc_tab *kfunc_tab;
 	struct bpf_kfunc_btf_tab *kfunc_btf_tab;

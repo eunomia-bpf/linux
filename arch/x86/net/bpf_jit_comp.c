@@ -10,6 +10,7 @@
 #include <linux/if_vlan.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_jit_directives.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
@@ -1021,6 +1022,404 @@ static void emit_movsx_reg(u8 **pprog, int num_bits, bool is64, u32 dst_reg,
 	*pprog = prog;
 }
 
+static void maybe_emit_mod(u8 **pprog, u32 dst_reg, u32 src_reg, bool is64);
+static void maybe_emit_1mod(u8 **pprog, u32 reg, bool is64);
+
+static u32 jit_bpf_reg(u32 reg, bool use_priv_fp)
+{
+	if (use_priv_fp && reg == BPF_REG_FP)
+		return X86_REG_R9;
+
+	return reg;
+}
+
+static bool is_bpf_simple_mov(const struct bpf_insn *insn)
+{
+	u8 cls = BPF_CLASS(insn->code);
+
+	if ((cls != BPF_ALU && cls != BPF_ALU64) || BPF_OP(insn->code) != BPF_MOV)
+		return false;
+	if (insn->off != 0)
+		return false;
+
+	switch (BPF_SRC(insn->code)) {
+	case BPF_X:
+		return insn->imm == 0;
+	case BPF_K:
+		return insn->src_reg == 0;
+	default:
+		return false;
+	}
+}
+
+static bool is_bpf_cmov_cond_jump(const struct bpf_insn *insn)
+{
+	u8 cls = BPF_CLASS(insn->code);
+
+	if (cls != BPF_JMP && cls != BPF_JMP32)
+		return false;
+	if (BPF_SRC(insn->code) != BPF_X && BPF_SRC(insn->code) != BPF_K)
+		return false;
+
+	switch (BPF_OP(insn->code)) {
+	case BPF_JEQ:
+	case BPF_JNE:
+	case BPF_JGT:
+	case BPF_JLT:
+	case BPF_JGE:
+	case BPF_JLE:
+	case BPF_JSGT:
+	case BPF_JSLT:
+	case BPF_JSGE:
+	case BPF_JSLE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool bpf_mov_is_noop(const struct bpf_insn *insn)
+{
+	return BPF_SRC(insn->code) == BPF_X && insn->dst_reg == insn->src_reg;
+}
+
+static void emit_cmov_reg(u8 **pprog, u8 cmov_op, bool is64,
+			  u32 dst_reg, u32 src_reg)
+{
+	u8 *prog = *pprog;
+
+	/* CMOVcc encodes dst in ModRM.reg and src in ModRM.r/m. */
+	maybe_emit_mod(&prog, src_reg, dst_reg, is64);
+	EMIT3(0x0F, cmov_op, add_2reg(0xC0, src_reg, dst_reg));
+	*pprog = prog;
+}
+
+static int bpf_jmp_invert(u8 op, u8 *inv_op)
+{
+	switch (op) {
+	case BPF_JEQ:
+		*inv_op = BPF_JNE;
+		return 0;
+	case BPF_JNE:
+		*inv_op = BPF_JEQ;
+		return 0;
+	case BPF_JGT:
+		*inv_op = BPF_JLE;
+		return 0;
+	case BPF_JLT:
+		*inv_op = BPF_JGE;
+		return 0;
+	case BPF_JGE:
+		*inv_op = BPF_JLT;
+		return 0;
+	case BPF_JLE:
+		*inv_op = BPF_JGT;
+		return 0;
+	case BPF_JSGT:
+		*inv_op = BPF_JSLE;
+		return 0;
+	case BPF_JSLT:
+		*inv_op = BPF_JSGE;
+		return 0;
+	case BPF_JSGE:
+		*inv_op = BPF_JSLT;
+		return 0;
+	case BPF_JSLE:
+		*inv_op = BPF_JSGT;
+		return 0;
+	default:
+		return -EFAULT;
+	}
+}
+
+static int bpf_jmp_to_x86_cond(u8 op, u8 *jmp_cond)
+{
+	switch (op) {
+	case BPF_JEQ:
+		*jmp_cond = X86_JE;
+		return 0;
+	case BPF_JSET:
+	case BPF_JNE:
+		*jmp_cond = X86_JNE;
+		return 0;
+	case BPF_JGT:
+		*jmp_cond = X86_JA;
+		return 0;
+	case BPF_JLT:
+		*jmp_cond = X86_JB;
+		return 0;
+	case BPF_JGE:
+		*jmp_cond = X86_JAE;
+		return 0;
+	case BPF_JLE:
+		*jmp_cond = X86_JBE;
+		return 0;
+	case BPF_JSGT:
+		*jmp_cond = X86_JG;
+		return 0;
+	case BPF_JSLT:
+		*jmp_cond = X86_JL;
+		return 0;
+	case BPF_JSGE:
+		*jmp_cond = X86_JGE;
+		return 0;
+	case BPF_JSLE:
+		*jmp_cond = X86_JLE;
+		return 0;
+	default:
+		return -EFAULT;
+	}
+}
+
+static int bpf_jmp_to_x86_cmov(u8 op, u8 *cmov_op)
+{
+	switch (op) {
+	case BPF_JEQ:
+		*cmov_op = 0x44;
+		return 0;
+	case BPF_JNE:
+		*cmov_op = 0x45;
+		return 0;
+	case BPF_JGT:
+		*cmov_op = 0x47;
+		return 0;
+	case BPF_JLT:
+		*cmov_op = 0x42;
+		return 0;
+	case BPF_JGE:
+		*cmov_op = 0x43;
+		return 0;
+	case BPF_JLE:
+		*cmov_op = 0x46;
+		return 0;
+	case BPF_JSGT:
+		*cmov_op = 0x4F;
+		return 0;
+	case BPF_JSLT:
+		*cmov_op = 0x4C;
+		return 0;
+	case BPF_JSGE:
+		*cmov_op = 0x4D;
+		return 0;
+	case BPF_JSLE:
+		*cmov_op = 0x4E;
+		return 0;
+	default:
+		return -EFAULT;
+	}
+}
+
+static int emit_bpf_jmp_cmp(u8 **pprog, const struct bpf_insn *insn,
+			    u32 dst_reg, u32 src_reg)
+{
+	bool is64 = BPF_CLASS(insn->code) == BPF_JMP;
+	s32 imm32 = insn->imm;
+	u8 *prog = *pprog;
+
+	switch (insn->code) {
+	case BPF_JMP | BPF_JEQ | BPF_X:
+	case BPF_JMP | BPF_JNE | BPF_X:
+	case BPF_JMP | BPF_JGT | BPF_X:
+	case BPF_JMP | BPF_JLT | BPF_X:
+	case BPF_JMP | BPF_JGE | BPF_X:
+	case BPF_JMP | BPF_JLE | BPF_X:
+	case BPF_JMP | BPF_JSGT | BPF_X:
+	case BPF_JMP | BPF_JSLT | BPF_X:
+	case BPF_JMP | BPF_JSGE | BPF_X:
+	case BPF_JMP | BPF_JSLE | BPF_X:
+	case BPF_JMP32 | BPF_JEQ | BPF_X:
+	case BPF_JMP32 | BPF_JNE | BPF_X:
+	case BPF_JMP32 | BPF_JGT | BPF_X:
+	case BPF_JMP32 | BPF_JLT | BPF_X:
+	case BPF_JMP32 | BPF_JGE | BPF_X:
+	case BPF_JMP32 | BPF_JLE | BPF_X:
+	case BPF_JMP32 | BPF_JSGT | BPF_X:
+	case BPF_JMP32 | BPF_JSLT | BPF_X:
+	case BPF_JMP32 | BPF_JSGE | BPF_X:
+	case BPF_JMP32 | BPF_JSLE | BPF_X:
+		maybe_emit_mod(&prog, dst_reg, src_reg, is64);
+		EMIT2(0x39, add_2reg(0xC0, dst_reg, src_reg));
+		break;
+
+	case BPF_JMP | BPF_JSET | BPF_X:
+	case BPF_JMP32 | BPF_JSET | BPF_X:
+		maybe_emit_mod(&prog, dst_reg, src_reg, is64);
+		EMIT2(0x85, add_2reg(0xC0, dst_reg, src_reg));
+		break;
+
+	case BPF_JMP | BPF_JSET | BPF_K:
+	case BPF_JMP32 | BPF_JSET | BPF_K:
+		maybe_emit_1mod(&prog, dst_reg, is64);
+		EMIT2_off32(0xF7, add_1reg(0xC0, dst_reg), imm32);
+		break;
+
+	case BPF_JMP | BPF_JEQ | BPF_K:
+	case BPF_JMP | BPF_JNE | BPF_K:
+	case BPF_JMP | BPF_JGT | BPF_K:
+	case BPF_JMP | BPF_JLT | BPF_K:
+	case BPF_JMP | BPF_JGE | BPF_K:
+	case BPF_JMP | BPF_JLE | BPF_K:
+	case BPF_JMP | BPF_JSGT | BPF_K:
+	case BPF_JMP | BPF_JSLT | BPF_K:
+	case BPF_JMP | BPF_JSGE | BPF_K:
+	case BPF_JMP | BPF_JSLE | BPF_K:
+	case BPF_JMP32 | BPF_JEQ | BPF_K:
+	case BPF_JMP32 | BPF_JNE | BPF_K:
+	case BPF_JMP32 | BPF_JGT | BPF_K:
+	case BPF_JMP32 | BPF_JLT | BPF_K:
+	case BPF_JMP32 | BPF_JGE | BPF_K:
+	case BPF_JMP32 | BPF_JLE | BPF_K:
+	case BPF_JMP32 | BPF_JSGT | BPF_K:
+	case BPF_JMP32 | BPF_JSLT | BPF_K:
+	case BPF_JMP32 | BPF_JSGE | BPF_K:
+	case BPF_JMP32 | BPF_JSLE | BPF_K:
+		if (imm32 == 0) {
+			maybe_emit_mod(&prog, dst_reg, dst_reg, is64);
+			EMIT2(0x85, add_2reg(0xC0, dst_reg, dst_reg));
+			break;
+		}
+
+		maybe_emit_1mod(&prog, dst_reg, is64);
+		if (is_imm8(imm32))
+			EMIT3(0x83, add_1reg(0xF8, dst_reg), imm32);
+		else
+			EMIT2_off32(0x81, add_1reg(0xF8, dst_reg), imm32);
+		break;
+
+	default:
+		return -EFAULT;
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+static void emit_bpf_mov_value(u8 **pprog, const struct bpf_insn *insn, u32 dst_reg,
+			       bool use_priv_fp)
+{
+	bool is64 = BPF_CLASS(insn->code) == BPF_ALU64;
+
+	if (BPF_SRC(insn->code) == BPF_X) {
+		u32 src_reg = jit_bpf_reg(insn->src_reg, use_priv_fp);
+
+		if (src_reg != dst_reg)
+			emit_mov_reg(pprog, is64, dst_reg, src_reg);
+		return;
+	}
+
+	emit_mov_imm32(pprog, is64, dst_reg, insn->imm);
+}
+
+static int emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
+				const struct bpf_insn *then_insn,
+				const struct bpf_insn *else_insn,
+				bool use_priv_fp)
+{
+	u32 dst_reg = jit_bpf_reg(then_insn->dst_reg, use_priv_fp);
+	bool is64 = BPF_CLASS(then_insn->code) == BPF_ALU64;
+	u32 cmov_src_reg;
+	u8 cmov_op;
+	int err;
+
+	if (!is_bpf_simple_mov(then_insn) || !is_bpf_simple_mov(else_insn))
+		return -EINVAL;
+
+	err = emit_bpf_jmp_cmp(pprog, jmp_insn, jit_bpf_reg(jmp_insn->dst_reg, use_priv_fp),
+			       jit_bpf_reg(jmp_insn->src_reg, use_priv_fp));
+	if (err)
+		return err;
+
+	err = bpf_jmp_to_x86_cmov(BPF_OP(jmp_insn->code), &cmov_op);
+	if (err)
+		return err;
+
+	if (BPF_SRC(else_insn->code) == BPF_X) {
+		cmov_src_reg = jit_bpf_reg(else_insn->src_reg, use_priv_fp);
+		if (cmov_src_reg == dst_reg && !bpf_mov_is_noop(then_insn)) {
+			emit_mov_reg(pprog, is64, AUX_REG, dst_reg);
+			cmov_src_reg = AUX_REG;
+		}
+	} else {
+		emit_bpf_mov_value(pprog, else_insn, AUX_REG, use_priv_fp);
+		cmov_src_reg = AUX_REG;
+	}
+
+	if (!bpf_mov_is_noop(then_insn))
+		emit_bpf_mov_value(pprog, then_insn, dst_reg, use_priv_fp);
+
+	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
+	return 0;
+}
+
+static bool is_bpf_cmov_select_compact(const struct bpf_insn *default_insn,
+				       const struct bpf_insn *jmp_insn,
+				       const struct bpf_insn *override_insn)
+{
+	u8 mov_cls;
+
+	if (!is_bpf_simple_mov(default_insn) || !is_bpf_simple_mov(override_insn))
+		return false;
+	if (!is_bpf_cmov_cond_jump(jmp_insn) || jmp_insn->off != 1)
+		return false;
+	if (default_insn->dst_reg != override_insn->dst_reg)
+		return false;
+
+	mov_cls = BPF_CLASS(default_insn->code);
+	if (mov_cls != BPF_CLASS(override_insn->code))
+		return false;
+
+	if (BPF_CLASS(jmp_insn->code) == BPF_JMP)
+		return mov_cls == BPF_ALU64;
+
+	return mov_cls == BPF_ALU;
+}
+
+static int emit_bpf_cmov_select_compact(u8 **pprog,
+					const struct bpf_insn *default_insn,
+					const struct bpf_insn *jmp_insn,
+					const struct bpf_insn *override_insn,
+					bool use_priv_fp)
+{
+	u32 dst_reg = jit_bpf_reg(default_insn->dst_reg, use_priv_fp);
+	bool is64 = BPF_CLASS(default_insn->code) == BPF_ALU64;
+	u32 cmov_src_reg;
+	u8 inv_op, cmov_op;
+	int err;
+
+	if (!is_bpf_cmov_select_compact(default_insn, jmp_insn, override_insn))
+		return -EINVAL;
+
+	if (!bpf_mov_is_noop(default_insn))
+		emit_bpf_mov_value(pprog, default_insn, dst_reg, use_priv_fp);
+
+	if (bpf_mov_is_noop(override_insn))
+		return 0;
+
+	err = emit_bpf_jmp_cmp(pprog, jmp_insn, jit_bpf_reg(jmp_insn->dst_reg, use_priv_fp),
+			       jit_bpf_reg(jmp_insn->src_reg, use_priv_fp));
+	if (err)
+		return err;
+
+	err = bpf_jmp_invert(BPF_OP(jmp_insn->code), &inv_op);
+	if (err)
+		return err;
+	err = bpf_jmp_to_x86_cmov(inv_op, &cmov_op);
+	if (err)
+		return err;
+
+	if (BPF_SRC(override_insn->code) == BPF_X) {
+		cmov_src_reg = jit_bpf_reg(override_insn->src_reg, use_priv_fp);
+		if (cmov_src_reg == dst_reg)
+			return 0;
+	} else {
+		emit_bpf_mov_value(pprog, override_insn, AUX_REG, use_priv_fp);
+		cmov_src_reg = AUX_REG;
+	}
+
+	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
+	return 0;
+}
+
 /* Emit the suffix (ModR/M etc) for addressing *(ptr_reg + off) and val_reg */
 static void emit_insn_suffix(u8 **pprog, u32 ptr_reg, u32 val_reg, int off)
 {
@@ -1715,6 +2114,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	prog = temp;
 
 	for (i = 1; i <= insn_cnt; i++, insn++) {
+		const struct bpf_jit_directive *directive;
 		const s32 imm32 = insn->imm;
 		u32 dst_reg = insn->dst_reg;
 		u32 src_reg = insn->src_reg;
@@ -1732,6 +2132,46 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 			if (dst_reg == BPF_REG_FP)
 				dst_reg = X86_REG_R9;
+		}
+
+		if (i + 1 < bpf_prog->len && is_bpf_simple_mov(insn)) {
+			directive = bpf_jit_directive_lookup(bpf_prog,
+							     BPF_JIT_DIRECTIVE_CMOV_SELECT,
+							     i);
+			if (directive &&
+			    is_bpf_cmov_select_compact(insn, insn + 1, insn + 2)) {
+				int region_start = proglen;
+
+				if (emit_bpf_cmov_select_compact(&prog, insn, insn + 1,
+								 insn + 2,
+								 priv_frame_ptr != NULL))
+					return -EFAULT;
+
+				ilen = prog - temp;
+				if (ilen > BPF_MAX_INSN_SIZE) {
+					pr_err("bpf_jit: fatal insn size error\n");
+					return -EFAULT;
+				}
+
+				if (image) {
+					if (unlikely(region_start + ilen > oldproglen ||
+						     region_start + ilen != addrs[i + 2])) {
+						pr_err("bpf_jit: fatal error\n");
+						return -EFAULT;
+					}
+					memcpy(rw_image + region_start, temp, ilen);
+				}
+
+				proglen = region_start + ilen;
+				addrs[i - 1] = region_start;
+				addrs[i] = region_start;
+				addrs[i + 1] = region_start;
+				addrs[i + 2] = proglen;
+				prog = temp;
+				insn += 2;
+				i += 2;
+				continue;
+			}
 		}
 
 		switch (insn->code) {
@@ -2541,67 +2981,48 @@ populate_extable:
 		case BPF_JMP32 | BPF_JSLT | BPF_K:
 		case BPF_JMP32 | BPF_JSGE | BPF_K:
 		case BPF_JMP32 | BPF_JSLE | BPF_K:
-			/* test dst_reg, dst_reg to save one extra byte */
-			if (imm32 == 0) {
-				maybe_emit_mod(&prog, dst_reg, dst_reg,
-					       BPF_CLASS(insn->code) == BPF_JMP);
-				EMIT2(0x85, add_2reg(0xC0, dst_reg, dst_reg));
-				goto emit_cond_jmp;
+			directive = bpf_jit_directive_lookup(bpf_prog,
+							     BPF_JIT_DIRECTIVE_CMOV_SELECT,
+							     i - 1);
+			if (directive) {
+				int region_start = proglen;
+
+				if (emit_bpf_cmov_select(&prog, insn, insn + 1, insn + 3,
+							 priv_frame_ptr != NULL))
+					return -EFAULT;
+
+				ilen = prog - temp;
+				if (ilen > BPF_MAX_INSN_SIZE) {
+					pr_err("bpf_jit: fatal insn size error\n");
+					return -EFAULT;
+				}
+
+				if (image) {
+					if (unlikely(region_start + ilen > oldproglen ||
+						     region_start + ilen != addrs[i + 3])) {
+						pr_err("bpf_jit: fatal error\n");
+						return -EFAULT;
+					}
+					memcpy(rw_image + region_start, temp, ilen);
+				}
+
+				proglen = region_start + ilen;
+				addrs[i] = region_start;
+				addrs[i + 1] = region_start;
+				addrs[i + 2] = region_start;
+				addrs[i + 3] = proglen;
+				prog = temp;
+				insn += 3;
+				i += 3;
+				continue;
 			}
 
-			/* cmp dst_reg, imm8/32 */
-			maybe_emit_1mod(&prog, dst_reg,
-					BPF_CLASS(insn->code) == BPF_JMP);
-
-			if (is_imm8(imm32))
-				EMIT3(0x83, add_1reg(0xF8, dst_reg), imm32);
-			else
-				EMIT2_off32(0x81, add_1reg(0xF8, dst_reg), imm32);
-
-emit_cond_jmp:		/* Convert BPF opcode to x86 */
-			switch (BPF_OP(insn->code)) {
-			case BPF_JEQ:
-				jmp_cond = X86_JE;
-				break;
-			case BPF_JSET:
-			case BPF_JNE:
-				jmp_cond = X86_JNE;
-				break;
-			case BPF_JGT:
-				/* GT is unsigned '>', JA in x86 */
-				jmp_cond = X86_JA;
-				break;
-			case BPF_JLT:
-				/* LT is unsigned '<', JB in x86 */
-				jmp_cond = X86_JB;
-				break;
-			case BPF_JGE:
-				/* GE is unsigned '>=', JAE in x86 */
-				jmp_cond = X86_JAE;
-				break;
-			case BPF_JLE:
-				/* LE is unsigned '<=', JBE in x86 */
-				jmp_cond = X86_JBE;
-				break;
-			case BPF_JSGT:
-				/* Signed '>', GT in x86 */
-				jmp_cond = X86_JG;
-				break;
-			case BPF_JSLT:
-				/* Signed '<', LT in x86 */
-				jmp_cond = X86_JL;
-				break;
-			case BPF_JSGE:
-				/* Signed '>=', GE in x86 */
-				jmp_cond = X86_JGE;
-				break;
-			case BPF_JSLE:
-				/* Signed '<=', LE in x86 */
-				jmp_cond = X86_JLE;
-				break;
-			default: /* to silence GCC warning */
+			if (emit_bpf_jmp_cmp(&prog, insn, dst_reg, src_reg))
 				return -EFAULT;
-			}
+
+emit_cond_jmp:
+			if (bpf_jmp_to_x86_cond(BPF_OP(insn->code), &jmp_cond))
+				return -EFAULT;
 			jmp_offset = addrs[i + insn->off] - addrs[i];
 			if (is_imm8_jmp_offset(jmp_offset)) {
 				if (jmp_padding) {
