@@ -2113,26 +2113,61 @@ static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
 {
 	u32 idx = rule->site_start;
 	const struct bpf_insn *first = &insns[idx];
-	u32 dst_reg = jit_bpf_reg(first->dst_reg, use_priv_fp);
-	u32 src_reg = jit_bpf_reg(first->src_reg, use_priv_fp);
-	s16 off = first->off;
+	u32 result_reg, base_reg;
+	s16 off;
 	u32 width;
+	bool is_high_first = false;
 
-	/* Calculate width from site_len: N = (site_len + 2) / 3 */
-	width = (rule->site_len + 2) / 3;
+	/*
+	 * Detect high-byte-first pattern:
+	 *   [0] ldxb tmp, [base+off+1]   (high byte)
+	 *   [1] lsh64 tmp, 8
+	 *   [2] ldxb dst, [base+off]     (low byte)
+	 *   [3] or64 tmp, dst            (combine into tmp)
+	 *
+	 * Key differentiator: in high-first, the OR's dst is first->dst_reg
+	 * (the tmp register), and the second ldxb has off = first->off - 1.
+	 * In low-first, the first insn loads the low byte directly.
+	 *
+	 * We detect this by checking if site_len==4 and insns[idx+1] is lsh64
+	 * (meaning the shift immediately follows the first load, which is the
+	 * high-byte pattern).
+	 */
+	if (rule->site_len == 4 &&
+	    insns[idx + 1].code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
+	    insns[idx + 1].imm == 8 &&
+	    insns[idx + 1].dst_reg == first->dst_reg &&
+	    insns[idx + 2].code == (BPF_LDX | BPF_MEM | BPF_B) &&
+	    insns[idx + 2].off == first->off - 1) {
+		/* High-byte-first 2-byte pattern */
+		is_high_first = true;
+		result_reg = jit_bpf_reg(first->dst_reg, use_priv_fp);
+		base_reg = jit_bpf_reg(first->src_reg, use_priv_fp);
+		off = insns[idx + 2].off; /* low byte's offset = base offset */
+		width = 2;
+	} else {
+		/* Low-byte-first pattern */
+		result_reg = jit_bpf_reg(first->dst_reg, use_priv_fp);
+		base_reg = jit_bpf_reg(first->src_reg, use_priv_fp);
+		off = first->off;
+		/* Calculate width from site_len: N = (site_len + 2) / 3 */
+		width = (rule->site_len + 2) / 3;
+	}
+
+	(void)is_high_first;
 
 	switch (width) {
 	case 2:
-		/* Emit: movzx dst, word ptr [src+off] */
-		emit_ldx(pprog, BPF_H, dst_reg, src_reg, off);
+		/* Emit: movzx result_reg, word ptr [base_reg+off] */
+		emit_ldx(pprog, BPF_H, result_reg, base_reg, off);
 		return 0;
 	case 4:
-		/* Emit: mov dst_32, dword ptr [src+off] (zero-extends to 64-bit) */
-		emit_ldx(pprog, BPF_W, dst_reg, src_reg, off);
+		/* Emit: mov result_reg_32, dword ptr [base_reg+off] (zero-extends to 64-bit) */
+		emit_ldx(pprog, BPF_W, result_reg, base_reg, off);
 		return 0;
 	case 8:
-		/* Emit: mov dst, qword ptr [src+off] */
-		emit_ldx(pprog, BPF_DW, dst_reg, src_reg, off);
+		/* Emit: mov result_reg, qword ptr [base_reg+off] */
+		emit_ldx(pprog, BPF_DW, result_reg, base_reg, off);
 		return 0;
 	default:
 		return -EINVAL;
@@ -2142,73 +2177,126 @@ static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
 /*
  * v4 JIT policy framework: rotate emitter
  *
- * Replaces a 4-insn rotate idiom (mov+lsh+rsh+or) with a single
- * ror or rorx instruction.
+ * Replaces a rotate idiom with a single ror or rorx instruction.
  *
- * Pattern:
- *   [0] mov   tmp, dst        (copy original)
- *   [1] lsh64 dst, N          (left shift)
- *   [2] rsh64 tmp, (W-N)      (right shift complement)
- *   [3] or64  dst, tmp        (combine)
+ * Three patterns supported:
  *
- * This is a left rotate by N, which equals right rotate by (W-N).
- * We emit ror dst, (W-N) or rorx dst, dst, (W-N).
+ * 4-insn (classic or commuted):
+ *   Classic: [0] mov tmp, dst; [1] lsh dst, N; [2] rsh tmp, (W-N); [3] or dst, tmp
+ *   Commuted: [0] mov tmp, dst; [1] rsh tmp, (W-N); [2] lsh dst, N; [3] or dst, tmp
+ *   Left rotate by N = right rotate by (W-N).
+ *
+ * 5-insn (two-copy 64-bit):
+ *   [0] mov64 tmp, src; [1] rsh64 tmp, (64-N); [2] mov64 dst, src;
+ *   [3] lsh64 dst, N; [4] or64 dst, tmp
+ *   Result in dst (insns[idx+2].dst_reg).
+ *
+ * 6-insn (clang masked 32-bit):
+ *   [0] mov64 tmp, src; [1] and64 tmp, mask; [2] rsh64 tmp, (32-N);
+ *   [3] mov64 dst, src; [4] lsh64 dst, N; [5] or64 dst, tmp
+ *   Always 32-bit rotate.  Result in dst (insns[3].dst_reg).
  */
 static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
 			    const struct bpf_jit_rule *rule,
 			    bool use_priv_fp)
 {
 	u32 idx = rule->site_start;
-	const struct bpf_insn *mov_insn = &insns[idx];
-	const struct bpf_insn *lsh_insn = &insns[idx + 1];
-	u32 dst_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
-	u32 tmp_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
-	bool is64 = BPF_CLASS(mov_insn->code) == BPF_ALU64;
-	u32 width = is64 ? 64 : 32;
-	u32 rot_amount = (u32)lsh_insn->imm;
-	u8 ror_imm = (u8)(width - rot_amount);
+	u32 dst_reg, src_reg, tmp_reg;
+	bool is64;
+	u32 width, rot_amount;
+	u8 ror_imm;
 	u8 *prog = *pprog;
+
+	if (rule->site_len == 6) {
+		/* 6-insn masked 32-bit rotate */
+		const struct bpf_insn *mov1 = &insns[idx];
+		const struct bpf_insn *lsh_insn = &insns[idx + 4];
+
+		src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
+		dst_reg = jit_bpf_reg(insns[idx + 3].dst_reg, use_priv_fp);
+		tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
+		is64 = false;
+		width = 32;
+		rot_amount = (u32)lsh_insn->imm;
+	} else if (rule->site_len == 5) {
+		const struct bpf_insn *mov1 = &insns[idx];
+		const struct bpf_insn *insn1 = &insns[idx + 1];
+
+		if (BPF_OP(insn1->code) == BPF_AND) {
+			/*
+			 * 5-insn masked 32-bit rotate: mov+and+{rsh,lsh}+{lsh,rsh}+or
+			 * Find the LSH among positions 2 and 3.
+			 */
+			const struct bpf_insn *lsh_insn;
+
+			if (BPF_OP(insns[idx + 2].code) == BPF_LSH)
+				lsh_insn = &insns[idx + 2];
+			else
+				lsh_insn = &insns[idx + 3];
+
+			src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
+			dst_reg = src_reg; /* result stays in original register */
+			tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
+			is64 = false;
+			width = 32;
+			rot_amount = (u32)lsh_insn->imm;
+		} else {
+			/*
+			 * 5-insn two-copy 64-bit rotate: mov+rsh+mov+lsh+or
+			 */
+			const struct bpf_insn *mov2 = &insns[idx + 2];
+			const struct bpf_insn *lsh_insn = &insns[idx + 3];
+
+			src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
+			dst_reg = jit_bpf_reg(mov2->dst_reg, use_priv_fp);
+			tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
+			is64 = true;
+			width = 64;
+			rot_amount = (u32)lsh_insn->imm;
+		}
+	} else {
+		/*
+		 * 4-insn rotate (classic or commuted).
+		 * Find the LSH instruction at either idx+1 or idx+2.
+		 */
+		const struct bpf_insn *mov_insn = &insns[idx];
+		const struct bpf_insn *lsh_insn;
+
+		if (BPF_OP(insns[idx + 1].code) == BPF_LSH)
+			lsh_insn = &insns[idx + 1]; /* classic */
+		else
+			lsh_insn = &insns[idx + 2]; /* commuted */
+
+		dst_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
+		src_reg = dst_reg;
+		tmp_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
+		is64 = BPF_CLASS(mov_insn->code) == BPF_ALU64;
+		width = is64 ? 64 : 32;
+		rot_amount = (u32)lsh_insn->imm;
+	}
+
+	ror_imm = (u8)(width - rot_amount);
 
 	if (rule->native_choice == BPF_JIT_ROT_RORX) {
 		/*
 		 * rorx dst, src, imm8
 		 * VEX.LZ.F2.0F3A.W1 F0 /r ib  (64-bit)
 		 * VEX.LZ.F2.0F3A.W0 F0 /r ib  (32-bit)
-		 *
-		 * 3-byte VEX prefix: C4 [R~X~B~.mmmmm] [W.vvvv~.L.pp]
-		 * mmmmm = 00011 (0F3A), pp = 11 (F2), L = 0
-		 * vvvv~ = 1111 (no extra src operand), W = 1 for 64-bit
-		 * R~,X~,B~ are inverted REX bits
-		 *
-		 * ModRM: mod=11, reg=dst (r field), r/m=src
-		 * Here src == dst (rotate in place).
 		 */
 		u8 byte2, byte3, modrm;
 
-		/* Byte 2: R~.X~.B~.mmmmm
-		 * R~ = inverted, set if dst is NOT extended (r8-r15)
-		 * X~ = inverted, 1 (no index register used)
-		 * B~ = inverted, set if src is NOT extended
-		 */
-		byte2 = 0x03; /* mmmmm = 00011 */
+		byte2 = 0x03;
 		if (!is_ereg(dst_reg))
-			byte2 |= 0x80; /* R~ = 1 */
-		byte2 |= 0x40; /* X~ = 1 (unused) */
-		if (!is_ereg(dst_reg))
-			byte2 |= 0x20; /* B~ = 1 (src == dst) */
+			byte2 |= 0x80;
+		byte2 |= 0x40;
+		if (!is_ereg(src_reg))
+			byte2 |= 0x20;
 
-		/* Byte 3: W.vvvv~.L.pp
-		 * W = 1 for 64-bit, 0 for 32-bit
-		 * vvvv~ = 1111 (inverted, meaning NDS=none)
-		 * L = 0 (scalar, LZ)
-		 * pp = 11 (F2 prefix)
-		 */
-		byte3 = 0x7B; /* 0.1111.0.11 = vvvv~=1111, L=0, pp=11 */
+		byte3 = 0x7B;
 		if (is64)
-			byte3 |= 0x80; /* W = 1 */
+			byte3 |= 0x80;
 
-		/* ModRM: mod=11, reg=dst, r/m=dst (src==dst) */
-		modrm = 0xC0 | (reg2hex[dst_reg] << 3) | reg2hex[dst_reg];
+		modrm = 0xC0 | (reg2hex[dst_reg] << 3) | reg2hex[src_reg];
 
 		EMIT4(0xC4, byte2, byte3, 0xF0);
 		EMIT2(modrm, ror_imm);
@@ -2219,7 +2307,14 @@ static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
 		 * ror dst, imm8
 		 * REX.W + C1 /1 ib  (64-bit)
 		 * C1 /1 ib           (32-bit, with REX if ereg)
+		 *
+		 * For 5-insn/6-insn: if src != dst, we need mov dst, src first.
 		 */
+		if ((rule->site_len == 5 || rule->site_len == 6) &&
+		    src_reg != dst_reg) {
+			emit_mov_reg(&prog, is64, dst_reg, src_reg);
+		}
+
 		if (is64)
 			EMIT1(add_1mod(0x48, dst_reg));
 		else if (is_ereg(dst_reg))

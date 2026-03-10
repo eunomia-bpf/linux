@@ -594,35 +594,31 @@ static bool bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
 }
 
 /**
- * bpf_jit_validate_wide_mem_rule - validate a WIDE_MEM rule against prog
+ * bpf_jit_validate_wide_mem_low_first - validate low-byte-first pattern
  *
- * Check that the BPF insn sequence at site_start is a byte-load ladder:
- * consecutive BPF_LDX_MEM(BPF_B, ...) from the same base register at
- * contiguous offsets, followed by shifts and ORs to reconstruct a wider value.
+ * Pattern (N = 2, 4, or 8 bytes):
+ *   [0] ldxb dst, [base+off]
+ *   [1] ldxb tmp, [base+off+1]
+ *   [2] lsh64 tmp, 8
+ *   [3] or64  dst, tmp
+ *   ... repeated for each additional byte
  *
- * For the POC, we validate a simple pattern:
- *   ldxb dst, [base+off]
- *   ldxb tmp, [base+off+1]
- *   lsh  tmp, 8
- *   or   dst, tmp
- *   ... (repeated for each additional byte)
- *
- * The rule specifies site_len to cover all these instructions.
+ * site_len = 1 + (N-1)*3 = 3N-2
  */
-static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
-					   u32 insn_cnt,
-					   const struct bpf_jit_rule *rule)
+static bool bpf_jit_validate_wide_mem_low_first(const struct bpf_insn *insns,
+						u32 insn_cnt, u32 idx,
+						u32 site_len)
 {
-	u32 idx = rule->site_start;
 	const struct bpf_insn *first;
 	u8 base_reg;
 	s16 base_off;
+	u32 expected_bytes;
+	u32 i;
 
-	if (idx + rule->site_len > insn_cnt)
+	if (idx + site_len > insn_cnt)
 		return false;
 
-	/* Must have at least 2 insns (one byte load + something) */
-	if (rule->site_len < 4)
+	if (site_len < 4)
 		return false;
 
 	first = &insns[idx];
@@ -634,71 +630,145 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 	base_reg = first->src_reg;
 	base_off = first->off;
 
-	/*
-	 * Validate pattern: for a 2-byte wide load, expect:
-	 *   [0] ldxb dst, [base+off]
-	 *   [1] ldxb tmp, [base+off+1]
-	 *   [2] lsh64 tmp, 8
-	 *   [3] or64  dst, tmp
-	 *
-	 * For a 4-byte wide load, expect 3 more groups of (ldxb, lsh, or)
-	 * after the first ldxb.
-	 *
-	 * General pattern: 1 + (width-1)*3 instructions, where width = site_len/3+1
-	 * would give us the total width. But let's just check the minimum structure.
-	 */
+	/* For N bytes: 1 + (N-1)*3 = 3N-2 insns, so N = (site_len + 2) / 3 */
+	if ((site_len + 2) % 3 != 0)
+		return false;
 
-	/* Check that expected byte count matches site_len:
-	 * For N bytes: 1 (first load) + (N-1)*3 (load+shift+or) = 3N-2 insns
-	 * So N = (site_len + 2) / 3
-	 */
-	{
-		u32 expected_bytes;
-		u32 i;
+	expected_bytes = (site_len + 2) / 3;
+	if (expected_bytes < 2 || expected_bytes > 8)
+		return false;
 
-		if ((rule->site_len + 2) % 3 != 0)
+	/* Only support power-of-2 widths that the emitter handles */
+	if (expected_bytes != 2 && expected_bytes != 4 && expected_bytes != 8)
+		return false;
+
+	/* Validate each subsequent byte group */
+	for (i = 1; i < expected_bytes; i++) {
+		u32 group_base = idx + 1 + (i - 1) * 3;
+		const struct bpf_insn *load_insn = &insns[group_base];
+		const struct bpf_insn *shift_insn = &insns[group_base + 1];
+		const struct bpf_insn *or_insn = &insns[group_base + 2];
+
+		/* Check ldxb */
+		if (load_insn->code != (BPF_LDX | BPF_MEM | BPF_B))
+			return false;
+		if (load_insn->src_reg != base_reg)
+			return false;
+		if (load_insn->off != base_off + (s16)i)
 			return false;
 
-		expected_bytes = (rule->site_len + 2) / 3;
-		if (expected_bytes < 2 || expected_bytes > 8)
+		/* Check lsh64 imm (shift by i*8) */
+		if (shift_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
+			return false;
+		if (shift_insn->imm != (s32)(i * 8))
+			return false;
+		if (shift_insn->dst_reg != load_insn->dst_reg)
 			return false;
 
-		/* Only support power-of-2 widths that the emitter handles */
-		if (expected_bytes != 2 && expected_bytes != 4 && expected_bytes != 8)
+		/* Check or64 */
+		if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
 			return false;
-
-		/* Validate each subsequent byte group */
-		for (i = 1; i < expected_bytes; i++) {
-			u32 group_base = idx + 1 + (i - 1) * 3;
-			const struct bpf_insn *load_insn = &insns[group_base];
-			const struct bpf_insn *shift_insn = &insns[group_base + 1];
-			const struct bpf_insn *or_insn = &insns[group_base + 2];
-
-			/* Check ldxb */
-			if (load_insn->code != (BPF_LDX | BPF_MEM | BPF_B))
-				return false;
-			if (load_insn->src_reg != base_reg)
-				return false;
-			if (load_insn->off != base_off + (s16)i)
-				return false;
-
-			/* Check lsh64 imm (shift by i*8) */
-			if (shift_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
-				return false;
-			if (shift_insn->imm != (s32)(i * 8))
-				return false;
-			if (shift_insn->dst_reg != load_insn->dst_reg)
-				return false;
-
-			/* Check or64 */
-			if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
-				return false;
-			if (or_insn->dst_reg != first->dst_reg)
-				return false;
-			if (or_insn->src_reg != load_insn->dst_reg)
-				return false;
-		}
+		if (or_insn->dst_reg != first->dst_reg)
+			return false;
+		if (or_insn->src_reg != load_insn->dst_reg)
+			return false;
 	}
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_wide_mem_high_first - validate clang's high-byte-first 2-byte pattern
+ *
+ * clang generates:
+ *   [0] ldxb tmp, [base+off+1]    (high byte FIRST)
+ *   [1] lsh64 tmp, 8
+ *   [2] ldxb dst, [base+off]      (low byte SECOND)
+ *   [3] or64 tmp, dst             (combine into tmp, NOT dst)
+ *
+ * site_len must be 4 (2-byte only for now).
+ * Result register is tmp (insns[0].dst_reg).
+ */
+static bool bpf_jit_validate_wide_mem_high_first(const struct bpf_insn *insns,
+						 u32 insn_cnt, u32 idx,
+						 u32 site_len)
+{
+	const struct bpf_insn *hi_load, *shift_insn, *lo_load, *or_insn;
+
+	/* Only 2-byte high-first for now */
+	if (site_len != 4)
+		return false;
+
+	if (idx + 4 > insn_cnt)
+		return false;
+
+	hi_load    = &insns[idx];
+	shift_insn = &insns[idx + 1];
+	lo_load    = &insns[idx + 2];
+	or_insn    = &insns[idx + 3];
+
+	/* [0] ldxb tmp, [base+off+1] */
+	if (hi_load->code != (BPF_LDX | BPF_MEM | BPF_B))
+		return false;
+
+	/* [1] lsh64 tmp, 8 */
+	if (shift_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
+		return false;
+	if (shift_insn->imm != 8)
+		return false;
+	if (shift_insn->dst_reg != hi_load->dst_reg)
+		return false;
+
+	/* [2] ldxb dst, [base+off] — same base register, offset = hi_load.off - 1 */
+	if (lo_load->code != (BPF_LDX | BPF_MEM | BPF_B))
+		return false;
+	if (lo_load->src_reg != hi_load->src_reg)
+		return false;
+	if (lo_load->off != hi_load->off - 1)
+		return false;
+
+	/* [3] or64 tmp, dst — combine INTO tmp (reversed from low-first) */
+	if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
+		return false;
+	if (or_insn->dst_reg != hi_load->dst_reg)
+		return false;
+	if (or_insn->src_reg != lo_load->dst_reg)
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_wide_mem_rule - validate a WIDE_MEM rule against prog
+ *
+ * Supports two patterns:
+ *   1. Low-byte-first: ldxb dst, [base+off]; ldxb tmp, [base+off+1]; lsh tmp, 8; or dst, tmp; ...
+ *   2. High-byte-first (clang): ldxb tmp, [base+off+1]; lsh tmp, 8; ldxb dst, [base+off]; or tmp, dst
+ */
+static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
+					   u32 insn_cnt,
+					   const struct bpf_jit_rule *rule)
+{
+	u32 idx = rule->site_start;
+	bool shape_ok;
+
+	if (idx + rule->site_len > insn_cnt)
+		return false;
+
+	if (rule->site_len < 4)
+		return false;
+
+	/* Try low-byte-first pattern first */
+	shape_ok = bpf_jit_validate_wide_mem_low_first(insns, insn_cnt, idx,
+						       rule->site_len);
+
+	/* If that fails, try high-byte-first pattern (2-byte only) */
+	if (!shape_ok)
+		shape_ok = bpf_jit_validate_wide_mem_high_first(insns, insn_cnt,
+								idx, rule->site_len);
+
+	if (!shape_ok)
+		return false;
 
 	/* Reject if any external jump targets the interior of this pattern */
 	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start, rule->site_len))
@@ -708,35 +778,37 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 }
 
 /**
- * bpf_jit_validate_rotate_rule - validate a ROTATE rule against prog
+ * bpf_jit_validate_rotate_4insn - validate a 4-insn rotate idiom
  *
- * Check that the BPF insn sequence at site_start matches a rotate idiom:
+ * Classic pattern (mov+lsh+rsh+or):
  *   [0] mov   tmp, dst        (copy original)
- *   [1] lsh64 dst, N          (left shift by rotation amount)
- *   [2] rsh64 tmp, (W-N)      (right shift complement)
- *   [3] or64  dst, tmp        (combine)
+ *   [1] lsh   dst, N          (left shift by rotation amount)
+ *   [2] rsh   tmp, (W-N)      (right shift complement)
+ *   [3] or    dst, tmp        (combine)
+ *
+ * Commuted pattern (mov+rsh+lsh+or) — clang often generates this:
+ *   [0] mov   tmp, dst        (copy original)
+ *   [1] rsh   tmp, (W-N)      (right shift complement on tmp)
+ *   [2] lsh   dst, N          (left shift on original)
+ *   [3] or    dst, tmp        (combine)
  *
  * Where W is 32 or 64 and N is the rotation amount (1..W-1).
- * site_len must be 4.
  */
-static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
-					 u32 insn_cnt,
-					 const struct bpf_jit_rule *rule)
+static bool bpf_jit_validate_rotate_4insn(const struct bpf_insn *insns,
+					   u32 insn_cnt, u32 idx)
 {
-	u32 idx = rule->site_start;
-	const struct bpf_insn *mov_insn, *lsh_insn, *rsh_insn, *or_insn;
+	const struct bpf_insn *mov_insn, *insn1, *insn2, *or_insn;
+	const struct bpf_insn *lsh_insn, *rsh_insn;
 	u8 lsh_cls, rsh_cls, or_cls;
 	u32 width, rot_amount;
-
-	if (rule->site_len != 4)
-		return false;
+	bool commuted;
 
 	if (idx + 4 > insn_cnt)
 		return false;
 
 	mov_insn = &insns[idx];
-	lsh_insn = &insns[idx + 1];
-	rsh_insn = &insns[idx + 2];
+	insn1    = &insns[idx + 1];
+	insn2    = &insns[idx + 2];
 	or_insn  = &insns[idx + 3];
 
 	/* [0] Must be MOV_X (reg-to-reg copy) */
@@ -753,14 +825,36 @@ static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 	else
 		return false;
 
-	/* tmp = mov_insn->dst_reg, src (original) = mov_insn->src_reg */
-	/* [1] lsh dst, N — dst must be the original src, imm is rotation amount */
+	/* The temporary must stay distinct from the rotate destination. */
+	if (mov_insn->dst_reg == mov_insn->src_reg)
+		return false;
+
+	/*
+	 * Detect ordering: classic (lsh+rsh) or commuted (rsh+lsh).
+	 * Check insn1: if it's LSH, classic; if RSH, commuted.
+	 */
+	if (BPF_OP(insn1->code) == BPF_LSH && BPF_SRC(insn1->code) == BPF_K) {
+		commuted = false;
+		lsh_insn = insn1;
+		rsh_insn = insn2;
+	} else if (BPF_OP(insn1->code) == BPF_RSH && BPF_SRC(insn1->code) == BPF_K) {
+		commuted = true;
+		rsh_insn = insn1;
+		lsh_insn = insn2;
+	} else {
+		return false;
+	}
+
+	/* Validate LSH instruction */
 	lsh_cls = BPF_CLASS(lsh_insn->code);
 	if (BPF_OP(lsh_insn->code) != BPF_LSH || BPF_SRC(lsh_insn->code) != BPF_K)
 		return false;
 	if ((width == 64 && lsh_cls != BPF_ALU64) ||
 	    (width == 32 && lsh_cls != BPF_ALU))
 		return false;
+	if (lsh_insn->off != 0)
+		return false;
+	/* lsh dst must be the original src register */
 	if (lsh_insn->dst_reg != mov_insn->src_reg)
 		return false;
 
@@ -768,13 +862,16 @@ static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 	if (rot_amount == 0 || rot_amount >= width)
 		return false;
 
-	/* [2] rsh tmp, (W - N) */
+	/* Validate RSH instruction */
 	rsh_cls = BPF_CLASS(rsh_insn->code);
 	if (BPF_OP(rsh_insn->code) != BPF_RSH || BPF_SRC(rsh_insn->code) != BPF_K)
 		return false;
 	if ((width == 64 && rsh_cls != BPF_ALU64) ||
 	    (width == 32 && rsh_cls != BPF_ALU))
 		return false;
+	if (rsh_insn->off != 0)
+		return false;
+	/* rsh dst must be the tmp register */
 	if (rsh_insn->dst_reg != mov_insn->dst_reg)
 		return false;
 	if ((u32)rsh_insn->imm != width - rot_amount)
@@ -787,9 +884,357 @@ static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 	if ((width == 64 && or_cls != BPF_ALU64) ||
 	    (width == 32 && or_cls != BPF_ALU))
 		return false;
+	if (or_insn->off != 0 || or_insn->imm != 0)
+		return false;
 	if (or_insn->dst_reg != mov_insn->src_reg)
 		return false;
 	if (or_insn->src_reg != mov_insn->dst_reg)
+		return false;
+
+	(void)commuted; /* both orderings produce the same result */
+	return true;
+}
+
+/**
+ * bpf_jit_validate_rotate_5insn - validate a 5-insn two-copy rotate
+ *
+ * clang often generates this pattern for 64-bit rotates:
+ *   [0] mov64  tmp, src       (copy for right-shift path)
+ *   [1] rsh64  tmp, (W-N)     (right shift complement)
+ *   [2] mov64  dst, src       (copy for left-shift path, same src as [0])
+ *   [3] lsh64  dst, N         (left shift)
+ *   [4] or64   dst, tmp       (combine)
+ *
+ * Where W is 64 and N is the rotation amount (1..63).
+ * Result register is dst (insns[idx+2].dst_reg).
+ */
+static bool bpf_jit_validate_rotate_5insn(const struct bpf_insn *insns,
+					   u32 insn_cnt, u32 idx)
+{
+	const struct bpf_insn *mov1, *rsh_insn, *mov2, *lsh_insn, *or_insn;
+	u32 rot_amount, rsh_amount;
+
+	if (idx + 5 > insn_cnt)
+		return false;
+
+	mov1     = &insns[idx];
+	rsh_insn = &insns[idx + 1];
+	mov2     = &insns[idx + 2];
+	lsh_insn = &insns[idx + 3];
+	or_insn  = &insns[idx + 4];
+
+	/* [0] mov64 tmp, src */
+	if (BPF_CLASS(mov1->code) != BPF_ALU64 ||
+	    BPF_OP(mov1->code) != BPF_MOV ||
+	    BPF_SRC(mov1->code) != BPF_X)
+		return false;
+	if (mov1->off != 0 || mov1->imm != 0)
+		return false;
+
+	/* [1] rsh64 tmp, (W-N) */
+	if (BPF_CLASS(rsh_insn->code) != BPF_ALU64 ||
+	    BPF_OP(rsh_insn->code) != BPF_RSH ||
+	    BPF_SRC(rsh_insn->code) != BPF_K)
+		return false;
+	if (rsh_insn->off != 0)
+		return false;
+	if (rsh_insn->dst_reg != mov1->dst_reg)
+		return false;
+	rsh_amount = (u32)rsh_insn->imm;
+	if (rsh_amount == 0 || rsh_amount >= 64)
+		return false;
+
+	/* [2] mov64 dst, src — must have the same source as [0] */
+	if (BPF_CLASS(mov2->code) != BPF_ALU64 ||
+	    BPF_OP(mov2->code) != BPF_MOV ||
+	    BPF_SRC(mov2->code) != BPF_X)
+		return false;
+	if (mov2->off != 0 || mov2->imm != 0)
+		return false;
+	if (mov2->src_reg != mov1->src_reg)
+		return false;
+	if (mov1->dst_reg == mov1->src_reg || mov1->dst_reg == mov2->dst_reg)
+		return false;
+
+	/* [3] lsh64 dst, N */
+	if (BPF_CLASS(lsh_insn->code) != BPF_ALU64 ||
+	    BPF_OP(lsh_insn->code) != BPF_LSH ||
+	    BPF_SRC(lsh_insn->code) != BPF_K)
+		return false;
+	if (lsh_insn->off != 0)
+		return false;
+	if (lsh_insn->dst_reg != mov2->dst_reg)
+		return false;
+	rot_amount = (u32)lsh_insn->imm;
+	if (rot_amount == 0 || rot_amount >= 64)
+		return false;
+
+	/* Verify: N + rsh_amount == 64 */
+	if (rot_amount + rsh_amount != 64)
+		return false;
+
+	/* [4] or64 dst, tmp */
+	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
+	    BPF_OP(or_insn->code) != BPF_OR ||
+	    BPF_SRC(or_insn->code) != BPF_X)
+		return false;
+	if (or_insn->off != 0 || or_insn->imm != 0)
+		return false;
+	if (or_insn->dst_reg != mov2->dst_reg)
+		return false;
+	if (or_insn->src_reg != mov1->dst_reg)
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_rotate_5insn_masked - validate a 5-insn masked 32-bit rotate
+ *
+ * clang sometimes emits a 5-insn variant when the second MOV is eliminated:
+ *   [0] mov64  tmp, src       (copy for mask+rsh path)
+ *   [1] and64  tmp, mask      (AND_K or AND_X)
+ *   [2,3] rsh64 tmp, (32-N) + lsh64 src, N  (either order)
+ *   [4] or64   src, tmp       (combine back into src)
+ *
+ * This is always a 32-bit rotate (N + rsh_amount == 32).
+ */
+static bool bpf_jit_validate_rotate_5insn_masked(const struct bpf_insn *insns,
+						   u32 insn_cnt, u32 idx)
+{
+	const struct bpf_insn *mov_insn, *and_insn, *insn2, *insn3, *or_insn;
+	const struct bpf_insn *lsh_insn, *rsh_insn;
+	u32 rot_amount, rsh_amount;
+
+	if (idx + 5 > insn_cnt)
+		return false;
+
+	mov_insn = &insns[idx];
+	and_insn = &insns[idx + 1];
+	insn2    = &insns[idx + 2];
+	insn3    = &insns[idx + 3];
+	or_insn  = &insns[idx + 4];
+
+	/* [0] mov64 tmp, src */
+	if (mov_insn->code != (BPF_ALU64 | BPF_MOV | BPF_X))
+		return false;
+	if (mov_insn->off != 0 || mov_insn->imm != 0)
+		return false;
+
+	/* [1] and64 tmp, mask (AND_K or AND_X) */
+	if (and_insn->code != (BPF_ALU64 | BPF_AND | BPF_K) &&
+	    and_insn->code != (BPF_ALU64 | BPF_AND | BPF_X))
+		return false;
+	if (and_insn->dst_reg != mov_insn->dst_reg)
+		return false;
+
+	/* [2,3] rsh and lsh in either order */
+	if (BPF_OP(insn2->code) == BPF_RSH &&
+	    BPF_SRC(insn2->code) == BPF_K &&
+	    BPF_CLASS(insn2->code) == BPF_ALU64 &&
+	    BPF_OP(insn3->code) == BPF_LSH &&
+	    BPF_SRC(insn3->code) == BPF_K &&
+	    BPF_CLASS(insn3->code) == BPF_ALU64) {
+		rsh_insn = insn2;
+		lsh_insn = insn3;
+	} else if (BPF_OP(insn2->code) == BPF_LSH &&
+		   BPF_SRC(insn2->code) == BPF_K &&
+		   BPF_CLASS(insn2->code) == BPF_ALU64 &&
+		   BPF_OP(insn3->code) == BPF_RSH &&
+		   BPF_SRC(insn3->code) == BPF_K &&
+		   BPF_CLASS(insn3->code) == BPF_ALU64) {
+		lsh_insn = insn2;
+		rsh_insn = insn3;
+	} else {
+		return false;
+	}
+
+	/* rsh must operate on tmp */
+	if (rsh_insn->dst_reg != mov_insn->dst_reg)
+		return false;
+	/* lsh must operate on original (src) */
+	if (lsh_insn->dst_reg != mov_insn->src_reg)
+		return false;
+
+	rot_amount = (u32)lsh_insn->imm;
+	rsh_amount = (u32)rsh_insn->imm;
+	if (rot_amount == 0 || rot_amount >= 32)
+		return false;
+	if (rsh_amount == 0 || rsh_amount >= 32)
+		return false;
+	if (rot_amount + rsh_amount != 32)
+		return false;
+
+	/* [4] or64 src, tmp */
+	if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
+		return false;
+	if (or_insn->dst_reg != mov_insn->src_reg)
+		return false;
+	if (or_insn->src_reg != mov_insn->dst_reg)
+		return false;
+
+	/* Mask validation: for AND_K, reject zero; for AND_X, trust shape */
+	if (BPF_SRC(and_insn->code) == BPF_K && and_insn->imm == 0)
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_rotate_6insn - validate a 6-insn masked 32-bit rotate
+ *
+ * clang generates this pattern for 32-bit rotates in a 64-bit context:
+ *   [0] mov64  tmp, src       (copy for right-shift path)
+ *   [1] and64  tmp, mask      (BPF_ALU64|BPF_AND|BPF_K — mask bits)
+ *   [2] rsh64  tmp, (32-N)    (right shift by complement)
+ *   [3] mov64  dst, src       (copy for left-shift path, same src as [0])
+ *   [4] lsh64  dst, N         (left shift)
+ *   [5] or64   dst, tmp       (combine)
+ *
+ * This is always a 32-bit rotate (width=32), proven by the masking.
+ * N + rsh_amount == 32.
+ */
+static bool bpf_jit_validate_rotate_6insn(const struct bpf_insn *insns,
+					   u32 insn_cnt, u32 idx)
+{
+	const struct bpf_insn *mov1, *and_insn, *rsh_insn;
+	const struct bpf_insn *mov2, *lsh_insn, *or_insn;
+	u32 rot_amount, rsh_amount;
+
+	if (idx + 6 > insn_cnt)
+		return false;
+
+	mov1     = &insns[idx];
+	and_insn = &insns[idx + 1];
+	rsh_insn = &insns[idx + 2];
+	mov2     = &insns[idx + 3];
+	lsh_insn = &insns[idx + 4];
+	or_insn  = &insns[idx + 5];
+
+	/* [0] mov64 tmp, src — reg-to-reg copy, ALU64 */
+	if (BPF_CLASS(mov1->code) != BPF_ALU64 ||
+	    BPF_OP(mov1->code) != BPF_MOV ||
+	    BPF_SRC(mov1->code) != BPF_X)
+		return false;
+	if (mov1->off != 0 || mov1->imm != 0)
+		return false;
+
+	/* [1] and64 tmp, mask — immediate (AND_K) or register (AND_X) AND on tmp.
+	 * clang generates AND_X when the mask constant doesn't fit in a
+	 * sign-extended 32-bit immediate (e.g., 0xf0000000 for 32-bit rotate).
+	 */
+	if (BPF_CLASS(and_insn->code) != BPF_ALU64 ||
+	    BPF_OP(and_insn->code) != BPF_AND)
+		return false;
+	if (BPF_SRC(and_insn->code) != BPF_K &&
+	    BPF_SRC(and_insn->code) != BPF_X)
+		return false;
+	if (and_insn->off != 0)
+		return false;
+	if (and_insn->dst_reg != mov1->dst_reg)
+		return false;
+
+	/* [2] rsh64 tmp, (32-N) */
+	if (BPF_CLASS(rsh_insn->code) != BPF_ALU64 ||
+	    BPF_OP(rsh_insn->code) != BPF_RSH ||
+	    BPF_SRC(rsh_insn->code) != BPF_K)
+		return false;
+	if (rsh_insn->off != 0)
+		return false;
+	if (rsh_insn->dst_reg != mov1->dst_reg)
+		return false;
+	rsh_amount = (u32)rsh_insn->imm;
+	if (rsh_amount == 0 || rsh_amount >= 32)
+		return false;
+
+	/* [3] mov64 dst, src — must use the same source as [0] */
+	if (BPF_CLASS(mov2->code) != BPF_ALU64 ||
+	    BPF_OP(mov2->code) != BPF_MOV ||
+	    BPF_SRC(mov2->code) != BPF_X)
+		return false;
+	if (mov2->off != 0 || mov2->imm != 0)
+		return false;
+	if (mov2->src_reg != mov1->src_reg)
+		return false;
+	if (mov1->dst_reg == mov1->src_reg || mov1->dst_reg == mov2->dst_reg)
+		return false;
+
+	/* [4] lsh64 dst, N */
+	if (BPF_CLASS(lsh_insn->code) != BPF_ALU64 ||
+	    BPF_OP(lsh_insn->code) != BPF_LSH ||
+	    BPF_SRC(lsh_insn->code) != BPF_K)
+		return false;
+	if (lsh_insn->off != 0)
+		return false;
+	if (lsh_insn->dst_reg != mov2->dst_reg)
+		return false;
+	rot_amount = (u32)lsh_insn->imm;
+	if (rot_amount == 0 || rot_amount >= 32)
+		return false;
+
+	/* Verify: N + rsh_amount == 32 */
+	if (rot_amount + rsh_amount != 32)
+		return false;
+
+	/* [5] or64 dst, tmp */
+	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
+	    BPF_OP(or_insn->code) != BPF_OR ||
+	    BPF_SRC(or_insn->code) != BPF_X)
+		return false;
+	if (or_insn->off != 0 || or_insn->imm != 0)
+		return false;
+	if (or_insn->dst_reg != mov2->dst_reg)
+		return false;
+	if (or_insn->src_reg != mov1->dst_reg)
+		return false;
+
+	/*
+	 * Validate the AND mask: for a 32-bit left-rotate by N,
+	 * the right-shift path extracts bits [N..31] and shifts them
+	 * right by (32-N).  The mask should preserve at most the low 32
+	 * bits relevant to the rotation.
+	 *
+	 * For AND_K: accept any non-zero immediate mask.
+	 * For AND_X: the mask is in a register (clang loads large masks
+	 * via lddw into a register); we trust the pattern shape and
+	 * skip the imm==0 check since imm is not used for AND_X.
+	 */
+	if (BPF_SRC(and_insn->code) == BPF_K && and_insn->imm == 0)
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_rotate_rule - validate a ROTATE rule against prog
+ *
+ * Supports three patterns:
+ *   site_len==4: 4-insn rotate, classic (mov+lsh+rsh+or) or commuted (mov+rsh+lsh+or)
+ *   site_len==5: 5-insn two-copy 64-bit rotate (mov+rsh+mov+lsh+or)
+ *   site_len==6: clang's 6-insn masked 32-bit rotate (mov+and+rsh+mov+lsh+or)
+ */
+static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
+					 u32 insn_cnt,
+					 const struct bpf_jit_rule *rule)
+{
+	bool shape_ok;
+
+	if (rule->site_len == 4)
+		shape_ok = bpf_jit_validate_rotate_4insn(insns, insn_cnt,
+							  rule->site_start);
+	else if (rule->site_len == 5)
+		/* Try 64-bit two-copy first, then 32-bit masked */
+		shape_ok = bpf_jit_validate_rotate_5insn(insns, insn_cnt,
+							  rule->site_start) ||
+			   bpf_jit_validate_rotate_5insn_masked(insns, insn_cnt,
+								 rule->site_start);
+	else if (rule->site_len == 6)
+		shape_ok = bpf_jit_validate_rotate_6insn(insns, insn_cnt,
+							  rule->site_start);
+	else
+		return false;
+
+	if (!shape_ok)
 		return false;
 
 	/* Reject if any external jump targets the interior of this pattern */
