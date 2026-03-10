@@ -6,6 +6,7 @@
 
 struct bpf_prog;
 struct bpf_verifier_env;
+struct bpf_insn;
 
 /* ---- v2 legacy (BPF_PROG_LOAD path) ---- */
 
@@ -79,5 +80,11 @@ void bpf_jit_free_policy(struct bpf_jit_policy *policy);
 /* Rule lookup during JIT emission */
 const struct bpf_jit_rule *
 bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx);
+
+/* Fixed-heuristic probes for stock JIT baselines */
+int bpf_jit_probe_rotate(const struct bpf_insn *insns, u32 insn_cnt, u32 idx);
+int bpf_jit_probe_wide_mem(const struct bpf_insn *insns, u32 insn_cnt, u32 idx);
+int bpf_jit_probe_addr_calc(const struct bpf_insn *insns, u32 insn_cnt, u32 idx);
+int bpf_jit_probe_cond_select(const struct bpf_insn *insns, u32 insn_cnt, u32 idx);
 
 #endif /* _LINUX_BPF_JIT_DIRECTIVES_H */

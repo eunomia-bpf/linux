@@ -70,6 +70,40 @@ config BPF_JIT_DEFAULT_ON
 	def_bool ARCH_WANT_DEFAULT_BPF_JIT || BPF_JIT_ALWAYS_ON
 	depends on HAVE_EBPF_JIT && BPF_JIT
 
+config BPF_JIT_FIXED_ROTATE
+	bool "Enable fixed rotate baseline in the x86 BPF JIT"
+	depends on BPF_JIT && X86_64
+	default y
+	help
+	  Enable a fixed rotate-pattern baseline that emits ROR/RORX for
+	  recognized rotate idioms without requiring a v4 JIT policy blob.
+
+config BPF_JIT_FIXED_WIDE_MEM
+	bool "Enable fixed wide-memory baseline in the x86 BPF JIT"
+	depends on BPF_JIT && X86_64
+	default y
+	help
+	  Enable a fixed wide-load baseline that fuses byte-recomposition
+	  ladders into a single wider load in the x86 BPF JIT.
+
+config BPF_JIT_FIXED_LEA
+	bool "Enable fixed LEA baseline in the x86 BPF JIT"
+	depends on BPF_JIT && X86_64
+	default y
+	help
+	  Enable a fixed address-calculation baseline that fuses mov+shl+add
+	  sequences into a single LEA in the x86 BPF JIT.
+
+config BPF_JIT_FIXED_CMOV
+	bool "Enable fixed CMOV baseline in the x86 BPF JIT"
+	depends on BPF_JIT && X86_64
+	default n
+	help
+	  Enable a fixed conditional-select baseline that emits CMOV for
+	  recognized branch diamonds/compacts in the x86 BPF JIT. This is
+	  intentionally disabled by default because it can hurt predictable
+	  workloads.
+
 config BPF_UNPRIV_DEFAULT_OFF
 	bool "Disable unprivileged BPF by default"
 	default y

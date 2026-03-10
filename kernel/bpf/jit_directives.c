@@ -1413,6 +1413,90 @@ static bool bpf_jit_validate_rule(const struct bpf_insn *insns,
 	}
 }
 
+static int bpf_jit_probe_rule(const struct bpf_insn *insns, u32 insn_cnt,
+			      u32 idx, u16 rule_kind, u16 native_choice,
+			      const u16 *site_lens, u32 nr_site_lens)
+{
+	struct bpf_jit_rule rule = {
+		.rule_kind = rule_kind,
+		.native_choice = native_choice,
+		.site_start = idx,
+		.cpu_features_required = 0,
+	};
+	u32 i;
+
+	for (i = 0; i < nr_site_lens; i++) {
+		rule.site_len = site_lens[i];
+		if (bpf_jit_validate_rule(insns, insn_cnt, &rule))
+			return rule.site_len;
+	}
+
+	return 0;
+}
+
+/**
+ * bpf_jit_probe_rotate - check whether insns[idx] starts a rotate pattern
+ *
+ * Prefer the longest valid site so the fixed baseline consumes the full idiom
+ * before the main do_jit() switch considers any interior instructions.
+ *
+ * Return: matched site_len (4, 5, or 6), or 0 if no safe rotate pattern starts
+ * at idx.
+ */
+int bpf_jit_probe_rotate(const struct bpf_insn *insns, u32 insn_cnt, u32 idx)
+{
+	static const u16 site_lens[] = { 6, 5, 4 };
+
+	return bpf_jit_probe_rule(insns, insn_cnt, idx, BPF_JIT_RK_ROTATE,
+				  BPF_JIT_ROT_ROR, site_lens,
+				  sizeof(site_lens) / sizeof(site_lens[0]));
+}
+
+/**
+ * bpf_jit_probe_wide_mem - check whether insns[idx] starts a wide-load pattern
+ *
+ * Return: matched site_len (4, 10, or 22), or 0 if no safe wide-load pattern
+ * starts at idx.
+ */
+int bpf_jit_probe_wide_mem(const struct bpf_insn *insns, u32 insn_cnt, u32 idx)
+{
+	static const u16 site_lens[] = { 22, 10, 4 };
+
+	return bpf_jit_probe_rule(insns, insn_cnt, idx, BPF_JIT_RK_WIDE_MEM,
+				  BPF_JIT_WMEM_WIDE_LOAD, site_lens,
+				  sizeof(site_lens) / sizeof(site_lens[0]));
+}
+
+/**
+ * bpf_jit_probe_addr_calc - check whether insns[idx] starts an LEA candidate
+ *
+ * Return: 3 if a safe mov+shl+add address-calculation pattern starts at idx,
+ * otherwise 0.
+ */
+int bpf_jit_probe_addr_calc(const struct bpf_insn *insns, u32 insn_cnt, u32 idx)
+{
+	static const u16 site_lens[] = { 3 };
+
+	return bpf_jit_probe_rule(insns, insn_cnt, idx, BPF_JIT_RK_ADDR_CALC,
+				  BPF_JIT_ACALC_LEA, site_lens,
+				  sizeof(site_lens) / sizeof(site_lens[0]));
+}
+
+/**
+ * bpf_jit_probe_cond_select - check whether insns[idx] starts a CMOV candidate
+ *
+ * Return: matched site_len (4 for diamond, 3 for compact), or 0 if no safe
+ * conditional-select pattern starts at idx.
+ */
+int bpf_jit_probe_cond_select(const struct bpf_insn *insns, u32 insn_cnt, u32 idx)
+{
+	static const u16 site_lens[] = { 4, 3 };
+
+	return bpf_jit_probe_rule(insns, insn_cnt, idx, BPF_JIT_RK_COND_SELECT,
+				  BPF_JIT_SEL_CMOVCC, site_lens,
+				  sizeof(site_lens) / sizeof(site_lens[0]));
+}
+
 static u32 bpf_jit_main_subprog_end(const struct bpf_prog *prog)
 {
 	if (prog->aux->func_cnt > 1 && prog->aux->func &&

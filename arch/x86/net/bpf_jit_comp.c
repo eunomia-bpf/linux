@@ -2509,6 +2509,37 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 	}
 }
 
+static int bpf_jit_commit_multi_insn(u8 **pprog, u8 *temp, u8 *image,
+				     u8 *rw_image, int oldproglen, int *proglen,
+				     int *addrs, int i, int consumed)
+{
+	int region_start = *proglen;
+	int ilen = *pprog - temp;
+	int j;
+
+	if (ilen > BPF_MAX_INSN_SIZE) {
+		pr_err("bpf_jit: fatal insn size error\n");
+		return -EFAULT;
+	}
+
+	if (image) {
+		if (unlikely(region_start + ilen > oldproglen)) {
+			pr_err("bpf_jit: fatal error\n");
+			return -EFAULT;
+		}
+		memcpy(rw_image + region_start, temp, ilen);
+	}
+
+	*proglen = region_start + ilen;
+
+	for (j = 0; j < consumed - 1; j++)
+		addrs[i + j] = region_start;
+	addrs[i + consumed - 1] = *proglen;
+
+	*pprog = temp;
+	return 0;
+}
+
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -2586,6 +2617,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		u8 jmp_cond;
 		u8 *func;
 		int nops;
+		bool v4_rule_matched = false;
 
 		if (priv_frame_ptr) {
 			if (src_reg == BPF_REG_FP)
@@ -2610,46 +2642,173 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
 					int consumed;
 
+					v4_rule_matched = true;
 					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
 									 rule,
 									 bpf_prog->insnsi,
 									 priv_frame_ptr != NULL);
 					if (consumed > 0) {
-						int region_start = proglen;
-						int j;
-
-						ilen = prog - temp;
-						if (ilen > BPF_MAX_INSN_SIZE) {
-							pr_err("bpf_jit: fatal insn size error\n");
-							return -EFAULT;
-						}
-
-						if (image) {
-							if (unlikely(region_start + ilen > oldproglen)) {
-								pr_err("bpf_jit: fatal error\n");
-								return -EFAULT;
-							}
-							memcpy(rw_image + region_start, temp, ilen);
-						}
-
-						proglen = region_start + ilen;
-
-						/*
-						 * Fill addrs for all consumed insns.
-						 * addrs[i+j] for j=0..consumed-2 -> region_start
-						 * addrs[i+consumed-1] -> proglen (end of block)
-						 */
-						for (j = 0; j < consumed - 1; j++)
-							addrs[i + j] = region_start;
-						addrs[i + consumed - 1] = proglen;
-
-						prog = temp;
+						err = bpf_jit_commit_multi_insn(&prog, temp,
+									 image, rw_image,
+									 oldproglen, &proglen,
+									 addrs, i, consumed);
+						if (err)
+							return err;
 						insn += consumed - 1;
 						i += consumed - 1;
 						continue;
 					}
 					/* consumed == 0 means fall through to stock emission */
 					/* consumed < 0 means error, also fall through */
+				}
+			}
+		}
+
+		/*
+		 * Fixed baselines are an alternative to the v4 policy path, not
+		 * an override for it. If an active v4 rule starts here, its
+		 * choice wins even when it requests stock emission.
+		 */
+		if (!v4_rule_matched) {
+			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_ROTATE)) {
+				int site_len;
+
+				site_len = bpf_jit_probe_rotate(bpf_prog->insnsi,
+								insn_cnt, i - 1);
+				if (site_len > 0) {
+					struct bpf_jit_rule fixed_rule = {
+						.site_start = i - 1,
+						.site_len = site_len,
+						.rule_kind = BPF_JIT_RK_ROTATE,
+						.native_choice = boot_cpu_has(X86_FEATURE_BMI2) ?
+								BPF_JIT_ROT_RORX :
+								BPF_JIT_ROT_ROR,
+					};
+					int consumed;
+
+					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+									 &fixed_rule,
+									 bpf_prog->insnsi,
+									 priv_frame_ptr != NULL);
+					if (consumed > 0) {
+						err = bpf_jit_commit_multi_insn(&prog, temp,
+									 image, rw_image,
+									 oldproglen, &proglen,
+									 addrs, i, consumed);
+						if (err)
+							return err;
+						insn += consumed - 1;
+						i += consumed - 1;
+						continue;
+					}
+				}
+			}
+
+			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_WIDE_MEM)) {
+				int site_len;
+
+				site_len = bpf_jit_probe_wide_mem(bpf_prog->insnsi,
+								  insn_cnt, i - 1);
+				if (site_len > 0) {
+					struct bpf_jit_rule fixed_rule = {
+						.site_start = i - 1,
+						.site_len = site_len,
+						.rule_kind = BPF_JIT_RK_WIDE_MEM,
+						.native_choice = BPF_JIT_WMEM_WIDE_LOAD,
+					};
+					int consumed;
+
+					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+									 &fixed_rule,
+									 bpf_prog->insnsi,
+									 priv_frame_ptr != NULL);
+					if (consumed > 0) {
+						err = bpf_jit_commit_multi_insn(&prog, temp,
+									 image, rw_image,
+									 oldproglen, &proglen,
+									 addrs, i, consumed);
+						if (err)
+							return err;
+						insn += consumed - 1;
+						i += consumed - 1;
+						continue;
+					}
+				}
+			}
+
+			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_LEA)) {
+				int site_len;
+
+				site_len = bpf_jit_probe_addr_calc(bpf_prog->insnsi,
+								   insn_cnt, i - 1);
+				if (site_len > 0) {
+					struct bpf_jit_rule fixed_rule = {
+						.site_start = i - 1,
+						.site_len = site_len,
+						.rule_kind = BPF_JIT_RK_ADDR_CALC,
+						.native_choice = BPF_JIT_ACALC_LEA,
+					};
+					int consumed;
+
+					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+									 &fixed_rule,
+									 bpf_prog->insnsi,
+									 priv_frame_ptr != NULL);
+					if (consumed > 0) {
+						err = bpf_jit_commit_multi_insn(&prog, temp,
+									 image, rw_image,
+									 oldproglen, &proglen,
+									 addrs, i, consumed);
+						if (err)
+							return err;
+						insn += consumed - 1;
+						i += consumed - 1;
+						continue;
+					}
+				}
+			}
+
+			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_CMOV) &&
+			    boot_cpu_has(X86_FEATURE_CMOV)) {
+				int site_len;
+
+				site_len = bpf_jit_probe_cond_select(bpf_prog->insnsi,
+								     insn_cnt, i - 1);
+				if (site_len > 0) {
+					u32 directive_idx = site_len == 4 ? i - 1 : i;
+
+					/*
+					 * Keep explicit legacy CMOV directives ahead of
+					 * the fixed baseline when they target the same site.
+					 */
+					directive = bpf_jit_directive_lookup(bpf_prog,
+									     BPF_JIT_DIRECTIVE_CMOV_SELECT,
+									     directive_idx);
+					if (!directive) {
+						struct bpf_jit_rule fixed_rule = {
+							.site_start = i - 1,
+							.site_len = site_len,
+							.rule_kind = BPF_JIT_RK_COND_SELECT,
+							.native_choice = BPF_JIT_SEL_CMOVCC,
+						};
+						int consumed;
+
+						consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+										 &fixed_rule,
+										 bpf_prog->insnsi,
+										 priv_frame_ptr != NULL);
+						if (consumed > 0) {
+							err = bpf_jit_commit_multi_insn(&prog, temp,
+										 image, rw_image,
+										 oldproglen, &proglen,
+										 addrs, i, consumed);
+							if (err)
+								return err;
+							insn += consumed - 1;
+							i += consumed - 1;
+							continue;
+						}
+					}
 				}
 			}
 		}
