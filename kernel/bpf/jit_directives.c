@@ -489,32 +489,105 @@ static int rule_cmp(const void *a, const void *b)
 }
 
 /**
+ * bpf_jit_has_interior_edge - check if any jump from outside targets inside a pattern
+ * @insns:      full BPF instruction array
+ * @insn_cnt:   number of instructions
+ * @site_start: first instruction index of the pattern (inclusive)
+ * @site_len:   number of instructions in the pattern
+ *
+ * An "interior edge" is a jump whose source is OUTSIDE [site_start,
+ * site_start+site_len) and whose target falls STRICTLY INSIDE the same
+ * range, i.e. target > site_start && target < site_start+site_len.
+ *
+ * When such a jump exists the cmov transformation would corrupt the jump's
+ * target address (addrs[] entries shift), so the rule must be rejected.
+ */
+static bool bpf_jit_has_interior_edge(const struct bpf_insn *insns,
+				      u32 insn_cnt,
+				      u32 site_start, u32 site_len)
+{
+	u32 site_end = site_start + site_len;
+	u32 i;
+
+	for (i = 0; i < insn_cnt; i++) {
+		u8 code = insns[i].code;
+		u8 cls  = BPF_CLASS(code);
+		u8 op;
+		s32 target;
+
+		/* Only care about jump class instructions */
+		if (cls != BPF_JMP && cls != BPF_JMP32)
+			continue;
+
+		op = BPF_OP(code);
+
+		/* EXIT and CALL do not branch to an instruction offset */
+		if (op == BPF_EXIT || op == BPF_CALL)
+			continue;
+
+		/* Compute jump target (0-based absolute index) */
+		if (op == BPF_JA) {
+			if (cls == BPF_JMP)
+				target = (s32)i + 1 + (s32)insns[i].off;
+			else /* BPF_JMP32 JA encodes offset in imm */
+				target = (s32)i + 1 + (s32)insns[i].imm;
+		} else {
+			target = (s32)i + 1 + (s32)insns[i].off;
+		}
+
+		if (target < 0 || (u32)target >= insn_cnt)
+			continue;
+
+		/*
+		 * Check: source is OUTSIDE the pattern AND target is
+		 * STRICTLY INTERIOR (not the first instruction, which is
+		 * the canonical entry point and is fine).
+		 */
+		if ((i < site_start || i >= site_end) &&
+		    (u32)target > site_start && (u32)target < site_end)
+			return true;
+	}
+
+	return false;
+}
+
+/**
  * bpf_jit_validate_cond_select_rule - validate a COND_SELECT rule against prog
  *
  * Check that the BPF insn sequence at site_start matches either a diamond
- * (jcc+2, mov, ja+1, mov) or compact (mov, jcc+1, mov) shape.
+ * (jcc+2, mov, ja+1, mov) or compact (mov, jcc+1, mov) shape, and that no
+ * jump from outside the pattern targets an interior instruction (which would
+ * corrupt addrs[] after the cmov transformation).
  */
 static bool bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
 					      u32 insn_cnt,
 					      const struct bpf_jit_rule *rule)
 {
 	u32 idx = rule->site_start;
+	bool shape_ok;
 
 	if (rule->site_len == 4) {
 		/* Diamond: jcc+2, mov_false, ja+1, mov_true */
-		return bpf_jit_cmov_select_match_diamond(insns, insn_cnt, idx);
-	}
-
-	if (rule->site_len == 3) {
+		shape_ok = bpf_jit_cmov_select_match_diamond(insns, insn_cnt, idx);
+	} else if (rule->site_len == 3) {
 		/* Compact: mov_default, jcc+1, mov_override
 		 * The match function expects idx pointing at the jcc,
 		 * so idx+1 is the jcc in a compact form where site_start
 		 * is the mov_default.
 		 */
-		return bpf_jit_cmov_select_match_compact(insns, insn_cnt, idx + 1);
+		shape_ok = bpf_jit_cmov_select_match_compact(insns, insn_cnt, idx + 1);
+	} else {
+		return false;
 	}
 
-	return false;
+	if (!shape_ok)
+		return false;
+
+	/* Reject if any external jump targets the interior of this pattern */
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start, rule->site_len))
+		return false;
+
+	return true;
 }
 
 /**
@@ -619,6 +692,10 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 				return false;
 		}
 	}
+
+	/* Reject if any external jump targets the interior of this pattern */
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start, rule->site_len))
+		return false;
 
 	return true;
 }
@@ -778,28 +855,37 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	policy->rule_cnt = hdr->rule_cnt;
 	policy->active_cnt = 0;
 
-	/* Copy rules and validate each one */
-	for (i = 0; i < hdr->rule_cnt; i++) {
-		struct bpf_jit_rule *rule = &policy->rules[i];
+		/* Copy rules and validate each one */
+		for (i = 0; i < hdr->rule_cnt; i++) {
+			struct bpf_jit_rule *rule = &policy->rules[i];
+			bool active;
 
-		rule->rule_kind = urules[i].rule_kind;
-		rule->native_choice = urules[i].native_choice;
-		rule->site_start = urules[i].site_start;
+			rule->rule_kind = urules[i].rule_kind;
+			rule->native_choice = urules[i].native_choice;
+			rule->site_start = urules[i].site_start;
 		rule->site_len = urules[i].site_len;
 		rule->priority = urules[i].priority;
 		rule->reserved = 0;
 
-		/* Validate against actual BPF instructions */
-		if (bpf_jit_validate_rule(prog->insnsi, prog->len, rule)) {
-			rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
-			policy->active_cnt++;
-		} else {
-			rule->flags = 0; /* failed validation, will be skipped */
-		}
-	}
+			/* Validate against actual BPF instructions */
+			active = bpf_jit_validate_rule(prog->insnsi, prog->len, rule);
+			if (active) {
+				rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
+				policy->active_cnt++;
+			} else {
+				rule->flags = 0; /* failed validation, will be skipped */
+			}
 
-	/* Sort by site_start for efficient lookup */
-	sort(policy->rules, policy->rule_cnt,
+			pr_info("bpf_jit_v4: parse rule[%u] kind=%u choice=%u site=%u len=%u active=%d\n",
+				i, rule->rule_kind, rule->native_choice,
+				rule->site_start, rule->site_len, active);
+		}
+
+		pr_info("bpf_jit_v4: parsed policy rules=%u active=%u prog_len=%u\n",
+			policy->rule_cnt, policy->active_cnt, prog->len);
+
+		/* Sort by site_start for efficient lookup */
+		sort(policy->rules, policy->rule_cnt,
 	     sizeof(struct bpf_jit_rule), rule_cmp, NULL);
 
 out:
