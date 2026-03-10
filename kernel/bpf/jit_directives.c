@@ -1016,14 +1016,23 @@ static bool bpf_jit_validate_rotate_5insn_masked(const struct bpf_insn *insns,
 	or_insn  = &insns[idx + 4];
 
 	/* [0] mov64 tmp, src */
-	if (mov_insn->code != (BPF_ALU64 | BPF_MOV | BPF_X))
+	if (BPF_CLASS(mov_insn->code) != BPF_ALU64 ||
+	    BPF_OP(mov_insn->code) != BPF_MOV ||
+	    BPF_SRC(mov_insn->code) != BPF_X)
 		return false;
 	if (mov_insn->off != 0 || mov_insn->imm != 0)
 		return false;
+	if (mov_insn->dst_reg == mov_insn->src_reg)
+		return false;
 
 	/* [1] and64 tmp, mask (AND_K or AND_X) */
-	if (and_insn->code != (BPF_ALU64 | BPF_AND | BPF_K) &&
-	    and_insn->code != (BPF_ALU64 | BPF_AND | BPF_X))
+	if (BPF_CLASS(and_insn->code) != BPF_ALU64 ||
+	    BPF_OP(and_insn->code) != BPF_AND)
+		return false;
+	if (BPF_SRC(and_insn->code) != BPF_K &&
+	    BPF_SRC(and_insn->code) != BPF_X)
+		return false;
+	if (and_insn->off != 0)
 		return false;
 	if (and_insn->dst_reg != mov_insn->dst_reg)
 		return false;
@@ -1050,9 +1059,13 @@ static bool bpf_jit_validate_rotate_5insn_masked(const struct bpf_insn *insns,
 	}
 
 	/* rsh must operate on tmp */
+	if (rsh_insn->off != 0)
+		return false;
 	if (rsh_insn->dst_reg != mov_insn->dst_reg)
 		return false;
 	/* lsh must operate on original (src) */
+	if (lsh_insn->off != 0)
+		return false;
 	if (lsh_insn->dst_reg != mov_insn->src_reg)
 		return false;
 
@@ -1066,7 +1079,11 @@ static bool bpf_jit_validate_rotate_5insn_masked(const struct bpf_insn *insns,
 		return false;
 
 	/* [4] or64 src, tmp */
-	if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
+	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
+	    BPF_OP(or_insn->code) != BPF_OR ||
+	    BPF_SRC(or_insn->code) != BPF_X)
+		return false;
+	if (or_insn->off != 0 || or_insn->imm != 0)
 		return false;
 	if (or_insn->dst_reg != mov_insn->src_reg)
 		return false;
