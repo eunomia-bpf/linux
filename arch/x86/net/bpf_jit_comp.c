@@ -2048,6 +2048,121 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
 	return 0;
 }
 
+/*
+ * v4 JIT policy framework: wide_load emitter
+ *
+ * Replaces a byte-load ladder (N byte loads + shifts + ORs) with a single
+ * wider load instruction.
+ *
+ * Pattern replaced (for N bytes):
+ *   [0] ldxb dst, [base+off]
+ *   [1] ldxb tmp, [base+off+1]
+ *   [2] lsh64 tmp, 8
+ *   [3] or64  dst, tmp
+ *   ... (repeated for each additional byte)
+ *
+ * Emitted:
+ *   If N==2: movzx dst, word ptr [base+off]   (zero-extend 16->64)
+ *   If N==4: mov   dst, dword ptr [base+off]  (zero-extend 32->64)
+ *   If N==8: mov   dst, qword ptr [base+off]
+ *
+ * For N==3,5,6,7: load next power-of-2 and mask, but POC only supports 2,4,8.
+ */
+static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
+			       const struct bpf_jit_rule *rule,
+			       bool use_priv_fp)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *first = &insns[idx];
+	u32 dst_reg = jit_bpf_reg(first->dst_reg, use_priv_fp);
+	u32 src_reg = jit_bpf_reg(first->src_reg, use_priv_fp);
+	s16 off = first->off;
+	u32 width;
+
+	/* Calculate width from site_len: N = (site_len + 2) / 3 */
+	width = (rule->site_len + 2) / 3;
+
+	switch (width) {
+	case 2:
+		/* Emit: movzx dst, word ptr [src+off] */
+		emit_ldx(pprog, BPF_H, dst_reg, src_reg, off);
+		return 0;
+	case 4:
+		/* Emit: mov dst_32, dword ptr [src+off] (zero-extends to 64-bit) */
+		emit_ldx(pprog, BPF_W, dst_reg, src_reg, off);
+		return 0;
+	case 8:
+		/* Emit: mov dst, qword ptr [src+off] */
+		emit_ldx(pprog, BPF_DW, dst_reg, src_reg, off);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+/*
+ * v4 JIT policy framework: general rule dispatcher
+ *
+ * Called from do_jit() main loop. If a rule covers the current BPF insn,
+ * emits the alternative native code and returns the number of BPF insns
+ * consumed (>= 1). Returns 0 if no rule applies, or -1 on error.
+ */
+static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
+				  const struct bpf_jit_rule *rule,
+				  const struct bpf_insn *insns,
+				  bool use_priv_fp)
+{
+	int err;
+
+	switch (rule->rule_kind) {
+	case BPF_JIT_RK_COND_SELECT:
+		if (rule->native_choice == BPF_JIT_SEL_BRANCH) {
+			/* Stock emission requested — return 0 to fall through */
+			return 0;
+		}
+		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
+			return -1;
+
+		if (rule->site_len == 4) {
+			/* Diamond: jcc, mov_false, ja, mov_true */
+			err = emit_bpf_cmov_select(pprog,
+						   &insns[rule->site_start],
+						   &insns[rule->site_start + 1],
+						   &insns[rule->site_start + 3],
+						   use_priv_fp);
+		} else if (rule->site_len == 3) {
+			/* Compact: mov_default, jcc, mov_override */
+			err = emit_bpf_cmov_select_compact(pprog,
+							   &insns[rule->site_start],
+							   &insns[rule->site_start + 1],
+							   &insns[rule->site_start + 2],
+							   use_priv_fp);
+		} else {
+			return -1;
+		}
+
+		if (err)
+			return -1;
+		return rule->site_len;
+
+	case BPF_JIT_RK_WIDE_MEM:
+		if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS) {
+			/* Stock emission requested */
+			return 0;
+		}
+		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
+			return -1;
+
+		err = emit_bpf_wide_load(pprog, insns, rule, use_priv_fp);
+		if (err)
+			return -1;
+		return rule->site_len;
+
+	default:
+		return -1;
+	}
+}
+
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -2132,6 +2247,65 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 			if (dst_reg == BPF_REG_FP)
 				dst_reg = X86_REG_R9;
+		}
+
+		/* v4 rule dispatch: check if a rewrite rule covers this insn */
+		{
+			const struct bpf_jit_policy *v4_policy;
+			const struct bpf_prog_aux *v4_aux;
+
+			v4_aux = bpf_prog->aux->main_prog_aux ?
+				 bpf_prog->aux->main_prog_aux : bpf_prog->aux;
+			v4_policy = v4_aux->jit_policy;
+			if (v4_policy && v4_policy->active_cnt) {
+				const struct bpf_jit_rule *rule;
+
+				rule = bpf_jit_rule_lookup(v4_policy, i - 1);
+				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
+					int consumed;
+
+					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+									 rule,
+									 bpf_prog->insnsi,
+									 priv_frame_ptr != NULL);
+					if (consumed > 0) {
+						int region_start = proglen;
+						int j;
+
+						ilen = prog - temp;
+						if (ilen > BPF_MAX_INSN_SIZE) {
+							pr_err("bpf_jit: fatal insn size error\n");
+							return -EFAULT;
+						}
+
+						if (image) {
+							if (unlikely(region_start + ilen > oldproglen)) {
+								pr_err("bpf_jit: fatal error\n");
+								return -EFAULT;
+							}
+							memcpy(rw_image + region_start, temp, ilen);
+						}
+
+						proglen = region_start + ilen;
+
+						/*
+						 * Fill addrs for all consumed insns.
+						 * addrs[i+j] for j=0..consumed-2 -> region_start
+						 * addrs[i+consumed-1] -> proglen (end of block)
+						 */
+						for (j = 0; j < consumed - 1; j++)
+							addrs[i + j] = region_start;
+						addrs[i + consumed - 1] = proglen;
+
+						prog = temp;
+						insn += consumed - 1;
+						i += consumed - 1;
+						continue;
+					}
+					/* consumed == 0 means fall through to stock emission */
+					/* consumed < 0 means error, also fall through */
+				}
+			}
 		}
 
 		if (i + 1 < bpf_prog->len && is_bpf_simple_mov(insn)) {

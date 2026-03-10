@@ -292,6 +292,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		bpf_jit_directives_free(fp->aux->jit_directives);
+		bpf_jit_free_policy(fp->aux->jit_policy);
 		kfree(fp->aux->poke_tab);
 		kfree(fp->aux);
 	}

@@ -6341,6 +6341,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 	case BPF_PROG_ASSOC_STRUCT_OPS:
 		err = prog_assoc_struct_ops(&attr);
 		break;
+	case BPF_PROG_JIT_RECOMPILE:
+		err = bpf_prog_jit_recompile(&attr);
+		break;
 	default:
 		err = -EINVAL;
 		break;

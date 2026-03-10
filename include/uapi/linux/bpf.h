@@ -993,6 +993,7 @@ enum bpf_cmd {
 	BPF_TOKEN_CREATE,
 	BPF_PROG_STREAM_READ_BY_FD,
 	BPF_PROG_ASSOC_STRUCT_OPS,
+	BPF_PROG_JIT_RECOMPILE,
 	__MAX_BPF_CMD,
 };
 
@@ -1465,6 +1466,54 @@ enum bpf_jit_directives_load_flags {
 	BPF_F_JIT_DIRECTIVES_LOG = (1U << 0),
 };
 
+/* ---- v4 JIT policy blob format ---- */
+
+#define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
+#define BPF_JIT_POLICY_VERSION		1
+
+/* Architecture IDs for policy blob */
+#define BPF_JIT_ARCH_X86_64		1
+#define BPF_JIT_ARCH_ARM64		2
+
+struct bpf_jit_policy_hdr {
+	__u32 magic;
+	__u16 version;
+	__u16 hdr_len;		/* sizeof(this struct) */
+	__u32 total_len;	/* entire blob size */
+	__u32 rule_cnt;		/* number of rules */
+	__u32 insn_cnt;		/* bound program insn_cnt */
+	__u8  prog_tag[8];	/* BPF_TAG_SIZE, digest binding */
+	__u16 arch_id;		/* BPF_JIT_ARCH_X86_64 etc */
+	__u16 flags;		/* reserved */
+};
+
+enum bpf_jit_rule_kind {
+	BPF_JIT_RK_COND_SELECT	= 1,	/* cmovcc vs branch */
+	BPF_JIT_RK_WIDE_MEM	= 2,	/* wide load vs byte ladder */
+};
+
+/* COND_SELECT native_choice values */
+enum bpf_jit_select_native {
+	BPF_JIT_SEL_CMOVCC	= 1,	/* x86: cmp + cmovcc */
+	BPF_JIT_SEL_BRANCH	= 2,	/* x86: cmp + jcc + mov (stock) */
+};
+
+/* WIDE_MEM native_choice values */
+enum bpf_jit_wide_mem_native {
+	BPF_JIT_WMEM_WIDE_LOAD	= 1,	/* x86: wide mov + extract */
+	BPF_JIT_WMEM_BYTE_LOADS	= 2,	/* stock: multiple byte loads */
+};
+
+struct bpf_jit_rewrite_rule {
+	__u32 site_start;	/* BPF instruction offset */
+	__u16 site_len;		/* span length in BPF insns */
+	__u16 rule_kind;	/* enum bpf_jit_rule_kind */
+	__u16 native_choice;	/* which native instruction to use */
+	__u16 priority;		/* higher wins on overlap */
+	__u32 reserved;
+};
+
+/* Backward-compat: keep v2 magic/version for BPF_PROG_LOAD path */
 #define BPF_JIT_DIRECTIVE_MAGIC		0x4a445243U
 #define BPF_JIT_DIRECTIVE_VERSION	2
 
@@ -1958,6 +2007,12 @@ union bpf_attr {
 		__u32		prog_fd;
 		__u32		flags;
 	} prog_assoc_struct_ops;
+
+	struct { /* struct used by BPF_PROG_JIT_RECOMPILE command */
+		__u32		prog_fd;
+		__s32		policy_fd;	/* sealed memfd with policy blob; 0 = stock re-JIT */
+		__u32		flags;
+	} jit_recompile;
 
 } __attribute__((aligned(8)));
 
