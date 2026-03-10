@@ -1490,6 +1490,8 @@ struct bpf_jit_policy_hdr {
 enum bpf_jit_rule_kind {
 	BPF_JIT_RK_COND_SELECT	= 1,	/* cmovcc vs branch */
 	BPF_JIT_RK_WIDE_MEM	= 2,	/* wide load vs byte ladder */
+	BPF_JIT_RK_ROTATE	= 3,	/* rorx/ror vs shift+or */
+	BPF_JIT_RK_ADDR_CALC	= 4,	/* lea vs mov+shl+add */
 };
 
 /* COND_SELECT native_choice values */
@@ -1504,13 +1506,30 @@ enum bpf_jit_wide_mem_native {
 	BPF_JIT_WMEM_BYTE_LOADS	= 2,	/* stock: multiple byte loads */
 };
 
+/* ROTATE native_choice values */
+enum bpf_jit_rotate_native {
+	BPF_JIT_ROT_ROR		= 1,	/* x86: ror reg, imm */
+	BPF_JIT_ROT_RORX	= 2,	/* x86: rorx reg, reg, imm (BMI2) */
+	BPF_JIT_ROT_SHIFT	= 3,	/* stock: shl+shr+or */
+};
+
+/* ADDR_CALC native_choice values */
+enum bpf_jit_addr_calc_native {
+	BPF_JIT_ACALC_LEA		= 1,	/* x86: lea dst, [base + idx*scale] */
+	BPF_JIT_ACALC_SHIFT_ADD	= 2,	/* stock: mov+shl+add */
+};
+
+/* x86 CPU feature bits for bpf_jit_rewrite_rule.cpu_features_required */
+#define BPF_JIT_X86_CMOV	(1U << 0)
+#define BPF_JIT_X86_BMI2	(1U << 1)
+
 struct bpf_jit_rewrite_rule {
-	__u32 site_start;	/* BPF instruction offset */
-	__u16 site_len;		/* span length in BPF insns */
-	__u16 rule_kind;	/* enum bpf_jit_rule_kind */
-	__u16 native_choice;	/* which native instruction to use */
-	__u16 priority;		/* higher wins on overlap */
-	__u32 reserved;
+	__u32 site_start;		/* BPF instruction offset */
+	__u16 site_len;			/* span length in BPF insns */
+	__u16 rule_kind;		/* enum bpf_jit_rule_kind */
+	__u16 native_choice;		/* which native instruction to use */
+	__u16 priority;			/* higher wins on overlap */
+	__u32 cpu_features_required;	/* BPF_JIT_X86_* bits */
 };
 
 /* Backward-compat: keep v2 magic/version for BPF_PROG_LOAD path */

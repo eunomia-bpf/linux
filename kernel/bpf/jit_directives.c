@@ -17,6 +17,9 @@
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <uapi/linux/fcntl.h>
+#if defined(CONFIG_X86_64)
+#include <asm/cpufeature.h>
+#endif
 
 #define BPF_JIT_DIRECTIVES_MAX_BLOB_SIZE SZ_64K
 #define BPF_JIT_MAX_RULES		256
@@ -660,6 +663,10 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 		if (expected_bytes < 2 || expected_bytes > 8)
 			return false;
 
+		/* Only support power-of-2 widths that the emitter handles */
+		if (expected_bytes != 2 && expected_bytes != 4 && expected_bytes != 8)
+			return false;
+
 		/* Validate each subsequent byte group */
 		for (i = 1; i < expected_bytes; i++) {
 			u32 group_base = idx + 1 + (i - 1) * 3;
@@ -700,12 +707,216 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 	return true;
 }
 
+/**
+ * bpf_jit_validate_rotate_rule - validate a ROTATE rule against prog
+ *
+ * Check that the BPF insn sequence at site_start matches a rotate idiom:
+ *   [0] mov   tmp, dst        (copy original)
+ *   [1] lsh64 dst, N          (left shift by rotation amount)
+ *   [2] rsh64 tmp, (W-N)      (right shift complement)
+ *   [3] or64  dst, tmp        (combine)
+ *
+ * Where W is 32 or 64 and N is the rotation amount (1..W-1).
+ * site_len must be 4.
+ */
+static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
+					 u32 insn_cnt,
+					 const struct bpf_jit_rule *rule)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *mov_insn, *lsh_insn, *rsh_insn, *or_insn;
+	u8 lsh_cls, rsh_cls, or_cls;
+	u32 width, rot_amount;
+
+	if (rule->site_len != 4)
+		return false;
+
+	if (idx + 4 > insn_cnt)
+		return false;
+
+	mov_insn = &insns[idx];
+	lsh_insn = &insns[idx + 1];
+	rsh_insn = &insns[idx + 2];
+	or_insn  = &insns[idx + 3];
+
+	/* [0] Must be MOV_X (reg-to-reg copy) */
+	if (BPF_OP(mov_insn->code) != BPF_MOV ||
+	    BPF_SRC(mov_insn->code) != BPF_X ||
+	    mov_insn->off != 0 || mov_insn->imm != 0)
+		return false;
+
+	/* Determine width from MOV class */
+	if (BPF_CLASS(mov_insn->code) == BPF_ALU64)
+		width = 64;
+	else if (BPF_CLASS(mov_insn->code) == BPF_ALU)
+		width = 32;
+	else
+		return false;
+
+	/* tmp = mov_insn->dst_reg, src (original) = mov_insn->src_reg */
+	/* [1] lsh dst, N — dst must be the original src, imm is rotation amount */
+	lsh_cls = BPF_CLASS(lsh_insn->code);
+	if (BPF_OP(lsh_insn->code) != BPF_LSH || BPF_SRC(lsh_insn->code) != BPF_K)
+		return false;
+	if ((width == 64 && lsh_cls != BPF_ALU64) ||
+	    (width == 32 && lsh_cls != BPF_ALU))
+		return false;
+	if (lsh_insn->dst_reg != mov_insn->src_reg)
+		return false;
+
+	rot_amount = (u32)lsh_insn->imm;
+	if (rot_amount == 0 || rot_amount >= width)
+		return false;
+
+	/* [2] rsh tmp, (W - N) */
+	rsh_cls = BPF_CLASS(rsh_insn->code);
+	if (BPF_OP(rsh_insn->code) != BPF_RSH || BPF_SRC(rsh_insn->code) != BPF_K)
+		return false;
+	if ((width == 64 && rsh_cls != BPF_ALU64) ||
+	    (width == 32 && rsh_cls != BPF_ALU))
+		return false;
+	if (rsh_insn->dst_reg != mov_insn->dst_reg)
+		return false;
+	if ((u32)rsh_insn->imm != width - rot_amount)
+		return false;
+
+	/* [3] or dst, tmp */
+	or_cls = BPF_CLASS(or_insn->code);
+	if (BPF_OP(or_insn->code) != BPF_OR || BPF_SRC(or_insn->code) != BPF_X)
+		return false;
+	if ((width == 64 && or_cls != BPF_ALU64) ||
+	    (width == 32 && or_cls != BPF_ALU))
+		return false;
+	if (or_insn->dst_reg != mov_insn->src_reg)
+		return false;
+	if (or_insn->src_reg != mov_insn->dst_reg)
+		return false;
+
+	/* Reject if any external jump targets the interior of this pattern */
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start, rule->site_len))
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_validate_addr_calc_rule - validate an ADDR_CALC rule against prog
+ *
+ * Check that the BPF insn sequence at site_start matches:
+ *   [0] mov   dst, idx        (copy index, reg-to-reg)
+ *   [1] lsh64 dst, scale      (scale in {1,2,3} for *2, *4, *8)
+ *   [2] add64 dst, base       (add base register)
+ *
+ * site_len must be 3.
+ */
+static bool bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
+					    u32 insn_cnt,
+					    const struct bpf_jit_rule *rule)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *mov_insn, *lsh_insn, *add_insn;
+
+	if (rule->site_len != 3)
+		return false;
+
+	if (idx + 3 > insn_cnt)
+		return false;
+
+	mov_insn = &insns[idx];
+	lsh_insn = &insns[idx + 1];
+	add_insn = &insns[idx + 2];
+
+	/* [0] Must be MOV_X (reg-to-reg copy), ALU64 */
+	if (mov_insn->code != (BPF_ALU64 | BPF_MOV | BPF_X))
+		return false;
+	if (mov_insn->off != 0 || mov_insn->imm != 0)
+		return false;
+
+	/* [1] lsh64 dst, K where K in {1, 2, 3} */
+	if (lsh_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
+		return false;
+	if (lsh_insn->dst_reg != mov_insn->dst_reg)
+		return false;
+	if (lsh_insn->imm < 1 || lsh_insn->imm > 3)
+		return false;
+
+	/* [2] add64 dst, X (register) */
+	if (add_insn->code != (BPF_ALU64 | BPF_ADD | BPF_X))
+		return false;
+	if (add_insn->dst_reg != mov_insn->dst_reg)
+		return false;
+
+	/* Reject if any external jump targets the interior of this pattern */
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start, rule->site_len))
+		return false;
+
+	return true;
+}
+
+/**
+ * bpf_jit_site_has_side_effects - reject sites containing unsafe instructions
+ *
+ * A rule site must be pure computation (no memory stores, helper calls, or
+ * atomics).  This generic Layer-2 check runs before kind-specific validation
+ * and filters out sites that would be unsafe to rewrite regardless of the
+ * particular transformation.
+ */
+static bool bpf_jit_site_has_side_effects(const struct bpf_insn *insns,
+					   u32 site_start, u32 site_len)
+{
+	u32 i;
+
+	for (i = site_start; i < site_start + site_len; i++) {
+		u8 cls = BPF_CLASS(insns[i].code);
+		u8 op  = BPF_OP(insns[i].code);
+
+		/* Reject helper calls */
+		if (cls == BPF_JMP && op == BPF_CALL)
+			return true;
+
+		/* Reject stores (BPF_STX, BPF_ST) */
+		if (cls == BPF_STX || cls == BPF_ST)
+			return true;
+	}
+	return false;
+}
+
+/* CPU feature gating */
+#if defined(CONFIG_X86_64)
+static bool bpf_jit_check_cpu_features(u32 required)
+{
+	u32 available = 0;
+
+	if (boot_cpu_has(X86_FEATURE_CMOV))
+		available |= BPF_JIT_X86_CMOV;
+	if (boot_cpu_has(X86_FEATURE_BMI2))
+		available |= BPF_JIT_X86_BMI2;
+
+	return (required & available) == required;
+}
+#else
+static bool bpf_jit_check_cpu_features(u32 required)
+{
+	return required == 0;
+}
+#endif
+
 static bool bpf_jit_validate_rule(const struct bpf_insn *insns,
 				  u32 insn_cnt,
 				  const struct bpf_jit_rule *rule)
 {
 	/* Bounds check */
 	if (rule->site_start + rule->site_len > insn_cnt)
+		return false;
+
+	/* Check CPU features before kind-specific validation */
+	if (rule->cpu_features_required) {
+		if (!bpf_jit_check_cpu_features(rule->cpu_features_required))
+			return false;
+	}
+
+	/* Layer-2 generic check: reject sites with side effects */
+	if (bpf_jit_site_has_side_effects(insns, rule->site_start, rule->site_len))
 		return false;
 
 	switch (rule->rule_kind) {
@@ -722,9 +933,31 @@ static bool bpf_jit_validate_rule(const struct bpf_insn *insns,
 			return false;
 		return bpf_jit_validate_wide_mem_rule(insns, insn_cnt, rule);
 
+	case BPF_JIT_RK_ROTATE:
+		if (rule->native_choice != BPF_JIT_ROT_ROR &&
+		    rule->native_choice != BPF_JIT_ROT_RORX &&
+		    rule->native_choice != BPF_JIT_ROT_SHIFT)
+			return false;
+		return bpf_jit_validate_rotate_rule(insns, insn_cnt, rule);
+
+	case BPF_JIT_RK_ADDR_CALC:
+		if (rule->native_choice != BPF_JIT_ACALC_LEA &&
+		    rule->native_choice != BPF_JIT_ACALC_SHIFT_ADD)
+			return false;
+		return bpf_jit_validate_addr_calc_rule(insns, insn_cnt, rule);
+
 	default:
 		return false;
 	}
+}
+
+static u32 bpf_jit_main_subprog_end(const struct bpf_prog *prog)
+{
+	if (prog->aux->func_cnt > 1 && prog->aux->func &&
+	    prog->aux->func[1] && prog->aux->func[1]->aux)
+		return prog->aux->func[1]->aux->subprog_start;
+
+	return prog->len;
 }
 
 /**
@@ -745,6 +978,7 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	loff_t pos = 0;
 	ssize_t nread;
 	u32 i;
+	u32 main_subprog_end;
 
 	if (!prog)
 		return ERR_PTR(-EINVAL);
@@ -844,6 +1078,7 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	}
 
 	urules = (const struct bpf_jit_rewrite_rule *)(hdr + 1);
+	main_subprog_end = bpf_jit_main_subprog_end(prog);
 
 	/* Allocate policy */
 	policy = kvmalloc(struct_size(policy, rules, hdr->rule_cnt), GFP_KERNEL_ACCOUNT);
@@ -855,38 +1090,49 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	policy->rule_cnt = hdr->rule_cnt;
 	policy->active_cnt = 0;
 
-		/* Copy rules and validate each one */
-		for (i = 0; i < hdr->rule_cnt; i++) {
-			struct bpf_jit_rule *rule = &policy->rules[i];
-			bool active;
+	/* Copy rules and validate each one */
+	for (i = 0; i < hdr->rule_cnt; i++) {
+		struct bpf_jit_rule *rule = &policy->rules[i];
+		bool active;
 
-			rule->rule_kind = urules[i].rule_kind;
-			rule->native_choice = urules[i].native_choice;
-			rule->site_start = urules[i].site_start;
+		rule->rule_kind = urules[i].rule_kind;
+		rule->native_choice = urules[i].native_choice;
+		rule->site_start = urules[i].site_start;
 		rule->site_len = urules[i].site_len;
 		rule->priority = urules[i].priority;
 		rule->reserved = 0;
+		rule->cpu_features_required = urules[i].cpu_features_required;
 
-			/* Validate against actual BPF instructions */
-			active = bpf_jit_validate_rule(prog->insnsi, prog->len, rule);
-			if (active) {
-				rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
-				policy->active_cnt++;
-			} else {
-				rule->flags = 0; /* failed validation, will be skipped */
-			}
-
-			pr_info("bpf_jit_v4: parse rule[%u] kind=%u choice=%u site=%u len=%u active=%d\n",
-				i, rule->rule_kind, rule->native_choice,
-				rule->site_start, rule->site_len, active);
+		/*
+		 * BPF_PROG_JIT_RECOMPILE currently recompiles the main prog
+		 * image only. Rules in non-main subprogs are therefore
+		 * rejected until subprog-aware re-JIT support exists.
+		 */
+		active = rule->site_start + rule->site_len <= main_subprog_end &&
+			 bpf_jit_validate_rule(prog->insnsi, prog->len, rule);
+		if (active) {
+			rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
+			policy->active_cnt++;
+		} else {
+			rule->flags = 0; /* failed validation, will be skipped */
 		}
+	}
 
-		pr_info("bpf_jit_v4: parsed policy rules=%u active=%u prog_len=%u\n",
-			policy->rule_cnt, policy->active_cnt, prog->len);
-
-		/* Sort by site_start for efficient lookup */
-		sort(policy->rules, policy->rule_cnt,
+	/* Sort by site_start for efficient lookup */
+	sort(policy->rules, policy->rule_cnt,
 	     sizeof(struct bpf_jit_rule), rule_cmp, NULL);
+
+	pr_debug("bpf_jit_recompile: prog insn_cnt=%u rule_cnt=%u active=%u\n",
+		 prog->len, policy->rule_cnt, policy->active_cnt);
+
+	for (i = 0; i < policy->rule_cnt; i++) {
+		struct bpf_jit_rule *rule = &policy->rules[i];
+
+		pr_debug("bpf_jit_recompile: rule[%u] kind=%u site=%u+%u choice=%u cpu_feat=0x%x -> %s\n",
+			 i, rule->rule_kind, rule->site_start, rule->site_len,
+			 rule->native_choice, rule->cpu_features_required,
+			 (rule->flags & BPF_JIT_REWRITE_F_ACTIVE) ? "active" : "rejected");
+	}
 
 out:
 	kvfree(blob);
@@ -972,9 +1218,15 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 		if (old_policy)
 			bpf_jit_free_policy(old_policy);
 
-		/* Trigger stock re-JIT by calling bpf_int_jit_compile again */
-		prog = bpf_int_jit_compile(prog);
-		err = prog ? 0 : -ENOMEM;
+		/* Trigger stock re-JIT by calling bpf_int_jit_compile again.
+		 * Save prog pointer: bpf_int_jit_compile returns prog on
+		 * success or NULL on OOM, but prog itself is not freed.
+		 */
+		{
+			struct bpf_prog *recompiled = bpf_int_jit_compile(prog);
+			if (!recompiled)
+				err = -ENOMEM;
+		}
 		goto out_put;
 	}
 
@@ -1003,11 +1255,20 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	if (old_policy)
 		bpf_jit_free_policy(old_policy);
 
-	/* Trigger re-JIT */
-	prog = bpf_int_jit_compile(prog);
-	if (!prog) {
-		err = -ENOMEM;
-		goto out_put;
+	/* Trigger re-JIT.
+	 * Save prog pointer: bpf_int_jit_compile returns prog on success
+	 * or NULL on OOM, but prog itself is not freed.  On failure we
+	 * must clean up the policy we just stored.
+	 */
+	{
+		struct bpf_prog *recompiled = bpf_int_jit_compile(prog);
+		if (!recompiled) {
+			/* Clean up the policy we just stored */
+			bpf_jit_free_policy(prog->aux->jit_policy);
+			prog->aux->jit_policy = NULL;
+			err = -ENOMEM;
+			goto out_put;
+		}
 	}
 
 out_put:

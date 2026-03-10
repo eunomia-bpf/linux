@@ -947,6 +947,29 @@ done:
 	*pprog = prog;
 }
 
+static void emit_mov_imm32_noflags(u8 **pprog, bool sign_propagate,
+				   u32 dst_reg, const u32 imm32)
+{
+	u8 *prog = *pprog;
+	u8 b1, b2, b3;
+
+	if (sign_propagate && (s32)imm32 < 0) {
+		/* 'mov %rax, imm32' sign extends imm32 */
+		b1 = add_1mod(0x48, dst_reg);
+		b2 = 0xC7;
+		b3 = 0xC0;
+		EMIT3_off32(b1, b2, add_1reg(b3, dst_reg), imm32);
+		goto done;
+	}
+
+	/* mov %eax, imm32 */
+	if (is_ereg(dst_reg))
+		EMIT1(add_1mod(0x40, dst_reg));
+	EMIT1_off32(add_1reg(0xB8, dst_reg), imm32);
+done:
+	*pprog = prog;
+}
+
 static void emit_mov_imm64(u8 **pprog, u32 dst_reg,
 			   const u32 imm32_hi, const u32 imm32_lo)
 {
@@ -1310,6 +1333,22 @@ static void emit_bpf_mov_value(u8 **pprog, const struct bpf_insn *insn, u32 dst_
 	emit_mov_imm32(pprog, is64, dst_reg, insn->imm);
 }
 
+static void emit_bpf_mov_value_noflags(u8 **pprog, const struct bpf_insn *insn,
+				       u32 dst_reg, bool use_priv_fp)
+{
+	bool is64 = BPF_CLASS(insn->code) == BPF_ALU64;
+
+	if (BPF_SRC(insn->code) == BPF_X) {
+		u32 src_reg = jit_bpf_reg(insn->src_reg, use_priv_fp);
+
+		if (src_reg != dst_reg)
+			emit_mov_reg(pprog, is64, dst_reg, src_reg);
+		return;
+	}
+
+	emit_mov_imm32_noflags(pprog, is64, dst_reg, insn->imm);
+}
+
 static int emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
 				const struct bpf_insn *then_insn,
 				const struct bpf_insn *else_insn,
@@ -1340,12 +1379,12 @@ static int emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
 			cmov_src_reg = AUX_REG;
 		}
 	} else {
-		emit_bpf_mov_value(pprog, else_insn, AUX_REG, use_priv_fp);
+		emit_bpf_mov_value_noflags(pprog, else_insn, AUX_REG, use_priv_fp);
 		cmov_src_reg = AUX_REG;
 	}
 
 	if (!bpf_mov_is_noop(then_insn))
-		emit_bpf_mov_value(pprog, then_insn, dst_reg, use_priv_fp);
+		emit_bpf_mov_value_noflags(pprog, then_insn, dst_reg, use_priv_fp);
 
 	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
 	return 0;
@@ -1412,7 +1451,7 @@ static int emit_bpf_cmov_select_compact(u8 **pprog,
 		if (cmov_src_reg == dst_reg)
 			return 0;
 	} else {
-		emit_bpf_mov_value(pprog, override_insn, AUX_REG, use_priv_fp);
+		emit_bpf_mov_value_noflags(pprog, override_insn, AUX_REG, use_priv_fp);
 		cmov_src_reg = AUX_REG;
 	}
 
@@ -2101,6 +2140,191 @@ static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
 }
 
 /*
+ * v4 JIT policy framework: rotate emitter
+ *
+ * Replaces a 4-insn rotate idiom (mov+lsh+rsh+or) with a single
+ * ror or rorx instruction.
+ *
+ * Pattern:
+ *   [0] mov   tmp, dst        (copy original)
+ *   [1] lsh64 dst, N          (left shift)
+ *   [2] rsh64 tmp, (W-N)      (right shift complement)
+ *   [3] or64  dst, tmp        (combine)
+ *
+ * This is a left rotate by N, which equals right rotate by (W-N).
+ * We emit ror dst, (W-N) or rorx dst, dst, (W-N).
+ */
+static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
+			    const struct bpf_jit_rule *rule,
+			    bool use_priv_fp)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *mov_insn = &insns[idx];
+	const struct bpf_insn *lsh_insn = &insns[idx + 1];
+	u32 dst_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
+	u32 tmp_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
+	bool is64 = BPF_CLASS(mov_insn->code) == BPF_ALU64;
+	u32 width = is64 ? 64 : 32;
+	u32 rot_amount = (u32)lsh_insn->imm;
+	u8 ror_imm = (u8)(width - rot_amount);
+	u8 *prog = *pprog;
+
+	if (rule->native_choice == BPF_JIT_ROT_RORX) {
+		/*
+		 * rorx dst, src, imm8
+		 * VEX.LZ.F2.0F3A.W1 F0 /r ib  (64-bit)
+		 * VEX.LZ.F2.0F3A.W0 F0 /r ib  (32-bit)
+		 *
+		 * 3-byte VEX prefix: C4 [R~X~B~.mmmmm] [W.vvvv~.L.pp]
+		 * mmmmm = 00011 (0F3A), pp = 11 (F2), L = 0
+		 * vvvv~ = 1111 (no extra src operand), W = 1 for 64-bit
+		 * R~,X~,B~ are inverted REX bits
+		 *
+		 * ModRM: mod=11, reg=dst (r field), r/m=src
+		 * Here src == dst (rotate in place).
+		 */
+		u8 byte2, byte3, modrm;
+
+		/* Byte 2: R~.X~.B~.mmmmm
+		 * R~ = inverted, set if dst is NOT extended (r8-r15)
+		 * X~ = inverted, 1 (no index register used)
+		 * B~ = inverted, set if src is NOT extended
+		 */
+		byte2 = 0x03; /* mmmmm = 00011 */
+		if (!is_ereg(dst_reg))
+			byte2 |= 0x80; /* R~ = 1 */
+		byte2 |= 0x40; /* X~ = 1 (unused) */
+		if (!is_ereg(dst_reg))
+			byte2 |= 0x20; /* B~ = 1 (src == dst) */
+
+		/* Byte 3: W.vvvv~.L.pp
+		 * W = 1 for 64-bit, 0 for 32-bit
+		 * vvvv~ = 1111 (inverted, meaning NDS=none)
+		 * L = 0 (scalar, LZ)
+		 * pp = 11 (F2 prefix)
+		 */
+		byte3 = 0x7B; /* 0.1111.0.11 = vvvv~=1111, L=0, pp=11 */
+		if (is64)
+			byte3 |= 0x80; /* W = 1 */
+
+		/* ModRM: mod=11, reg=dst, r/m=dst (src==dst) */
+		modrm = 0xC0 | (reg2hex[dst_reg] << 3) | reg2hex[dst_reg];
+
+		EMIT4(0xC4, byte2, byte3, 0xF0);
+		EMIT2(modrm, ror_imm);
+
+		(void)tmp_reg;
+	} else {
+		/*
+		 * ror dst, imm8
+		 * REX.W + C1 /1 ib  (64-bit)
+		 * C1 /1 ib           (32-bit, with REX if ereg)
+		 */
+		if (is64)
+			EMIT1(add_1mod(0x48, dst_reg));
+		else if (is_ereg(dst_reg))
+			EMIT1(add_1mod(0x40, dst_reg));
+		EMIT3(0xC1, add_1reg(0xC8, dst_reg), ror_imm);
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+/*
+ * v4 JIT policy framework: LEA fusion emitter
+ *
+ * Replaces a 3-insn address calculation (mov+shl+add) with a single
+ * LEA instruction.
+ *
+ * Pattern:
+ *   [0] mov   dst, idx        (copy index)
+ *   [1] lsh64 dst, scale      (scale in {1,2,3})
+ *   [2] add64 dst, base       (add base register)
+ *
+ * Emitted: lea dst, [base + idx*scale_factor]
+ * where scale_factor = 1<<scale = {2, 4, 8}
+ */
+static int emit_bpf_lea_fusion(u8 **pprog, const struct bpf_insn *insns,
+			       const struct bpf_jit_rule *rule,
+			       bool use_priv_fp)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *mov_insn = &insns[idx];
+	const struct bpf_insn *lsh_insn = &insns[idx + 1];
+	const struct bpf_insn *add_insn = &insns[idx + 2];
+	u32 dst_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
+	u32 index_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
+	u32 base_reg = jit_bpf_reg(add_insn->src_reg, use_priv_fp);
+	u32 scale = (u32)lsh_insn->imm; /* 1, 2, or 3 */
+	u8 sib_scale;
+	u8 *prog = *pprog;
+
+	/*
+	 * SIB scale encoding: 00=1, 01=2, 10=4, 11=8
+	 * scale=1 -> *2 -> SIB scale=01
+	 * scale=2 -> *4 -> SIB scale=10
+	 * scale=3 -> *8 -> SIB scale=11
+	 */
+	sib_scale = (u8)scale; /* conveniently maps directly */
+
+	/*
+	 * lea dst, [base + index*scale_factor]
+	 * REX.W + 0x8D + ModRM + SIB
+	 *
+	 * ModRM: mod=00, reg=dst, rm=100 (SIB follows)
+	 * SIB: scale | index<<3 | base
+	 *
+	 * Special case: if base is RBP (reg2hex=5), mod=00 means
+	 * [disp32 + index*s], so we need mod=01 with disp8=0.
+	 * Similarly for R13 (reg2hex=5).
+	 */
+	{
+		u8 rex = add_3mod(0x48, dst_reg, BPF_REG_0, index_reg);
+		/* Fix: add_3mod sets REX.B from r1 (dst in lea is /r field),
+		 * REX.X from index, REX.R from r2. For LEA:
+		 * REX.R = dst (reg field), REX.X = index, REX.B = base
+		 * We need to build REX manually.
+		 */
+		rex = 0x48;
+		if (is_ereg(dst_reg))
+			rex |= 0x04; /* REX.R */
+		if (is_ereg(index_reg))
+			rex |= 0x02; /* REX.X */
+		if (is_ereg(base_reg))
+			rex |= 0x01; /* REX.B */
+
+		EMIT1(rex);
+	}
+
+	EMIT1(0x8D); /* LEA opcode */
+
+	{
+		u8 modrm;
+		u8 sib;
+		bool base_needs_disp = (reg2hex[base_reg] == 5); /* RBP or R13 */
+
+		if (base_needs_disp) {
+			/* mod=01, reg=dst, rm=100 */
+			modrm = 0x44 | (reg2hex[dst_reg] << 3);
+		} else {
+			/* mod=00, reg=dst, rm=100 */
+			modrm = 0x04 | (reg2hex[dst_reg] << 3);
+		}
+
+		sib = (sib_scale << 6) | (reg2hex[index_reg] << 3) | reg2hex[base_reg];
+
+		EMIT2(modrm, sib);
+
+		if (base_needs_disp)
+			EMIT1(0); /* disp8 = 0 */
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+/*
  * v4 JIT policy framework: general rule dispatcher
  *
  * Called from do_jit() main loop. If a rule covers the current BPF insn,
@@ -2154,6 +2378,33 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 			return -1;
 
 		err = emit_bpf_wide_load(pprog, insns, rule, use_priv_fp);
+		if (err)
+			return -1;
+		return rule->site_len;
+
+	case BPF_JIT_RK_ROTATE:
+		if (rule->native_choice == BPF_JIT_ROT_SHIFT) {
+			/* Stock emission requested */
+			return 0;
+		}
+		if (rule->native_choice != BPF_JIT_ROT_ROR &&
+		    rule->native_choice != BPF_JIT_ROT_RORX)
+			return -1;
+
+		err = emit_bpf_rotate(pprog, insns, rule, use_priv_fp);
+		if (err)
+			return -1;
+		return rule->site_len;
+
+	case BPF_JIT_RK_ADDR_CALC:
+		if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD) {
+			/* Stock emission requested */
+			return 0;
+		}
+		if (rule->native_choice != BPF_JIT_ACALC_LEA)
+			return -1;
+
+		err = emit_bpf_lea_fusion(pprog, insns, rule, use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;

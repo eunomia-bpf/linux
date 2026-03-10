@@ -54,6 +54,7 @@ struct bpf_jit_rule {
 	u16 flags;
 	u16 priority;
 	u16 reserved;
+	u32 cpu_features_required;
 };
 
 /**
