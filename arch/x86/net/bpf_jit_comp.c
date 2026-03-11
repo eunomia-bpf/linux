@@ -12,6 +12,7 @@
 #include <linux/bpf.h>
 #include <linux/bpf_jit_directives.h>
 #include <linux/memory.h>
+#include <linux/overflow.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
 #include <asm/ftrace.h>
@@ -1459,6 +1460,122 @@ static int emit_bpf_cmov_select_compact(u8 **pprog,
 	return 0;
 }
 
+static bool bpf_jit_value_is_noop(const struct bpf_jit_binding_value *value,
+				  u8 dst_bpf_reg)
+{
+	return value->type == BPF_JIT_BIND_VAL_REG &&
+	       (u8)value->value == dst_bpf_reg;
+}
+
+static int emit_bpf_canonical_value_noflags(
+	u8 **pprog,
+	const struct bpf_jit_binding_value *value,
+	u32 dst_reg,
+	bool is64,
+	bool use_priv_fp)
+{
+	if (value->type == BPF_JIT_BIND_VAL_REG) {
+		u32 src_reg = jit_bpf_reg((u8)value->value, use_priv_fp);
+
+		if (src_reg != dst_reg)
+			emit_mov_reg(pprog, is64, dst_reg, src_reg);
+		return 0;
+	}
+
+	if (value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	emit_mov_imm32_noflags(pprog, is64, dst_reg, (s32)value->value);
+	return 0;
+}
+
+static int emit_canonical_select(u8 **pprog,
+				 const struct bpf_jit_canonical_params *params,
+				 bool use_priv_fp)
+{
+	const struct bpf_jit_binding_value *dst_value;
+	const struct bpf_jit_binding_value *cond_op_value;
+	const struct bpf_jit_binding_value *cond_a_value;
+	const struct bpf_jit_binding_value *cond_b_value;
+	const struct bpf_jit_binding_value *true_value;
+	const struct bpf_jit_binding_value *false_value;
+	const struct bpf_jit_binding_value *width_value;
+	struct bpf_insn cmp_insn = {};
+	u32 dst_reg, cond_a_reg, cond_b_reg = 0;
+	u32 cmov_src_reg;
+	u8 cond_op, cmov_op;
+	bool is64, false_is_noop;
+	int err;
+
+	dst_value = &params->params[BPF_JIT_SEL_PARAM_DST_REG];
+	cond_op_value = &params->params[BPF_JIT_SEL_PARAM_COND_OP];
+	cond_a_value = &params->params[BPF_JIT_SEL_PARAM_COND_A];
+	cond_b_value = &params->params[BPF_JIT_SEL_PARAM_COND_B];
+	true_value = &params->params[BPF_JIT_SEL_PARAM_TRUE_VAL];
+	false_value = &params->params[BPF_JIT_SEL_PARAM_FALSE_VAL];
+	width_value = &params->params[BPF_JIT_SEL_PARAM_WIDTH];
+
+	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
+	    cond_op_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    cond_a_value->type != BPF_JIT_BIND_VAL_REG ||
+	    (cond_b_value->type != BPF_JIT_BIND_VAL_REG &&
+	     cond_b_value->type != BPF_JIT_BIND_VAL_IMM) ||
+	    (true_value->type != BPF_JIT_BIND_VAL_REG &&
+	     true_value->type != BPF_JIT_BIND_VAL_IMM) ||
+	    (false_value->type != BPF_JIT_BIND_VAL_REG &&
+	     false_value->type != BPF_JIT_BIND_VAL_IMM) ||
+	    width_value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	if (width_value->value != 32 && width_value->value != 64)
+		return -EINVAL;
+
+	is64 = width_value->value == 64;
+	cond_op = (u8)cond_op_value->value;
+	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
+	cond_a_reg = jit_bpf_reg((u8)cond_a_value->value, use_priv_fp);
+	false_is_noop = bpf_jit_value_is_noop(false_value, (u8)dst_value->value);
+
+	cmp_insn.code = (is64 ? BPF_JMP : BPF_JMP32) | cond_op |
+			(cond_b_value->type == BPF_JIT_BIND_VAL_REG ? BPF_X : BPF_K);
+	cmp_insn.dst_reg = (u8)cond_a_value->value;
+	if (cond_b_value->type == BPF_JIT_BIND_VAL_REG) {
+		cmp_insn.src_reg = (u8)cond_b_value->value;
+		cond_b_reg = jit_bpf_reg((u8)cond_b_value->value, use_priv_fp);
+	} else {
+		cmp_insn.imm = (s32)cond_b_value->value;
+	}
+
+	err = emit_bpf_jmp_cmp(pprog, &cmp_insn, cond_a_reg, cond_b_reg);
+	if (err)
+		return err;
+
+	err = bpf_jmp_to_x86_cmov(cond_op, &cmov_op);
+	if (err)
+		return err;
+
+	if (true_value->type == BPF_JIT_BIND_VAL_REG) {
+		cmov_src_reg = jit_bpf_reg((u8)true_value->value, use_priv_fp);
+		if (cmov_src_reg == dst_reg && !false_is_noop) {
+			emit_mov_reg(pprog, is64, AUX_REG, dst_reg);
+			cmov_src_reg = AUX_REG;
+		}
+	} else {
+		emit_mov_imm32_noflags(pprog, is64, AUX_REG, (s32)true_value->value);
+		cmov_src_reg = AUX_REG;
+	}
+
+	if (!false_is_noop) {
+		err = emit_bpf_canonical_value_noflags(pprog, false_value, dst_reg,
+						       is64, use_priv_fp);
+		if (err)
+			return err;
+	}
+
+	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
+	return 0;
+}
+
 /* Emit the suffix (ModR/M etc) for addressing *(ptr_reg + off) and val_reg */
 static void emit_insn_suffix(u8 **pprog, u32 ptr_reg, u32 val_reg, int off)
 {
@@ -2278,6 +2395,10 @@ static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
 	ror_imm = (u8)(width - rot_amount);
 
 	if (rule->native_choice == BPF_JIT_ROT_RORX) {
+#if defined(CONFIG_X86_64)
+		if (!boot_cpu_has(X86_FEATURE_BMI2))
+			return -EINVAL;
+#endif
 		/*
 		 * rorx dst, src, imm8
 		 * VEX.LZ.F2.0F3A.W1 F0 /r ib  (64-bit)
@@ -2419,6 +2540,234 @@ static int emit_bpf_lea_fusion(u8 **pprog, const struct bpf_insn *insns,
 	return 0;
 }
 
+static int emit_canonical_wide_load(u8 **pprog,
+				    const struct bpf_jit_canonical_params *params,
+				    bool use_priv_fp)
+{
+	u32 result_reg, base_reg;
+	s16 off;
+	u32 width;
+
+	if (params->params[BPF_JIT_WMEM_PARAM_DST_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_WMEM_PARAM_BASE_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_WMEM_PARAM_WIDTH].type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	result_reg = jit_bpf_reg((u8)params->params[BPF_JIT_WMEM_PARAM_DST_REG].value,
+				 use_priv_fp);
+	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_WMEM_PARAM_BASE_REG].value,
+			       use_priv_fp);
+	off = (s16)params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].value;
+	width = (u32)params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
+
+	switch (width) {
+	case 2:
+		emit_ldx(pprog, BPF_H, result_reg, base_reg, off);
+		return 0;
+	case 4:
+		emit_ldx(pprog, BPF_W, result_reg, base_reg, off);
+		return 0;
+	case 8:
+		emit_ldx(pprog, BPF_DW, result_reg, base_reg, off);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int emit_canonical_rotate(u8 **pprog,
+				 const struct bpf_jit_canonical_params *params,
+				 u16 native_choice,
+				 bool use_priv_fp)
+{
+	const struct bpf_jit_binding_value *dst_value;
+	const struct bpf_jit_binding_value *src_value;
+	const struct bpf_jit_binding_value *amount_value;
+	const struct bpf_jit_binding_value *width_value;
+	u32 dst_reg, src_reg, width, rot_amount;
+	bool is64;
+	u8 ror_imm;
+	u8 *prog = *pprog;
+
+	dst_value = &params->params[BPF_JIT_ROT_PARAM_DST_REG];
+	src_value = &params->params[BPF_JIT_ROT_PARAM_SRC_REG];
+	amount_value = &params->params[BPF_JIT_ROT_PARAM_AMOUNT];
+	width_value = &params->params[BPF_JIT_ROT_PARAM_WIDTH];
+
+	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
+	    src_value->type != BPF_JIT_BIND_VAL_REG ||
+	    amount_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    width_value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	width = (u32)width_value->value;
+	rot_amount = (u32)amount_value->value;
+	if ((width != 32 && width != 64) || !rot_amount || rot_amount >= width)
+		return -EINVAL;
+
+	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
+	src_reg = jit_bpf_reg((u8)src_value->value, use_priv_fp);
+	is64 = width == 64;
+	ror_imm = (u8)(width - rot_amount);
+
+	if (native_choice == BPF_JIT_ROT_RORX) {
+#if defined(CONFIG_X86_64)
+		u8 byte2, byte3, modrm;
+
+		if (!boot_cpu_has(X86_FEATURE_BMI2))
+			return -EINVAL;
+
+		byte2 = 0x03;
+		if (!is_ereg(dst_reg))
+			byte2 |= 0x80;
+		byte2 |= 0x40;
+		if (!is_ereg(src_reg))
+			byte2 |= 0x20;
+
+		byte3 = 0x7B;
+		if (is64)
+			byte3 |= 0x80;
+
+		modrm = 0xC0 | (reg2hex[dst_reg] << 3) | reg2hex[src_reg];
+
+		EMIT4(0xC4, byte2, byte3, 0xF0);
+		EMIT2(modrm, ror_imm);
+		return 0;
+#else
+		return -EINVAL;
+#endif
+	}
+
+	if (native_choice != BPF_JIT_ROT_ROR)
+		return -EINVAL;
+
+	if (src_reg != dst_reg)
+		emit_mov_reg(&prog, is64, dst_reg, src_reg);
+
+	if (is64)
+		EMIT1(add_1mod(0x48, dst_reg));
+	else if (is_ereg(dst_reg))
+		EMIT1(add_1mod(0x40, dst_reg));
+	EMIT3(0xC1, add_1reg(0xC8, dst_reg), ror_imm);
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_canonical_lea_fusion(
+	u8 **pprog,
+	const struct bpf_jit_canonical_params *params,
+	bool use_priv_fp)
+{
+	u32 dst_reg, index_reg, base_reg;
+	u32 scale;
+	u8 sib_scale;
+	u8 *prog = *pprog;
+
+	if (params->params[BPF_JIT_ACALC_PARAM_DST_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_ACALC_PARAM_BASE_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_ACALC_PARAM_INDEX_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_ACALC_PARAM_SCALE].type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	dst_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_DST_REG].value,
+			      use_priv_fp);
+	index_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_INDEX_REG].value,
+				use_priv_fp);
+	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_BASE_REG].value,
+			       use_priv_fp);
+	scale = (u32)params->params[BPF_JIT_ACALC_PARAM_SCALE].value;
+	if (scale < 1 || scale > 3)
+		return -EINVAL;
+
+	sib_scale = (u8)scale;
+
+	{
+		u8 rex = 0x48;
+
+		if (is_ereg(dst_reg))
+			rex |= 0x04;
+		if (is_ereg(index_reg))
+			rex |= 0x02;
+		if (is_ereg(base_reg))
+			rex |= 0x01;
+
+		EMIT1(rex);
+	}
+
+	EMIT1(0x8D);
+
+	{
+		u8 modrm;
+		u8 sib;
+		bool base_needs_disp = reg2hex[base_reg] == 5;
+
+		if (base_needs_disp)
+			modrm = 0x44 | (reg2hex[dst_reg] << 3);
+		else
+			modrm = 0x04 | (reg2hex[dst_reg] << 3);
+
+		sib = (sib_scale << 6) | (reg2hex[index_reg] << 3) |
+		      reg2hex[base_reg];
+
+		EMIT2(modrm, sib);
+		if (base_needs_disp)
+			EMIT1(0);
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
+{
+	if (rule->rule_kind == BPF_JIT_RK_PATTERN)
+		return rule->canonical_form;
+
+	switch (rule->rule_kind) {
+	case BPF_JIT_RK_ROTATE:
+		return BPF_JIT_CF_ROTATE;
+	case BPF_JIT_RK_WIDE_MEM:
+		return BPF_JIT_CF_WIDE_MEM;
+	case BPF_JIT_RK_ADDR_CALC:
+		return BPF_JIT_CF_ADDR_CALC;
+	case BPF_JIT_RK_COND_SELECT:
+		return BPF_JIT_CF_COND_SELECT;
+	default:
+		return 0;
+	}
+}
+
+static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
+					 const struct bpf_jit_rule *rule)
+{
+	u32 site_start = rule->site_start;
+	u32 subprog_start = bpf_prog->aux->subprog_start;
+	u32 site_end;
+
+	/*
+	 * v4 policy rules are validated against the full translated program, so
+	 * sites are program-absolute. Fixed baseline rules are synthesized
+	 * inside do_jit() against the current subprog and therefore stay local.
+	 */
+	if (!(rule->flags & BPF_JIT_REWRITE_F_ACTIVE))
+		return site_start;
+
+	if (!bpf_prog->aux->main_prog_aux)
+		return site_start;
+
+	if (site_start < subprog_start)
+		return -EINVAL;
+
+	site_start -= subprog_start;
+	if (check_add_overflow(site_start, rule->site_len, &site_end) ||
+	    site_end > bpf_prog->len)
+		return -EINVAL;
+
+	return site_start;
+}
+
 /*
  * v4 JIT policy framework: general rule dispatcher
  *
@@ -2431,10 +2780,20 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 				  const struct bpf_insn *insns,
 				  bool use_priv_fp)
 {
+	u16 form = bpf_jit_rule_form(rule);
+	struct bpf_jit_rule local_rule;
+	int local_site_start;
 	int err;
 
-	switch (rule->rule_kind) {
-	case BPF_JIT_RK_COND_SELECT:
+	local_site_start = bpf_jit_rule_local_site_start(bpf_prog, rule);
+	if (local_site_start < 0)
+		return -1;
+
+	local_rule = *rule;
+	local_rule.site_start = local_site_start;
+
+	switch (form) {
+	case BPF_JIT_CF_COND_SELECT:
 		if (rule->native_choice == BPF_JIT_SEL_BRANCH) {
 			/* Stock emission requested — return 0 to fall through */
 			return 0;
@@ -2442,19 +2801,22 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
 			return -1;
 
-		if (rule->site_len == 4) {
+		if (rule->rule_kind == BPF_JIT_RK_PATTERN) {
+			err = emit_canonical_select(pprog, &rule->params,
+						      use_priv_fp);
+		} else if (local_rule.site_len == 4) {
 			/* Diamond: jcc, mov_false, ja, mov_true */
 			err = emit_bpf_cmov_select(pprog,
-						   &insns[rule->site_start],
-						   &insns[rule->site_start + 1],
-						   &insns[rule->site_start + 3],
+						   &insns[local_rule.site_start],
+						   &insns[local_rule.site_start + 1],
+						   &insns[local_rule.site_start + 3],
 						   use_priv_fp);
-		} else if (rule->site_len == 3) {
+		} else if (local_rule.site_len == 3) {
 			/* Compact: mov_default, jcc, mov_override */
 			err = emit_bpf_cmov_select_compact(pprog,
-							   &insns[rule->site_start],
-							   &insns[rule->site_start + 1],
-							   &insns[rule->site_start + 2],
+							   &insns[local_rule.site_start],
+							   &insns[local_rule.site_start + 1],
+							   &insns[local_rule.site_start + 2],
 							   use_priv_fp);
 		} else {
 			return -1;
@@ -2464,7 +2826,7 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 			return -1;
 		return rule->site_len;
 
-	case BPF_JIT_RK_WIDE_MEM:
+	case BPF_JIT_CF_WIDE_MEM:
 		if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS) {
 			/* Stock emission requested */
 			return 0;
@@ -2472,12 +2834,17 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
 			return -1;
 
-		err = emit_bpf_wide_load(pprog, insns, rule, use_priv_fp);
+		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
+			err = emit_canonical_wide_load(pprog, &rule->params,
+						       use_priv_fp);
+		else
+			err = emit_bpf_wide_load(pprog, insns, &local_rule,
+						 use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
 
-	case BPF_JIT_RK_ROTATE:
+	case BPF_JIT_CF_ROTATE:
 		if (rule->native_choice == BPF_JIT_ROT_SHIFT) {
 			/* Stock emission requested */
 			return 0;
@@ -2486,12 +2853,18 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		    rule->native_choice != BPF_JIT_ROT_RORX)
 			return -1;
 
-		err = emit_bpf_rotate(pprog, insns, rule, use_priv_fp);
+		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
+			err = emit_canonical_rotate(pprog, &rule->params,
+						      rule->native_choice,
+						      use_priv_fp);
+		else
+			err = emit_bpf_rotate(pprog, insns, &local_rule,
+					      use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
 
-	case BPF_JIT_RK_ADDR_CALC:
+	case BPF_JIT_CF_ADDR_CALC:
 		if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD) {
 			/* Stock emission requested */
 			return 0;
@@ -2499,7 +2872,12 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_ACALC_LEA)
 			return -1;
 
-		err = emit_bpf_lea_fusion(pprog, insns, rule, use_priv_fp);
+		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
+			err = emit_canonical_lea_fusion(pprog, &rule->params,
+							use_priv_fp);
+		else
+			err = emit_bpf_lea_fusion(pprog, insns, &local_rule,
+						  use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
@@ -2507,37 +2885,6 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 	default:
 		return -1;
 	}
-}
-
-static int bpf_jit_commit_multi_insn(u8 **pprog, u8 *temp, u8 *image,
-				     u8 *rw_image, int oldproglen, int *proglen,
-				     int *addrs, int i, int consumed)
-{
-	int region_start = *proglen;
-	int ilen = *pprog - temp;
-	int j;
-
-	if (ilen > BPF_MAX_INSN_SIZE) {
-		pr_err("bpf_jit: fatal insn size error\n");
-		return -EFAULT;
-	}
-
-	if (image) {
-		if (unlikely(region_start + ilen > oldproglen)) {
-			pr_err("bpf_jit: fatal error\n");
-			return -EFAULT;
-		}
-		memcpy(rw_image + region_start, temp, ilen);
-	}
-
-	*proglen = region_start + ilen;
-
-	for (j = 0; j < consumed - 1; j++)
-		addrs[i + j] = region_start;
-	addrs[i + consumed - 1] = *proglen;
-
-	*pprog = temp;
-	return 0;
 }
 
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
@@ -2617,7 +2964,6 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		u8 jmp_cond;
 		u8 *func;
 		int nops;
-		bool v4_rule_matched = false;
 
 		if (priv_frame_ptr) {
 			if (src_reg == BPF_REG_FP)
@@ -2637,178 +2983,55 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 			v4_policy = v4_aux->jit_policy;
 			if (v4_policy && v4_policy->active_cnt) {
 				const struct bpf_jit_rule *rule;
+				u32 abs_insn_idx = i - 1;
 
-				rule = bpf_jit_rule_lookup(v4_policy, i - 1);
+				if (bpf_prog->aux->main_prog_aux)
+					abs_insn_idx += bpf_prog->aux->subprog_start;
+
+				rule = bpf_jit_rule_lookup(v4_policy, abs_insn_idx);
 				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
 					int consumed;
 
-					v4_rule_matched = true;
 					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
 									 rule,
 									 bpf_prog->insnsi,
 									 priv_frame_ptr != NULL);
 					if (consumed > 0) {
-						err = bpf_jit_commit_multi_insn(&prog, temp,
-									 image, rw_image,
-									 oldproglen, &proglen,
-									 addrs, i, consumed);
-						if (err)
-							return err;
+						int region_start = proglen;
+						int j;
+
+						ilen = prog - temp;
+						if (ilen > BPF_MAX_INSN_SIZE) {
+							pr_err("bpf_jit: fatal insn size error\n");
+							return -EFAULT;
+						}
+
+						if (image) {
+							if (unlikely(region_start + ilen > oldproglen)) {
+								pr_err("bpf_jit: fatal error\n");
+								return -EFAULT;
+							}
+							memcpy(rw_image + region_start, temp, ilen);
+						}
+
+						proglen = region_start + ilen;
+
+						/*
+						 * Fill addrs for all consumed insns.
+						 * addrs[i+j] for j=0..consumed-2 -> region_start
+						 * addrs[i+consumed-1] -> proglen (end of block)
+						 */
+						for (j = 0; j < consumed - 1; j++)
+							addrs[i + j] = region_start;
+						addrs[i + consumed - 1] = proglen;
+
+						prog = temp;
 						insn += consumed - 1;
 						i += consumed - 1;
 						continue;
 					}
 					/* consumed == 0 means fall through to stock emission */
 					/* consumed < 0 means error, also fall through */
-				}
-			}
-		}
-
-		/*
-		 * Fixed baselines are an alternative to the v4 policy path, not
-		 * an override for it. If an active v4 rule starts here, its
-		 * choice wins even when it requests stock emission.
-		 */
-		if (!v4_rule_matched) {
-			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_ROTATE)) {
-				int site_len;
-
-				site_len = bpf_jit_probe_rotate(bpf_prog->insnsi,
-								insn_cnt, i - 1);
-				if (site_len > 0) {
-					struct bpf_jit_rule fixed_rule = {
-						.site_start = i - 1,
-						.site_len = site_len,
-						.rule_kind = BPF_JIT_RK_ROTATE,
-						.native_choice = boot_cpu_has(X86_FEATURE_BMI2) ?
-								BPF_JIT_ROT_RORX :
-								BPF_JIT_ROT_ROR,
-					};
-					int consumed;
-
-					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-									 &fixed_rule,
-									 bpf_prog->insnsi,
-									 priv_frame_ptr != NULL);
-					if (consumed > 0) {
-						err = bpf_jit_commit_multi_insn(&prog, temp,
-									 image, rw_image,
-									 oldproglen, &proglen,
-									 addrs, i, consumed);
-						if (err)
-							return err;
-						insn += consumed - 1;
-						i += consumed - 1;
-						continue;
-					}
-				}
-			}
-
-			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_WIDE_MEM)) {
-				int site_len;
-
-				site_len = bpf_jit_probe_wide_mem(bpf_prog->insnsi,
-								  insn_cnt, i - 1);
-				if (site_len > 0) {
-					struct bpf_jit_rule fixed_rule = {
-						.site_start = i - 1,
-						.site_len = site_len,
-						.rule_kind = BPF_JIT_RK_WIDE_MEM,
-						.native_choice = BPF_JIT_WMEM_WIDE_LOAD,
-					};
-					int consumed;
-
-					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-									 &fixed_rule,
-									 bpf_prog->insnsi,
-									 priv_frame_ptr != NULL);
-					if (consumed > 0) {
-						err = bpf_jit_commit_multi_insn(&prog, temp,
-									 image, rw_image,
-									 oldproglen, &proglen,
-									 addrs, i, consumed);
-						if (err)
-							return err;
-						insn += consumed - 1;
-						i += consumed - 1;
-						continue;
-					}
-				}
-			}
-
-			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_LEA)) {
-				int site_len;
-
-				site_len = bpf_jit_probe_addr_calc(bpf_prog->insnsi,
-								   insn_cnt, i - 1);
-				if (site_len > 0) {
-					struct bpf_jit_rule fixed_rule = {
-						.site_start = i - 1,
-						.site_len = site_len,
-						.rule_kind = BPF_JIT_RK_ADDR_CALC,
-						.native_choice = BPF_JIT_ACALC_LEA,
-					};
-					int consumed;
-
-					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-									 &fixed_rule,
-									 bpf_prog->insnsi,
-									 priv_frame_ptr != NULL);
-					if (consumed > 0) {
-						err = bpf_jit_commit_multi_insn(&prog, temp,
-									 image, rw_image,
-									 oldproglen, &proglen,
-									 addrs, i, consumed);
-						if (err)
-							return err;
-						insn += consumed - 1;
-						i += consumed - 1;
-						continue;
-					}
-				}
-			}
-
-			if (IS_ENABLED(CONFIG_BPF_JIT_FIXED_CMOV) &&
-			    boot_cpu_has(X86_FEATURE_CMOV)) {
-				int site_len;
-
-				site_len = bpf_jit_probe_cond_select(bpf_prog->insnsi,
-								     insn_cnt, i - 1);
-				if (site_len > 0) {
-					u32 directive_idx = site_len == 4 ? i - 1 : i;
-
-					/*
-					 * Keep explicit legacy CMOV directives ahead of
-					 * the fixed baseline when they target the same site.
-					 */
-					directive = bpf_jit_directive_lookup(bpf_prog,
-									     BPF_JIT_DIRECTIVE_CMOV_SELECT,
-									     directive_idx);
-					if (!directive) {
-						struct bpf_jit_rule fixed_rule = {
-							.site_start = i - 1,
-							.site_len = site_len,
-							.rule_kind = BPF_JIT_RK_COND_SELECT,
-							.native_choice = BPF_JIT_SEL_CMOVCC,
-						};
-						int consumed;
-
-						consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-										 &fixed_rule,
-										 bpf_prog->insnsi,
-										 priv_frame_ptr != NULL);
-						if (consumed > 0) {
-							err = bpf_jit_commit_multi_insn(&prog, temp,
-										 image, rw_image,
-										 oldproglen, &proglen,
-										 addrs, i, consumed);
-							if (err)
-								return err;
-							insn += consumed - 1;
-							i += consumed - 1;
-							continue;
-						}
-					}
 				}
 			}
 		}
