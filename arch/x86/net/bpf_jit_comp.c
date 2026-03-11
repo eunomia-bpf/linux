@@ -3186,6 +3186,480 @@ static int emit_canonical_endian_fusion(
 	return 0;
 }
 
+static int emit_bpf_end_insn(u8 **pprog, const struct bpf_insn *insn,
+			     bool use_priv_fp)
+{
+	const s32 imm32 = insn->imm;
+	u32 dst_reg = jit_bpf_reg(insn->dst_reg, use_priv_fp);
+	u8 *prog = *pprog;
+
+	switch (insn->code) {
+	case BPF_ALU | BPF_END | BPF_FROM_BE:
+	case BPF_ALU64 | BPF_END | BPF_FROM_LE:
+		switch (imm32) {
+		case 16:
+			EMIT1(0x66);
+			if (is_ereg(dst_reg))
+				EMIT1(0x41);
+			EMIT3(0xC1, add_1reg(0xC8, dst_reg), 8);
+
+			if (is_ereg(dst_reg))
+				EMIT3(0x45, 0x0F, 0xB7);
+			else
+				EMIT2(0x0F, 0xB7);
+			EMIT1(add_2reg(0xC0, dst_reg, dst_reg));
+			break;
+		case 32:
+			if (is_ereg(dst_reg))
+				EMIT2(0x41, 0x0F);
+			else
+				EMIT1(0x0F);
+			EMIT1(add_1reg(0xC8, dst_reg));
+			break;
+		case 64:
+			EMIT3(add_1mod(0x48, dst_reg), 0x0F,
+			      add_1reg(0xC8, dst_reg));
+			break;
+		default:
+			return -EINVAL;
+		}
+		break;
+
+	case BPF_ALU | BPF_END | BPF_FROM_LE:
+		switch (imm32) {
+		case 16:
+			if (is_ereg(dst_reg))
+				EMIT3(0x45, 0x0F, 0xB7);
+			else
+				EMIT2(0x0F, 0xB7);
+			EMIT1(add_2reg(0xC0, dst_reg, dst_reg));
+			break;
+		case 32:
+			if (is_ereg(dst_reg))
+				EMIT1(0x45);
+			EMIT2(0x89, add_2reg(0xC0, dst_reg, dst_reg));
+			break;
+		case 64:
+			break;
+		default:
+			return -EINVAL;
+		}
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_bpf_alu64_insn(u8 **pprog, const struct bpf_insn *insn,
+			       bool use_priv_fp)
+{
+	const s32 imm32 = insn->imm;
+	u32 dst_reg = jit_bpf_reg(insn->dst_reg, use_priv_fp);
+	u32 src_reg = jit_bpf_reg(insn->src_reg, use_priv_fp);
+	u8 b2 = 0, b3 = 0;
+	u8 *prog = *pprog;
+
+	switch (insn->code) {
+	case BPF_ALU64 | BPF_ADD | BPF_X:
+	case BPF_ALU64 | BPF_SUB | BPF_X:
+	case BPF_ALU64 | BPF_AND | BPF_X:
+	case BPF_ALU64 | BPF_OR | BPF_X:
+	case BPF_ALU64 | BPF_XOR | BPF_X:
+		maybe_emit_mod(&prog, dst_reg, src_reg, true);
+		b2 = simple_alu_opcodes[BPF_OP(insn->code)];
+		EMIT2(b2, add_2reg(0xC0, dst_reg, src_reg));
+		break;
+
+	case BPF_ALU64 | BPF_NEG:
+		maybe_emit_1mod(&prog, dst_reg, true);
+		EMIT2(0xF7, add_1reg(0xD8, dst_reg));
+		break;
+
+	case BPF_ALU64 | BPF_ADD | BPF_K:
+	case BPF_ALU64 | BPF_SUB | BPF_K:
+	case BPF_ALU64 | BPF_AND | BPF_K:
+	case BPF_ALU64 | BPF_OR | BPF_K:
+	case BPF_ALU64 | BPF_XOR | BPF_K:
+		maybe_emit_1mod(&prog, dst_reg, true);
+
+		switch (BPF_OP(insn->code)) {
+		case BPF_ADD:
+			b3 = 0xC0;
+			b2 = 0x05;
+			break;
+		case BPF_SUB:
+			b3 = 0xE8;
+			b2 = 0x2D;
+			break;
+		case BPF_AND:
+			b3 = 0xE0;
+			b2 = 0x25;
+			break;
+		case BPF_OR:
+			b3 = 0xC8;
+			b2 = 0x0D;
+			break;
+		case BPF_XOR:
+			b3 = 0xF0;
+			b2 = 0x35;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		if (is_imm8(imm32))
+			EMIT3(0x83, add_1reg(b3, dst_reg), imm32);
+		else if (is_axreg(dst_reg))
+			EMIT1_off32(b2, imm32);
+		else
+			EMIT2_off32(0x81, add_1reg(b3, dst_reg), imm32);
+		break;
+
+	case BPF_ALU64 | BPF_MOV | BPF_X:
+		if (insn_is_cast_user(insn) || insn_is_mov_percpu_addr(insn))
+			return -EINVAL;
+		if (insn->off == 0)
+			emit_mov_reg(&prog, true, dst_reg, src_reg);
+		else
+			emit_movsx_reg(&prog, insn->off, true, dst_reg, src_reg);
+		break;
+
+	case BPF_ALU64 | BPF_MOV | BPF_K:
+		emit_mov_imm32(&prog, true, dst_reg, imm32);
+		break;
+
+	case BPF_ALU64 | BPF_MUL | BPF_K:
+		maybe_emit_mod(&prog, dst_reg, dst_reg, true);
+		if (is_imm8(imm32))
+			EMIT3(0x6B, add_2reg(0xC0, dst_reg, dst_reg), imm32);
+		else
+			EMIT2_off32(0x69, add_2reg(0xC0, dst_reg, dst_reg), imm32);
+		break;
+
+	case BPF_ALU64 | BPF_MUL | BPF_X:
+		maybe_emit_mod(&prog, src_reg, dst_reg, true);
+		EMIT3(0x0F, 0xAF, add_2reg(0xC0, src_reg, dst_reg));
+		break;
+
+	case BPF_ALU64 | BPF_LSH | BPF_K:
+	case BPF_ALU64 | BPF_RSH | BPF_K:
+	case BPF_ALU64 | BPF_ARSH | BPF_K:
+		maybe_emit_1mod(&prog, dst_reg, true);
+		b3 = simple_alu_opcodes[BPF_OP(insn->code)];
+		if (imm32 == 1)
+			EMIT2(0xD1, add_1reg(b3, dst_reg));
+		else
+			EMIT3(0xC1, add_1reg(b3, dst_reg), imm32);
+		break;
+
+	case BPF_ALU64 | BPF_LSH | BPF_X:
+	case BPF_ALU64 | BPF_RSH | BPF_X:
+	case BPF_ALU64 | BPF_ARSH | BPF_X:
+		if (boot_cpu_has(X86_FEATURE_BMI2) && src_reg != BPF_REG_4) {
+			u8 op;
+
+			switch (BPF_OP(insn->code)) {
+			case BPF_LSH:
+				op = 1;
+				break;
+			case BPF_RSH:
+				op = 3;
+				break;
+			case BPF_ARSH:
+				op = 2;
+				break;
+			default:
+				return -EINVAL;
+			}
+
+			emit_shiftx(&prog, dst_reg, src_reg, true, op);
+			break;
+		}
+
+		if (src_reg != BPF_REG_4) {
+			if (dst_reg == BPF_REG_4) {
+				EMIT_mov(AUX_REG, dst_reg);
+				dst_reg = AUX_REG;
+			} else {
+				EMIT1(0x51);
+			}
+			EMIT_mov(BPF_REG_4, src_reg);
+		}
+
+		maybe_emit_1mod(&prog, dst_reg, true);
+		b3 = simple_alu_opcodes[BPF_OP(insn->code)];
+		EMIT2(0xD3, add_1reg(b3, dst_reg));
+
+		if (src_reg != BPF_REG_4) {
+			if (insn->dst_reg == BPF_REG_4)
+				EMIT_mov(insn->dst_reg, AUX_REG);
+			else
+				EMIT1(0x59);
+		}
+		break;
+
+	case BPF_ALU64 | BPF_DIV | BPF_X:
+	case BPF_ALU64 | BPF_MOD | BPF_X:
+	case BPF_ALU64 | BPF_DIV | BPF_K:
+	case BPF_ALU64 | BPF_MOD | BPF_K:
+		if (dst_reg != BPF_REG_0)
+			EMIT1(0x50);
+		if (dst_reg != BPF_REG_3)
+			EMIT1(0x52);
+
+		if (BPF_SRC(insn->code) == BPF_X) {
+			if (src_reg == BPF_REG_0 || src_reg == BPF_REG_3) {
+				EMIT_mov(AUX_REG, src_reg);
+				src_reg = AUX_REG;
+			}
+		} else {
+			EMIT3_off32(0x49, 0xC7, 0xC3, imm32);
+			src_reg = AUX_REG;
+		}
+
+		if (dst_reg != BPF_REG_0)
+			emit_mov_reg(&prog, true, BPF_REG_0, dst_reg);
+
+		if (insn->off == 0) {
+			EMIT2(0x31, 0xd2);
+			maybe_emit_1mod(&prog, src_reg, true);
+			EMIT2(0xF7, add_1reg(0xF0, src_reg));
+		} else {
+			EMIT2(0x48, 0x99);
+			maybe_emit_1mod(&prog, src_reg, true);
+			EMIT2(0xF7, add_1reg(0xF8, src_reg));
+		}
+
+		if (BPF_OP(insn->code) == BPF_MOD && dst_reg != BPF_REG_3)
+			emit_mov_reg(&prog, true, dst_reg, BPF_REG_3);
+		else if (BPF_OP(insn->code) == BPF_DIV && dst_reg != BPF_REG_0)
+			emit_mov_reg(&prog, true, dst_reg, BPF_REG_0);
+
+		if (dst_reg != BPF_REG_3)
+			EMIT1(0x5A);
+		if (dst_reg != BPF_REG_0)
+			EMIT1(0x58);
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_linear_bpf_insn(u8 **pprog, const struct bpf_insn *insn,
+				bool use_priv_fp)
+{
+	u32 dst_reg = jit_bpf_reg(insn->dst_reg, use_priv_fp);
+	u32 src_reg = jit_bpf_reg(insn->src_reg, use_priv_fp);
+
+	if (BPF_CLASS(insn->code) == BPF_ALU && BPF_OP(insn->code) != BPF_END)
+		return emit_bpf_alu32_insn(pprog, insn, use_priv_fp);
+
+	switch (insn->code) {
+	case BPF_ALU | BPF_END | BPF_FROM_BE:
+	case BPF_ALU | BPF_END | BPF_FROM_LE:
+	case BPF_ALU64 | BPF_END | BPF_FROM_LE:
+		return emit_bpf_end_insn(pprog, insn, use_priv_fp);
+
+	case BPF_ALU64 | BPF_ADD | BPF_X:
+	case BPF_ALU64 | BPF_SUB | BPF_X:
+	case BPF_ALU64 | BPF_AND | BPF_X:
+	case BPF_ALU64 | BPF_OR | BPF_X:
+	case BPF_ALU64 | BPF_XOR | BPF_X:
+	case BPF_ALU64 | BPF_NEG:
+	case BPF_ALU64 | BPF_ADD | BPF_K:
+	case BPF_ALU64 | BPF_SUB | BPF_K:
+	case BPF_ALU64 | BPF_AND | BPF_K:
+	case BPF_ALU64 | BPF_OR | BPF_K:
+	case BPF_ALU64 | BPF_XOR | BPF_K:
+	case BPF_ALU64 | BPF_MOV | BPF_X:
+	case BPF_ALU64 | BPF_MOV | BPF_K:
+	case BPF_ALU64 | BPF_MUL | BPF_K:
+	case BPF_ALU64 | BPF_MUL | BPF_X:
+	case BPF_ALU64 | BPF_LSH | BPF_K:
+	case BPF_ALU64 | BPF_RSH | BPF_K:
+	case BPF_ALU64 | BPF_ARSH | BPF_K:
+	case BPF_ALU64 | BPF_LSH | BPF_X:
+	case BPF_ALU64 | BPF_RSH | BPF_X:
+	case BPF_ALU64 | BPF_ARSH | BPF_X:
+	case BPF_ALU64 | BPF_DIV | BPF_X:
+	case BPF_ALU64 | BPF_MOD | BPF_X:
+	case BPF_ALU64 | BPF_DIV | BPF_K:
+	case BPF_ALU64 | BPF_MOD | BPF_K:
+		return emit_bpf_alu64_insn(pprog, insn, use_priv_fp);
+
+	case BPF_LDX | BPF_MEM | BPF_B:
+		emit_ldx(pprog, BPF_B, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEM | BPF_H:
+		emit_ldx(pprog, BPF_H, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEM | BPF_W:
+		emit_ldx(pprog, BPF_W, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEM | BPF_DW:
+		emit_ldx(pprog, BPF_DW, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEMSX | BPF_B:
+		emit_ldsx(pprog, BPF_B, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEMSX | BPF_H:
+		emit_ldsx(pprog, BPF_H, dst_reg, src_reg, insn->off);
+		return 0;
+	case BPF_LDX | BPF_MEMSX | BPF_W:
+		emit_ldsx(pprog, BPF_W, dst_reg, src_reg, insn->off);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int measure_branch_flip_body(const struct bpf_prog *bpf_prog,
+				    u32 start, u32 len,
+				    bool use_priv_fp, u32 *out_len)
+{
+	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
+	u32 i;
+	u32 size = 0;
+	int err;
+
+	for (i = 0; i < len; i++) {
+		u8 *prog = temp;
+
+		err = emit_linear_bpf_insn(&prog, &bpf_prog->insnsi[start + i],
+					   use_priv_fp);
+		if (err)
+			return err;
+		size += (u32)(prog - temp);
+	}
+
+	if (out_len)
+		*out_len = size;
+	return 0;
+}
+
+static int emit_branch_flip_body(u8 **pprog, const struct bpf_prog *bpf_prog,
+				 u32 start, u32 len, bool use_priv_fp)
+{
+	u32 i;
+	int err;
+
+	for (i = 0; i < len; i++) {
+		err = emit_linear_bpf_insn(pprog, &bpf_prog->insnsi[start + i],
+					   use_priv_fp);
+		if (err)
+			return err;
+	}
+
+	return 0;
+}
+
+static int emit_local_cond_jump(u8 **pprog, u8 jmp_cond, s32 jmp_offset)
+{
+	u8 *prog = *pprog;
+
+	if (is_imm8_jmp_offset(jmp_offset))
+		EMIT2(jmp_cond, jmp_offset);
+	else if (is_simm32(jmp_offset))
+		EMIT2_off32(0x0F, jmp_cond + 0x10, jmp_offset);
+	else
+		return -EINVAL;
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_local_jump(u8 **pprog, s32 jmp_offset)
+{
+	u8 *prog = *pprog;
+
+	if (is_imm8_jmp_offset(jmp_offset))
+		EMIT2(0xEB, jmp_offset);
+	else if (is_simm32(jmp_offset))
+		EMIT1_off32(0xE9, jmp_offset);
+	else
+		return -EINVAL;
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_canonical_branch_flip(u8 **pprog,
+				      const struct bpf_prog *bpf_prog,
+				      u32 site_start,
+				      const struct bpf_jit_canonical_params *params,
+				      bool use_priv_fp)
+{
+	const struct bpf_insn *jcc_insn = &bpf_prog->insnsi[site_start];
+	u32 body_a_len, body_b_len, body_a_start, body_b_start;
+	u32 body_a_size = 0, body_b_size = 0;
+	u32 jmp_join_size;
+	u32 dst_reg, src_reg = 0;
+	u8 inv_op, jmp_cond;
+	int err;
+
+	if (!params ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	body_a_len = (u32)params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
+	body_b_len = (u32)params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
+	if (!body_a_len || body_a_len > 16 || !body_b_len || body_b_len > 16)
+		return -EINVAL;
+
+	body_a_start = site_start + 1;
+	body_b_start = site_start + 1 + body_a_len + 1;
+
+	err = measure_branch_flip_body(bpf_prog, body_b_start, body_b_len,
+				       use_priv_fp, &body_b_size);
+	if (err)
+		return err;
+	err = measure_branch_flip_body(bpf_prog, body_a_start, body_a_len,
+				       use_priv_fp, &body_a_size);
+	if (err)
+		return err;
+
+	dst_reg = jit_bpf_reg(jcc_insn->dst_reg, use_priv_fp);
+	if (BPF_SRC(jcc_insn->code) == BPF_X)
+		src_reg = jit_bpf_reg(jcc_insn->src_reg, use_priv_fp);
+
+	err = emit_bpf_jmp_cmp(pprog, jcc_insn, dst_reg, src_reg);
+	if (err)
+		return err;
+
+	err = bpf_jmp_invert(BPF_OP(jcc_insn->code), &inv_op);
+	if (err)
+		return err;
+	if (bpf_jmp_to_x86_cond(inv_op, &jmp_cond))
+		return -EINVAL;
+
+	jmp_join_size = is_imm8_jmp_offset((s32)body_a_size) ? 2U : 5U;
+	err = emit_local_cond_jump(pprog, jmp_cond,
+				   (s32)body_b_size + (s32)jmp_join_size);
+	if (err)
+		return err;
+
+	err = emit_branch_flip_body(pprog, bpf_prog, body_b_start, body_b_len,
+				    use_priv_fp);
+	if (err)
+		return err;
+
+	err = emit_local_jump(pprog, (s32)body_a_size);
+	if (err)
+		return err;
+
+	return emit_branch_flip_body(pprog, bpf_prog, body_a_start, body_a_len,
+				     use_priv_fp);
+}
+
 struct bpf_bitfield_extract_site {
 	u8 dst_bpf_reg;
 	u8 src_bpf_reg;
@@ -3612,6 +4086,20 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 
 			err = emit_canonical_endian_fusion(pprog, &rule->params,
 							use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
+
+	case BPF_JIT_CF_BRANCH_FLIP:
+			if (rule->native_choice == BPF_JIT_BFLIP_ORIGINAL)
+				return 0;
+			if (rule->native_choice != BPF_JIT_BFLIP_FLIPPED)
+				return -EINVAL;
+
+			err = emit_canonical_branch_flip(pprog, bpf_prog,
+						       (u32)local_site_start,
+						       &rule->params,
+						       use_priv_fp);
 			if (err)
 				return err;
 			return rule->site_len;

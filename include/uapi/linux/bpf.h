@@ -1494,6 +1494,7 @@ enum bpf_jit_canonical_form {
 	BPF_JIT_CF_BITFIELD_EXTRACT = 5, /* maps to BITFIELD_EXTRACT emitter */
 	BPF_JIT_CF_ZERO_EXT_ELIDE = 6, /* maps to ZERO_EXT_ELIDE emitter */
 	BPF_JIT_CF_ENDIAN_FUSION = 7, /* maps to ENDIAN_FUSION emitter */
+	BPF_JIT_CF_BRANCH_FLIP = 8, /* maps to BRANCH_FLIP emitter */
 };
 
 /* COND_SELECT native_choice values */
@@ -1534,6 +1535,12 @@ enum bpf_jit_zero_ext_native {
 /* ENDIAN_FUSION native_choice values */
 enum bpf_jit_endian_fusion_native {
 	BPF_JIT_ENDIAN_MOVBE	= 1,	/* x86: movbe load/store fusion */
+};
+
+/* BRANCH_FLIP native_choice values */
+enum bpf_jit_branch_flip_native {
+	BPF_JIT_BFLIP_ORIGINAL	= 1,	/* stock ordering */
+	BPF_JIT_BFLIP_FLIPPED	= 2,	/* inverted jcc, swapped bodies */
 };
 
 /* x86 CPU feature bits for bpf_jit_rewrite_rule_v2.cpu_features_required */
@@ -1645,6 +1652,15 @@ enum bpf_jit_endian_fusion_param {
 	BPF_JIT_ENDIAN_PARAM_OFFSET	= 2,
 	BPF_JIT_ENDIAN_PARAM_WIDTH	= 3,
 	BPF_JIT_ENDIAN_PARAM_DIRECTION	= 4,
+};
+
+enum bpf_jit_branch_flip_param {
+	BPF_JIT_BFLIP_PARAM_COND_OP	= 0,
+	BPF_JIT_BFLIP_PARAM_BODY_A_START = 1,
+	BPF_JIT_BFLIP_PARAM_BODY_A_LEN	= 2,
+	BPF_JIT_BFLIP_PARAM_BODY_B_START = 3,
+	BPF_JIT_BFLIP_PARAM_BODY_B_LEN	= 4,
+	BPF_JIT_BFLIP_PARAM_JOIN_TARGET = 5,
 };
 
 enum bpf_jit_cond_select_param {

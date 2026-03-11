@@ -356,6 +356,9 @@ static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 		return native_choice == BPF_JIT_ZEXT_ELIDE;
 	case BPF_JIT_CF_ENDIAN_FUSION:
 		return native_choice == BPF_JIT_ENDIAN_MOVBE;
+	case BPF_JIT_CF_BRANCH_FLIP:
+		return native_choice == BPF_JIT_BFLIP_ORIGINAL ||
+		       native_choice == BPF_JIT_BFLIP_FLIPPED;
 	default:
 		return false;
 	}
@@ -371,6 +374,7 @@ static bool bpf_jit_canonical_form_valid(u16 form)
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 	case BPF_JIT_CF_ZERO_EXT_ELIDE:
 	case BPF_JIT_CF_ENDIAN_FUSION:
+	case BPF_JIT_CF_BRANCH_FLIP:
 		return true;
 	default:
 		return false;
@@ -1433,6 +1437,118 @@ bpf_jit_validate_endian_fusion_rule(const struct bpf_insn *insns,
 	return false;
 }
 
+static bool bpf_jit_branch_flip_body_linear(const struct bpf_insn *insns,
+					    u32 start, u32 len)
+{
+	u32 i;
+
+	if (!len)
+		return false;
+
+	for (i = start; i < start + len; i++) {
+		u8 cls = BPF_CLASS(insns[i].code);
+		u8 op = BPF_OP(insns[i].code);
+
+		if ((cls == BPF_JMP || cls == BPF_JMP32) &&
+		    op != BPF_CALL && op != BPF_EXIT)
+			return false;
+		if (cls == BPF_STX || cls == BPF_ST)
+			return false;
+		if (insns[i].code == (BPF_LD | BPF_IMM | BPF_DW))
+			return false;
+	}
+
+	return true;
+}
+
+static __maybe_unused bool
+bpf_jit_validate_branch_flip_rule(const struct bpf_insn *insns,
+				  u32 insn_cnt,
+				  const struct bpf_jit_rule *rule,
+				  const struct bpf_jit_canonical_params *params)
+{
+	const struct bpf_insn *jcc;
+	const struct bpf_insn *ja_insn;
+	s64 cond_op, body_a_start, body_a_len, body_b_start, body_b_len, join_target;
+	u32 idx = rule->site_start;
+	u32 ja_idx;
+	s32 expected_body_b_start;
+	s32 expected_join;
+	const u32 required_mask =
+		(1U << BPF_JIT_BFLIP_PARAM_COND_OP) |
+		(1U << BPF_JIT_BFLIP_PARAM_BODY_A_START) |
+		(1U << BPF_JIT_BFLIP_PARAM_BODY_A_LEN) |
+		(1U << BPF_JIT_BFLIP_PARAM_BODY_B_START) |
+		(1U << BPF_JIT_BFLIP_PARAM_BODY_B_LEN) |
+		(1U << BPF_JIT_BFLIP_PARAM_JOIN_TARGET);
+
+	if (!params || (params->present_mask & required_mask) != required_mask)
+		return false;
+	if (params->params[BPF_JIT_BFLIP_PARAM_COND_OP].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_A_START].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_B_START].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_BFLIP_PARAM_JOIN_TARGET].type != BPF_JIT_BIND_VAL_IMM)
+		return false;
+
+	cond_op = params->params[BPF_JIT_BFLIP_PARAM_COND_OP].value;
+	body_a_start = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_START].value;
+	body_a_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
+	body_b_start = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_START].value;
+	body_b_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
+	join_target = params->params[BPF_JIT_BFLIP_PARAM_JOIN_TARGET].value;
+
+	if (rule->site_len < 4 || idx + rule->site_len > insn_cnt)
+		return false;
+	if (body_a_len < 1 || body_a_len > 16 || body_b_len < 1 || body_b_len > 16)
+		return false;
+
+	jcc = &insns[idx];
+	if ((BPF_CLASS(jcc->code) != BPF_JMP && BPF_CLASS(jcc->code) != BPF_JMP32) ||
+	    (BPF_OP(jcc->code) != BPF_JEQ &&
+	     BPF_OP(jcc->code) != BPF_JNE &&
+	     BPF_OP(jcc->code) != BPF_JGT &&
+	     BPF_OP(jcc->code) != BPF_JLT &&
+	     BPF_OP(jcc->code) != BPF_JGE &&
+	     BPF_OP(jcc->code) != BPF_JLE &&
+	     BPF_OP(jcc->code) != BPF_JSGT &&
+	     BPF_OP(jcc->code) != BPF_JSLT &&
+	     BPF_OP(jcc->code) != BPF_JSGE &&
+	     BPF_OP(jcc->code) != BPF_JSLE &&
+	     BPF_OP(jcc->code) != BPF_JSET))
+		return false;
+	if (cond_op != BPF_OP(jcc->code))
+		return false;
+
+	expected_body_b_start = (s32)idx + 1 + jcc->off;
+	ja_idx = idx + 1 + (u32)body_a_len;
+	if (ja_idx >= insn_cnt)
+		return false;
+	ja_insn = &insns[ja_idx];
+	if (ja_insn->code != (BPF_JMP | BPF_JA))
+		return false;
+
+	expected_join = (s32)ja_idx + 1 + ja_insn->off;
+	if (body_a_start != (s64)(idx + 1) ||
+	    body_b_start != expected_body_b_start ||
+	    join_target != expected_join ||
+	    join_target != (s64)(idx + rule->site_len))
+		return false;
+	if (body_a_start + body_a_len + 1 != body_b_start)
+		return false;
+	if (body_b_start + body_b_len != join_target)
+		return false;
+
+	if (!bpf_jit_branch_flip_body_linear(insns, (u32)body_a_start,
+					     (u32)body_a_len) ||
+	    !bpf_jit_branch_flip_body_linear(insns, (u32)body_b_start,
+					     (u32)body_b_len))
+		return false;
+
+	return true;
+}
+
 /**
  * bpf_jit_site_has_side_effects - reject sites containing unsafe instructions
  *
@@ -1715,6 +1831,8 @@ static bool bpf_jit_binding_param_valid(u16 form, u8 param)
 		return param <= BPF_JIT_ZEXT_PARAM_DST_REG;
 	case BPF_JIT_CF_ENDIAN_FUSION:
 		return param <= BPF_JIT_ENDIAN_PARAM_DIRECTION;
+	case BPF_JIT_CF_BRANCH_FLIP:
+		return param <= BPF_JIT_BFLIP_PARAM_JOIN_TARGET;
 	default:
 		return false;
 	}
@@ -1970,6 +2088,24 @@ static bool bpf_jit_validate_canonical_params(
 		       (direction == BPF_JIT_ENDIAN_LOAD_SWAP ||
 			direction == BPF_JIT_ENDIAN_SWAP_STORE);
 	}
+	case BPF_JIT_CF_BRANCH_FLIP: {
+		s64 cond_op, body_a_len, body_b_len;
+
+		if (!bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_COND_OP) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_START) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_LEN) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_START) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_LEN) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_JOIN_TARGET))
+			return false;
+
+		cond_op = params->params[BPF_JIT_BFLIP_PARAM_COND_OP].value;
+		body_a_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
+		body_b_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
+		return bpf_jit_cond_op_valid((u8)cond_op) &&
+		       body_a_len >= 1 && body_a_len <= 16 &&
+		       body_b_len >= 1 && body_b_len <= 16;
+	}
 	default:
 		bpf_jit_recompile_rule_log(prog, rule,
 					   "canonical parameter validation failed");
@@ -1980,7 +2116,8 @@ static bool bpf_jit_validate_canonical_params(
 static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 					    const struct bpf_insn *insns,
 					    u32 insn_cnt,
-					    const struct bpf_jit_rule *rule)
+					    const struct bpf_jit_rule *rule,
+					    const struct bpf_jit_canonical_params *params)
 {
 	switch (rule->canonical_form) {
 	case BPF_JIT_CF_ZERO_EXT_ELIDE:
@@ -1992,6 +2129,14 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 		break;
 	case BPF_JIT_CF_ENDIAN_FUSION:
 		if (!bpf_jit_validate_endian_fusion_rule(insns, insn_cnt, rule)) {
+			bpf_jit_recompile_rule_log(prog, rule,
+						   "canonical site validation failed");
+			return false;
+		}
+		break;
+	case BPF_JIT_CF_BRANCH_FLIP:
+		if (!bpf_jit_validate_branch_flip_rule(insns, insn_cnt, rule,
+						       params)) {
 			bpf_jit_recompile_rule_log(prog, rule,
 						   "canonical site validation failed");
 			return false;
@@ -2031,7 +2176,8 @@ static bool bpf_jit_validate_pattern_rule(const struct bpf_prog *prog,
 				      vars, &tmp_params, prog, rule) ||
 	    !bpf_jit_validate_canonical_params(rule, &tmp_params, prog))
 		return false;
-	if (!bpf_jit_validate_canonical_site(prog, insns, insn_cnt, rule))
+	if (!bpf_jit_validate_canonical_site(prog, insns, insn_cnt, rule,
+					     &tmp_params))
 		return false;
 	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start,
 				      rule->site_len)) {
