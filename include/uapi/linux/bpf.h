@@ -1528,11 +1528,11 @@ enum bpf_jit_bitfield_extract_native {
 #define BPF_JIT_X86_CMOV	(1U << 0)
 #define BPF_JIT_X86_BMI2	(1U << 1)
 
-#define BPF_JIT_MAX_PATTERN_LEN		24
+#define BPF_JIT_MAX_PATTERN_LEN		64
 #define BPF_JIT_MAX_PATTERN_VARS	15
 #define BPF_JIT_MAX_CONSTRAINTS		16
-#define BPF_JIT_MAX_BINDINGS		12
-#define BPF_JIT_MAX_CANONICAL_PARAMS	12
+#define BPF_JIT_MAX_BINDINGS		16
+#define BPF_JIT_MAX_CANONICAL_PARAMS	16
 
 /* bpf_jit_pattern_insn.flags */
 #define BPF_JIT_PATTERN_F_EXPECT_IMM	(1U << 0)
@@ -2118,6 +2118,9 @@ union bpf_attr {
 		__u32		prog_fd;
 		__s32		policy_fd;	/* sealed memfd with policy blob; 0 = stock re-JIT */
 		__u32		flags;
+		__u32		log_level;
+		__u32		log_size;
+		__aligned_u64	log_buf;
 	} jit_recompile;
 
 } __attribute__((aligned(8)));

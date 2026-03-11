@@ -5,7 +5,7 @@
 #include <linux/types.h>
 
 #ifndef BPF_JIT_MAX_CANONICAL_PARAMS
-#define BPF_JIT_MAX_CANONICAL_PARAMS 12
+#define BPF_JIT_MAX_CANONICAL_PARAMS 16
 #endif
 
 struct bpf_prog;
@@ -41,7 +41,7 @@ struct bpf_jit_binding_value {
 
 struct bpf_jit_canonical_params {
 	struct bpf_jit_binding_value params[BPF_JIT_MAX_CANONICAL_PARAMS];
-	u16 present_mask;
+	u32 present_mask;
 	u8 param_count;
 };
 
@@ -78,6 +78,7 @@ struct bpf_jit_rule {
 	u16 site_len;
 	u16 flags;
 	u16 priority;
+	u16 user_index;
 	u32 cpu_features_required;
 };
 
@@ -97,6 +98,11 @@ struct bpf_jit_policy {
 
 /* Syscall handler */
 int bpf_prog_jit_recompile(union bpf_attr *attr);
+void __printf(2, 3) bpf_jit_recompile_prog_log(const struct bpf_prog *prog,
+					       const char *fmt, ...);
+void __printf(3, 4) bpf_jit_recompile_rule_log(const struct bpf_prog *prog,
+					       const struct bpf_jit_rule *rule,
+					       const char *fmt, ...);
 
 /* Policy blob parsing & validation */
 struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd);

@@ -3241,82 +3241,82 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 	int err;
 
 	if (rule->rule_kind != BPF_JIT_RK_PATTERN)
-		return -1;
+		return -EINVAL;
 
 	if (bpf_jit_rule_local_site_start(bpf_prog, rule) < 0)
-		return -1;
+		return -EINVAL;
 
 	switch (form) {
 	case BPF_JIT_CF_COND_SELECT:
-		if (rule->native_choice == BPF_JIT_SEL_BRANCH) {
-			/* Stock emission requested — return 0 to fall through */
-			return 0;
-		}
-		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
-			return -1;
+			if (rule->native_choice == BPF_JIT_SEL_BRANCH) {
+				/* Stock emission requested — return 0 to fall through */
+				return 0;
+			}
+			if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
+				return -EINVAL;
 
-		err = emit_canonical_select(pprog, &rule->params, use_priv_fp);
-		if (err)
-			return -1;
-		return rule->site_len;
+			err = emit_canonical_select(pprog, &rule->params, use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
 
 	case BPF_JIT_CF_WIDE_MEM:
-		if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS) {
-			/* Stock emission requested */
-			return 0;
-		}
-		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
-			return -1;
+			if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS) {
+				/* Stock emission requested */
+				return 0;
+			}
+			if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
+				return -EINVAL;
 
-		err = emit_canonical_wide_load(pprog, &rule->params, use_priv_fp);
-		if (err)
-			return -1;
-		return rule->site_len;
+			err = emit_canonical_wide_load(pprog, &rule->params, use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
 
 	case BPF_JIT_CF_ROTATE:
-		if (rule->native_choice == BPF_JIT_ROT_SHIFT) {
-			/* Stock emission requested */
-			return 0;
-		}
-		if (rule->native_choice != BPF_JIT_ROT_ROR &&
-		    rule->native_choice != BPF_JIT_ROT_RORX)
-			return -1;
+			if (rule->native_choice == BPF_JIT_ROT_SHIFT) {
+				/* Stock emission requested */
+				return 0;
+			}
+			if (rule->native_choice != BPF_JIT_ROT_ROR &&
+			    rule->native_choice != BPF_JIT_ROT_RORX)
+				return -EINVAL;
 
-		err = emit_canonical_rotate(pprog, &rule->params,
-					      rule->native_choice,
-					      use_priv_fp);
-		if (err)
-			return -1;
-		return rule->site_len;
+			err = emit_canonical_rotate(pprog, &rule->params,
+						      rule->native_choice,
+						      use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
 
 	case BPF_JIT_CF_ADDR_CALC:
-		if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD) {
-			/* Stock emission requested */
-			return 0;
-		}
-		if (rule->native_choice != BPF_JIT_ACALC_LEA)
-			return -1;
+			if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD) {
+				/* Stock emission requested */
+				return 0;
+			}
+			if (rule->native_choice != BPF_JIT_ACALC_LEA)
+				return -EINVAL;
 
-		err = emit_canonical_lea_fusion(pprog, &rule->params,
-						use_priv_fp);
-		if (err)
-			return -1;
-		return rule->site_len;
+			err = emit_canonical_lea_fusion(pprog, &rule->params,
+							use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
 
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
-		if (rule->native_choice == BPF_JIT_BFX_EXTRACT) {
-			err = emit_canonical_bitfield_extract(
-				pprog, &rule->params, use_priv_fp);
-			if (err)
-				return -1;
-			return rule->site_len;
-		}
-		return -1;
+			if (rule->native_choice == BPF_JIT_BFX_EXTRACT) {
+				err = emit_canonical_bitfield_extract(
+					pprog, &rule->params, use_priv_fp);
+				if (err)
+					return err;
+				return rule->site_len;
+			}
+			return -EINVAL;
 
-	default:
-		return -1;
+		default:
+			return -EINVAL;
+		}
 	}
-}
 
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
 		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
@@ -3422,11 +3422,11 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
 					int consumed;
 
-					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-									 rule,
-									 priv_frame_ptr != NULL);
-					if (consumed > 0) {
-						int region_start = proglen;
+						consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
+										 rule,
+										 priv_frame_ptr != NULL);
+						if (consumed > 0) {
+							int region_start = proglen;
 						int j;
 
 						ilen = prog - temp;
@@ -3450,20 +3450,28 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 						 * addrs[i+j] for j=0..consumed-2 -> region_start
 						 * addrs[i+consumed-1] -> proglen (end of block)
 						 */
-						for (j = 0; j < consumed - 1; j++)
-							addrs[i + j] = region_start;
-						addrs[i + consumed - 1] = proglen;
+							for (j = 0; j < consumed - 1; j++)
+								addrs[i + j] = region_start;
+							addrs[i + consumed - 1] = proglen;
+							if (image)
+								bpf_jit_recompile_rule_log(
+									bpf_prog, rule,
+									"applied successfully");
 
-						prog = temp;
-						insn += consumed - 1;
-						i += consumed - 1;
-						continue;
+							prog = temp;
+							insn += consumed - 1;
+							i += consumed - 1;
+							continue;
+						}
+						/* consumed == 0 means fall through to stock emission */
+						if (consumed < 0 && image)
+							bpf_jit_recompile_rule_log(
+								bpf_prog, rule,
+								"emitter fallback (err=%d)",
+								consumed);
 					}
-					/* consumed == 0 means fall through to stock emission */
-					/* consumed < 0 means error, also fall through */
 				}
 			}
-		}
 
 		switch (insn->code) {
 			/* ALU */
