@@ -1492,6 +1492,8 @@ enum bpf_jit_canonical_form {
 	BPF_JIT_CF_ADDR_CALC	= 3,	/* maps to ADDR_CALC emitter */
 	BPF_JIT_CF_COND_SELECT	= 4,	/* maps to COND_SELECT emitter */
 	BPF_JIT_CF_BITFIELD_EXTRACT = 5, /* maps to BITFIELD_EXTRACT emitter */
+	BPF_JIT_CF_ZERO_EXT_ELIDE = 6, /* maps to ZERO_EXT_ELIDE emitter */
+	BPF_JIT_CF_ENDIAN_FUSION = 7, /* maps to ENDIAN_FUSION emitter */
 };
 
 /* COND_SELECT native_choice values */
@@ -1524,9 +1526,20 @@ enum bpf_jit_bitfield_extract_native {
 	BPF_JIT_BFX_EXTRACT	= 1,	/* x86: bextr or compact shift/mask */
 };
 
+/* ZERO_EXT_ELIDE native_choice values */
+enum bpf_jit_zero_ext_native {
+	BPF_JIT_ZEXT_ELIDE	= 1,	/* x86: drop redundant zero-extend */
+};
+
+/* ENDIAN_FUSION native_choice values */
+enum bpf_jit_endian_fusion_native {
+	BPF_JIT_ENDIAN_MOVBE	= 1,	/* x86: movbe load/store fusion */
+};
+
 /* x86 CPU feature bits for bpf_jit_rewrite_rule_v2.cpu_features_required */
 #define BPF_JIT_X86_CMOV	(1U << 0)
 #define BPF_JIT_X86_BMI2	(1U << 1)
+#define BPF_JIT_X86_MOVBE	(1U << 2)
 
 #define BPF_JIT_MAX_PATTERN_LEN		64
 #define BPF_JIT_MAX_PATTERN_VARS	15
@@ -1615,6 +1628,23 @@ enum bpf_jit_bitfield_extract_param {
 	BPF_JIT_BFX_PARAM_MASK		= 3,
 	BPF_JIT_BFX_PARAM_WIDTH		= 4,
 	BPF_JIT_BFX_PARAM_ORDER		= 5,
+};
+
+enum bpf_jit_zero_ext_param {
+	BPF_JIT_ZEXT_PARAM_DST_REG	= 0,
+};
+
+enum bpf_jit_endian_fusion_direction {
+	BPF_JIT_ENDIAN_LOAD_SWAP	= 0,
+	BPF_JIT_ENDIAN_SWAP_STORE	= 1,
+};
+
+enum bpf_jit_endian_fusion_param {
+	BPF_JIT_ENDIAN_PARAM_DATA_REG	= 0,
+	BPF_JIT_ENDIAN_PARAM_BASE_REG	= 1,
+	BPF_JIT_ENDIAN_PARAM_OFFSET	= 2,
+	BPF_JIT_ENDIAN_PARAM_WIDTH	= 3,
+	BPF_JIT_ENDIAN_PARAM_DIRECTION	= 4,
 };
 
 enum bpf_jit_cond_select_param {

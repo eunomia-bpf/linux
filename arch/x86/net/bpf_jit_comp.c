@@ -2906,6 +2906,286 @@ static int emit_canonical_lea_fusion(
 	return 0;
 }
 
+static int emit_bpf_alu32_insn(u8 **pprog, const struct bpf_insn *insn,
+			       bool use_priv_fp)
+{
+	const s32 imm32 = insn->imm;
+	u32 dst_reg = jit_bpf_reg(insn->dst_reg, use_priv_fp);
+	u32 src_reg = jit_bpf_reg(insn->src_reg, use_priv_fp);
+	u8 b2 = 0, b3 = 0;
+	u8 *prog = *pprog;
+
+	switch (insn->code) {
+	case BPF_ALU | BPF_ADD | BPF_X:
+	case BPF_ALU | BPF_SUB | BPF_X:
+	case BPF_ALU | BPF_AND | BPF_X:
+	case BPF_ALU | BPF_OR | BPF_X:
+	case BPF_ALU | BPF_XOR | BPF_X:
+		maybe_emit_mod(&prog, dst_reg, src_reg, false);
+		b2 = simple_alu_opcodes[BPF_OP(insn->code)];
+		EMIT2(b2, add_2reg(0xC0, dst_reg, src_reg));
+		break;
+
+	case BPF_ALU | BPF_NEG:
+		maybe_emit_1mod(&prog, dst_reg, false);
+		EMIT2(0xF7, add_1reg(0xD8, dst_reg));
+		break;
+
+	case BPF_ALU | BPF_ADD | BPF_K:
+	case BPF_ALU | BPF_SUB | BPF_K:
+	case BPF_ALU | BPF_AND | BPF_K:
+	case BPF_ALU | BPF_OR | BPF_K:
+	case BPF_ALU | BPF_XOR | BPF_K:
+		maybe_emit_1mod(&prog, dst_reg, false);
+
+		switch (BPF_OP(insn->code)) {
+		case BPF_ADD:
+			b3 = 0xC0;
+			b2 = 0x05;
+			break;
+		case BPF_SUB:
+			b3 = 0xE8;
+			b2 = 0x2D;
+			break;
+		case BPF_AND:
+			b3 = 0xE0;
+			b2 = 0x25;
+			break;
+		case BPF_OR:
+			b3 = 0xC8;
+			b2 = 0x0D;
+			break;
+		case BPF_XOR:
+			b3 = 0xF0;
+			b2 = 0x35;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		if (is_imm8(imm32))
+			EMIT3(0x83, add_1reg(b3, dst_reg), imm32);
+		else if (is_axreg(dst_reg))
+			EMIT1_off32(b2, imm32);
+		else
+			EMIT2_off32(0x81, add_1reg(b3, dst_reg), imm32);
+		break;
+
+	case BPF_ALU | BPF_MOV | BPF_X:
+		if (insn->off == 0)
+			emit_mov_reg(&prog, false, dst_reg, src_reg);
+		else
+			emit_movsx_reg(&prog, insn->off, false, dst_reg, src_reg);
+		break;
+
+	case BPF_ALU | BPF_MOV | BPF_K:
+		emit_mov_imm32(&prog, false, dst_reg, imm32);
+		break;
+
+	case BPF_ALU | BPF_MUL | BPF_K:
+		maybe_emit_mod(&prog, dst_reg, dst_reg, false);
+
+		if (is_imm8(imm32))
+			EMIT3(0x6B, add_2reg(0xC0, dst_reg, dst_reg), imm32);
+		else
+			EMIT2_off32(0x69, add_2reg(0xC0, dst_reg, dst_reg), imm32);
+		break;
+
+	case BPF_ALU | BPF_MUL | BPF_X:
+		maybe_emit_mod(&prog, src_reg, dst_reg, false);
+		EMIT3(0x0F, 0xAF, add_2reg(0xC0, src_reg, dst_reg));
+		break;
+
+	case BPF_ALU | BPF_LSH | BPF_K:
+	case BPF_ALU | BPF_RSH | BPF_K:
+	case BPF_ALU | BPF_ARSH | BPF_K:
+		maybe_emit_1mod(&prog, dst_reg, false);
+		b3 = simple_alu_opcodes[BPF_OP(insn->code)];
+		if (imm32 == 1)
+			EMIT2(0xD1, add_1reg(b3, dst_reg));
+		else
+			EMIT3(0xC1, add_1reg(b3, dst_reg), imm32);
+		break;
+
+	case BPF_ALU | BPF_LSH | BPF_X:
+	case BPF_ALU | BPF_RSH | BPF_X:
+	case BPF_ALU | BPF_ARSH | BPF_X:
+		if (boot_cpu_has(X86_FEATURE_BMI2) && src_reg != BPF_REG_4) {
+			u8 op;
+
+			switch (BPF_OP(insn->code)) {
+			case BPF_LSH:
+				op = 1;
+				break;
+			case BPF_RSH:
+				op = 3;
+				break;
+			case BPF_ARSH:
+				op = 2;
+				break;
+			default:
+				return -EINVAL;
+			}
+
+			emit_shiftx(&prog, dst_reg, src_reg, false, op);
+			break;
+		}
+
+		if (src_reg != BPF_REG_4) {
+			if (dst_reg == BPF_REG_4) {
+				EMIT_mov(AUX_REG, dst_reg);
+				dst_reg = AUX_REG;
+			} else {
+				EMIT1(0x51);
+			}
+			EMIT_mov(BPF_REG_4, src_reg);
+		}
+
+		maybe_emit_1mod(&prog, dst_reg, false);
+		b3 = simple_alu_opcodes[BPF_OP(insn->code)];
+		EMIT2(0xD3, add_1reg(b3, dst_reg));
+
+		if (src_reg != BPF_REG_4) {
+			if (insn->dst_reg == BPF_REG_4)
+				EMIT_mov(insn->dst_reg, AUX_REG);
+			else
+				EMIT1(0x59);
+		}
+		break;
+
+	case BPF_ALU | BPF_DIV | BPF_X:
+	case BPF_ALU | BPF_MOD | BPF_X:
+	case BPF_ALU | BPF_DIV | BPF_K:
+	case BPF_ALU | BPF_MOD | BPF_K:
+		if (dst_reg != BPF_REG_0)
+			EMIT1(0x50);
+		if (dst_reg != BPF_REG_3)
+			EMIT1(0x52);
+
+		if (BPF_SRC(insn->code) == BPF_X) {
+			if (src_reg == BPF_REG_0 || src_reg == BPF_REG_3) {
+				EMIT_mov(AUX_REG, src_reg);
+				src_reg = AUX_REG;
+			}
+		} else {
+			EMIT3_off32(0x49, 0xC7, 0xC3, imm32);
+			src_reg = AUX_REG;
+		}
+
+		if (dst_reg != BPF_REG_0)
+			emit_mov_reg(&prog, false, BPF_REG_0, dst_reg);
+
+		EMIT2(0x31, 0xd2);
+		maybe_emit_1mod(&prog, src_reg, false);
+		EMIT2(0xF7, add_1reg(0xF0, src_reg));
+
+		if (BPF_OP(insn->code) == BPF_MOD && dst_reg != BPF_REG_3)
+			emit_mov_reg(&prog, false, dst_reg, BPF_REG_3);
+		else if (BPF_OP(insn->code) == BPF_DIV && dst_reg != BPF_REG_0)
+			emit_mov_reg(&prog, false, dst_reg, BPF_REG_0);
+
+		if (dst_reg != BPF_REG_3)
+			EMIT1(0x5A);
+		if (dst_reg != BPF_REG_0)
+			EMIT1(0x58);
+		break;
+
+	default:
+		return -EINVAL;
+	}
+
+	*pprog = prog;
+	return 0;
+}
+
+static int emit_canonical_zero_ext_elide(u8 **pprog,
+					 const struct bpf_prog *bpf_prog,
+					 u32 site_start,
+					 bool use_priv_fp)
+{
+	const struct bpf_insn *insn = &bpf_prog->insnsi[site_start];
+
+	if (BPF_CLASS(insn->code) != BPF_ALU || BPF_OP(insn->code) == BPF_END)
+		return -EINVAL;
+
+	return emit_bpf_alu32_insn(pprog, insn, use_priv_fp);
+}
+
+static void emit_movbe_load(u8 **pprog, u32 dst_reg, u32 base_reg,
+			    int off, u32 width)
+{
+	u8 *prog = *pprog;
+
+	if (width == 16)
+		EMIT1(0x66);
+	maybe_emit_mod(&prog, base_reg, dst_reg, width == 64);
+	EMIT3(0x0F, 0x38, 0xF0);
+	emit_insn_suffix(&prog, base_reg, dst_reg, off);
+
+	if (width == 16) {
+		if (is_ereg(dst_reg))
+			EMIT3(0x45, 0x0F, 0xB7);
+		else
+			EMIT2(0x0F, 0xB7);
+		EMIT1(add_2reg(0xC0, dst_reg, dst_reg));
+	}
+
+	*pprog = prog;
+}
+
+static void emit_movbe_store(u8 **pprog, u32 src_reg, u32 base_reg,
+			     int off, u32 width)
+{
+	u8 *prog = *pprog;
+
+	if (width == 16)
+		EMIT1(0x66);
+	maybe_emit_mod(&prog, base_reg, src_reg, width == 64);
+	EMIT3(0x0F, 0x38, 0xF1);
+	emit_insn_suffix(&prog, base_reg, src_reg, off);
+	*pprog = prog;
+}
+
+static int emit_canonical_endian_fusion(
+	u8 **pprog,
+	const struct bpf_jit_canonical_params *params,
+	bool use_priv_fp)
+{
+	u32 data_reg, base_reg, width, direction;
+	s16 off;
+
+	if (params->params[BPF_JIT_ENDIAN_PARAM_DATA_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_ENDIAN_PARAM_BASE_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_ENDIAN_PARAM_OFFSET].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_ENDIAN_PARAM_WIDTH].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_ENDIAN_PARAM_DIRECTION].type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	if (!boot_cpu_has(X86_FEATURE_MOVBE))
+		return -EINVAL;
+
+	width = (u32)params->params[BPF_JIT_ENDIAN_PARAM_WIDTH].value;
+	direction = (u32)params->params[BPF_JIT_ENDIAN_PARAM_DIRECTION].value;
+	if (width != 16 && width != 32 && width != 64)
+		return -EINVAL;
+	if (direction != BPF_JIT_ENDIAN_LOAD_SWAP &&
+	    direction != BPF_JIT_ENDIAN_SWAP_STORE)
+		return -EINVAL;
+
+	data_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ENDIAN_PARAM_DATA_REG].value,
+			       use_priv_fp);
+	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ENDIAN_PARAM_BASE_REG].value,
+			       use_priv_fp);
+	off = (s16)params->params[BPF_JIT_ENDIAN_PARAM_OFFSET].value;
+
+	if (direction == BPF_JIT_ENDIAN_LOAD_SWAP)
+		emit_movbe_load(pprog, data_reg, base_reg, off, width);
+	else
+		emit_movbe_store(pprog, data_reg, base_reg, off, width);
+
+	return 0;
+}
+
 struct bpf_bitfield_extract_site {
 	u8 dst_bpf_reg;
 	u8 src_bpf_reg;
@@ -3238,12 +3518,14 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 				  bool use_priv_fp)
 {
 	u16 form = bpf_jit_rule_form(rule);
+	int local_site_start;
 	int err;
 
 	if (rule->rule_kind != BPF_JIT_RK_PATTERN)
 		return -EINVAL;
 
-	if (bpf_jit_rule_local_site_start(bpf_prog, rule) < 0)
+	local_site_start = bpf_jit_rule_local_site_start(bpf_prog, rule);
+	if (local_site_start < 0)
 		return -EINVAL;
 
 	switch (form) {
@@ -3312,6 +3594,27 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 				return rule->site_len;
 			}
 			return -EINVAL;
+
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+			if (rule->native_choice != BPF_JIT_ZEXT_ELIDE)
+				return -EINVAL;
+
+			err = emit_canonical_zero_ext_elide(pprog, bpf_prog,
+						       (u32)local_site_start,
+						       use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
+
+	case BPF_JIT_CF_ENDIAN_FUSION:
+			if (rule->native_choice != BPF_JIT_ENDIAN_MOVBE)
+				return -EINVAL;
+
+			err = emit_canonical_endian_fusion(pprog, &rule->params,
+							use_priv_fp);
+			if (err)
+				return err;
+			return rule->site_len;
 
 		default:
 			return -EINVAL;

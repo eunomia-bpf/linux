@@ -352,6 +352,10 @@ static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 		       native_choice == BPF_JIT_ACALC_SHIFT_ADD;
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		return native_choice == BPF_JIT_BFX_EXTRACT;
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+		return native_choice == BPF_JIT_ZEXT_ELIDE;
+	case BPF_JIT_CF_ENDIAN_FUSION:
+		return native_choice == BPF_JIT_ENDIAN_MOVBE;
 	default:
 		return false;
 	}
@@ -365,6 +369,8 @@ static bool bpf_jit_canonical_form_valid(u16 form)
 	case BPF_JIT_CF_ROTATE:
 	case BPF_JIT_CF_ADDR_CALC:
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+	case BPF_JIT_CF_ENDIAN_FUSION:
 		return true;
 	default:
 		return false;
@@ -406,6 +412,8 @@ static u32 bpf_jit_cpu_features_for_native_choice(u16 form, u16 native_choice)
 		return native_choice == BPF_JIT_SEL_CMOVCC ? BPF_JIT_X86_CMOV : 0;
 	case BPF_JIT_CF_ROTATE:
 		return native_choice == BPF_JIT_ROT_RORX ? BPF_JIT_X86_BMI2 : 0;
+	case BPF_JIT_CF_ENDIAN_FUSION:
+		return native_choice == BPF_JIT_ENDIAN_MOVBE ? BPF_JIT_X86_MOVBE : 0;
 	default:
 		return 0;
 	}
@@ -1321,6 +1329,110 @@ bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
 	return true;
 }
 
+static bool bpf_jit_zero_ext_elide_is_alu32(const struct bpf_insn *insn)
+{
+	return BPF_CLASS(insn->code) == BPF_ALU && BPF_OP(insn->code) != BPF_END;
+}
+
+static __maybe_unused bool
+bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
+				     u32 insn_cnt,
+				     const struct bpf_jit_rule *rule)
+{
+	const struct bpf_insn *alu32_insn;
+	const struct bpf_insn *zext_insn;
+	u32 idx = rule->site_start;
+
+	if (rule->site_len != 2 || idx + 2 > insn_cnt)
+		return false;
+
+	alu32_insn = &insns[idx];
+	zext_insn = &insns[idx + 1];
+
+	if (!bpf_jit_zero_ext_elide_is_alu32(alu32_insn))
+		return false;
+
+	if (zext_insn->code == (BPF_ALU64 | BPF_MOV | BPF_X)) {
+		if (zext_insn->dst_reg != alu32_insn->dst_reg ||
+		    zext_insn->src_reg != alu32_insn->dst_reg ||
+		    zext_insn->off || zext_insn->imm)
+			return false;
+	} else if (zext_insn->code == (BPF_ALU64 | BPF_AND | BPF_K)) {
+		if (zext_insn->dst_reg != alu32_insn->dst_reg ||
+		    zext_insn->off || zext_insn->imm != -1)
+			return false;
+	} else {
+		return false;
+	}
+
+	return true;
+}
+
+static s32 bpf_jit_endian_width_from_mem_opcode(u8 code)
+{
+	switch (code) {
+	case BPF_LDX | BPF_MEM | BPF_H:
+	case BPF_STX | BPF_MEM | BPF_H:
+		return 16;
+	case BPF_LDX | BPF_MEM | BPF_W:
+	case BPF_STX | BPF_MEM | BPF_W:
+		return 32;
+	case BPF_LDX | BPF_MEM | BPF_DW:
+	case BPF_STX | BPF_MEM | BPF_DW:
+		return 64;
+	default:
+		return -1;
+	}
+}
+
+static bool bpf_jit_endian_fusion_is_swap(const struct bpf_insn *insn, s32 width)
+{
+	if (insn->off || insn->src_reg || insn->imm != width)
+		return false;
+
+	if (insn->code == (BPF_ALU64 | BPF_END | BPF_FROM_LE))
+		return width == 16 || width == 32 || width == 64;
+
+	if (insn->code == (BPF_ALU | BPF_END | BPF_FROM_BE))
+		return width == 16 || width == 32;
+
+	return false;
+}
+
+static __maybe_unused bool
+bpf_jit_validate_endian_fusion_rule(const struct bpf_insn *insns,
+				    u32 insn_cnt,
+				    const struct bpf_jit_rule *rule)
+{
+	const struct bpf_insn *first;
+	const struct bpf_insn *second;
+	s32 width_bits;
+	u32 idx = rule->site_start;
+
+	if (rule->site_len != 2 || idx + 2 > insn_cnt)
+		return false;
+
+	first = &insns[idx];
+	second = &insns[idx + 1];
+
+	width_bits = bpf_jit_endian_width_from_mem_opcode(first->code);
+	if (width_bits > 0 && BPF_CLASS(first->code) == BPF_LDX) {
+		if (first->imm || !bpf_jit_endian_fusion_is_swap(second, width_bits))
+			return false;
+		return first->dst_reg == second->dst_reg;
+	}
+
+	width_bits = bpf_jit_endian_width_from_mem_opcode(second->code);
+	if (width_bits > 0 && BPF_CLASS(second->code) == BPF_STX) {
+		if (second->imm ||
+		    !bpf_jit_endian_fusion_is_swap(first, width_bits))
+			return false;
+		return first->dst_reg == second->src_reg;
+	}
+
+	return false;
+}
+
 /**
  * bpf_jit_site_has_side_effects - reject sites containing unsafe instructions
  *
@@ -1363,6 +1475,8 @@ static bool bpf_jit_check_cpu_features(u32 required)
 		available |= BPF_JIT_X86_CMOV;
 	if (boot_cpu_has(X86_FEATURE_BMI2))
 		available |= BPF_JIT_X86_BMI2;
+	if (boot_cpu_has(X86_FEATURE_MOVBE))
+		available |= BPF_JIT_X86_MOVBE;
 
 	return (required & available) == required;
 }
@@ -1597,6 +1711,10 @@ static bool bpf_jit_binding_param_valid(u16 form, u8 param)
 		return param <= BPF_JIT_SEL_PARAM_WIDTH;
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		return param <= BPF_JIT_BFX_PARAM_ORDER;
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+		return param <= BPF_JIT_ZEXT_PARAM_DST_REG;
+	case BPF_JIT_CF_ENDIAN_FUSION:
+		return param <= BPF_JIT_ENDIAN_PARAM_DIRECTION;
 	default:
 		return false;
 	}
@@ -1833,11 +1951,57 @@ static bool bpf_jit_validate_canonical_params(
 		       (order == BPF_JIT_BFX_ORDER_SHIFT_MASK ||
 			order == BPF_JIT_BFX_ORDER_MASK_SHIFT);
 	}
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+		return bpf_jit_param_is_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG);
+	case BPF_JIT_CF_ENDIAN_FUSION: {
+		s64 width, direction;
+
+		if (!bpf_jit_param_is_reg(params, BPF_JIT_ENDIAN_PARAM_DATA_REG) ||
+		    !bpf_jit_param_is_reg(params, BPF_JIT_ENDIAN_PARAM_BASE_REG) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_ENDIAN_PARAM_OFFSET) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_ENDIAN_PARAM_WIDTH) ||
+		    !bpf_jit_param_is_imm(params,
+					  BPF_JIT_ENDIAN_PARAM_DIRECTION))
+			return false;
+
+		width = params->params[BPF_JIT_ENDIAN_PARAM_WIDTH].value;
+		direction = params->params[BPF_JIT_ENDIAN_PARAM_DIRECTION].value;
+		return (width == 16 || width == 32 || width == 64) &&
+		       (direction == BPF_JIT_ENDIAN_LOAD_SWAP ||
+			direction == BPF_JIT_ENDIAN_SWAP_STORE);
+	}
 	default:
 		bpf_jit_recompile_rule_log(prog, rule,
 					   "canonical parameter validation failed");
 		return false;
 	}
+}
+
+static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
+					    const struct bpf_insn *insns,
+					    u32 insn_cnt,
+					    const struct bpf_jit_rule *rule)
+{
+	switch (rule->canonical_form) {
+	case BPF_JIT_CF_ZERO_EXT_ELIDE:
+		if (!bpf_jit_validate_zero_ext_elide_rule(insns, insn_cnt, rule)) {
+			bpf_jit_recompile_rule_log(prog, rule,
+						   "canonical site validation failed");
+			return false;
+		}
+		break;
+	case BPF_JIT_CF_ENDIAN_FUSION:
+		if (!bpf_jit_validate_endian_fusion_rule(insns, insn_cnt, rule)) {
+			bpf_jit_recompile_rule_log(prog, rule,
+						   "canonical site validation failed");
+			return false;
+		}
+		break;
+	default:
+		break;
+	}
+
+	return true;
 }
 
 static bool bpf_jit_validate_pattern_rule(const struct bpf_prog *prog,
@@ -1866,6 +2030,8 @@ static bool bpf_jit_validate_pattern_rule(const struct bpf_prog *prog,
 	    !bpf_jit_extract_bindings(rule->bindings, rule->binding_count,
 				      vars, &tmp_params, prog, rule) ||
 	    !bpf_jit_validate_canonical_params(rule, &tmp_params, prog))
+		return false;
+	if (!bpf_jit_validate_canonical_site(prog, insns, insn_cnt, rule))
 		return false;
 	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start,
 				      rule->site_len)) {
@@ -1917,7 +2083,8 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 	}
 
 	/* Layer-2 generic check: reject sites with side effects */
-	if (bpf_jit_site_has_side_effects(insns, rule->site_start,
+	if (form != BPF_JIT_CF_ENDIAN_FUSION &&
+	    bpf_jit_site_has_side_effects(insns, rule->site_start,
 					  rule->site_len)) {
 		bpf_jit_recompile_rule_log(prog, rule,
 					   "site has side effects");
