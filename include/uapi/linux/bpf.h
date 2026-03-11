@@ -1469,7 +1469,9 @@ enum bpf_jit_directives_load_flags {
 /* ---- v4 JIT policy blob format ---- */
 
 #define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
-#define BPF_JIT_POLICY_VERSION		1
+#define BPF_JIT_POLICY_VERSION_1	1
+#define BPF_JIT_POLICY_VERSION_2	2
+#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_VERSION_1
 
 /* Architecture IDs for policy blob */
 #define BPF_JIT_ARCH_X86_64		1
@@ -1492,6 +1494,14 @@ enum bpf_jit_rule_kind {
 	BPF_JIT_RK_WIDE_MEM	= 2,	/* wide load vs byte ladder */
 	BPF_JIT_RK_ROTATE	= 3,	/* rorx/ror vs shift+or */
 	BPF_JIT_RK_ADDR_CALC	= 4,	/* lea vs mov+shl+add */
+	BPF_JIT_RK_PATTERN	= 5,	/* v5 declarative pattern */
+};
+
+enum bpf_jit_canonical_form {
+	BPF_JIT_CF_ROTATE	= 1,	/* maps to ROTATE emitter */
+	BPF_JIT_CF_WIDE_MEM	= 2,	/* maps to WIDE_MEM emitter */
+	BPF_JIT_CF_ADDR_CALC	= 3,	/* maps to ADDR_CALC emitter */
+	BPF_JIT_CF_COND_SELECT	= 4,	/* maps to COND_SELECT emitter */
 };
 
 /* COND_SELECT native_choice values */
@@ -1530,6 +1540,111 @@ struct bpf_jit_rewrite_rule {
 	__u16 native_choice;		/* which native instruction to use */
 	__u16 priority;			/* higher wins on overlap */
 	__u32 cpu_features_required;	/* BPF_JIT_X86_* bits */
+};
+
+#define BPF_JIT_MAX_PATTERN_LEN		24
+#define BPF_JIT_MAX_PATTERN_VARS	15
+#define BPF_JIT_MAX_CONSTRAINTS		16
+#define BPF_JIT_MAX_BINDINGS		12
+#define BPF_JIT_MAX_CANONICAL_PARAMS	12
+
+/* bpf_jit_pattern_insn.flags */
+#define BPF_JIT_PATTERN_F_EXPECT_IMM	(1U << 0)
+#define BPF_JIT_PATTERN_F_EXPECT_DST_REG	(1U << 1)
+#define BPF_JIT_PATTERN_F_EXPECT_SRC_REG	(1U << 2)
+#define BPF_JIT_PATTERN_F_EXPECT_OFF	(1U << 3)
+
+enum bpf_jit_pattern_constraint_type {
+	BPF_JIT_CSTR_EQUAL	= 1,
+	BPF_JIT_CSTR_SUM_CONST	= 2,
+	BPF_JIT_CSTR_IMM_RANGE	= 3,
+	BPF_JIT_CSTR_NOT_ZERO	= 4,
+	BPF_JIT_CSTR_MASK_BITS	= 5,
+	BPF_JIT_CSTR_DIFF_CONST	= 6,
+	BPF_JIT_CSTR_NOT_EQUAL	= 7,
+};
+
+struct bpf_jit_pattern_insn {
+	__u8 opcode;		/* exact BPF opcode */
+	__u8 dst_binding;	/* variable ID for dst_reg, 0 = unused */
+	__u8 src_binding;	/* variable ID for src_reg, 0 = unused */
+	__u8 imm_binding;	/* variable ID for imm, 0 = unused */
+	__u8 off_binding;	/* variable ID for off, 0 = unused */
+	__u8 flags;		/* BPF_JIT_PATTERN_F_* */
+	__u8 expected_dst_reg;
+	__u8 expected_src_reg;
+	__s16 expected_off;
+	__s32 expected_imm;
+};
+
+struct bpf_jit_pattern_constraint {
+	__u8 type;		/* enum bpf_jit_pattern_constraint_type */
+	__u8 var_a;		/* 1..BPF_JIT_MAX_PATTERN_VARS */
+	__u8 var_b;		/* optional second variable */
+	__u8 reserved;
+	__s32 constant;
+	__s32 constant_hi;
+	__u32 reserved2;
+};
+
+enum bpf_jit_binding_source_type {
+	BPF_JIT_BIND_SOURCE_REG		= 0,
+	BPF_JIT_BIND_SOURCE_IMM		= 1,
+	BPF_JIT_BIND_SOURCE_CONST	= 2,
+};
+
+enum bpf_jit_rotate_param {
+	BPF_JIT_ROT_PARAM_DST_REG	= 0,
+	BPF_JIT_ROT_PARAM_SRC_REG	= 1,
+	BPF_JIT_ROT_PARAM_AMOUNT	= 2,
+	BPF_JIT_ROT_PARAM_WIDTH		= 3,
+};
+
+enum bpf_jit_wide_mem_param {
+	BPF_JIT_WMEM_PARAM_DST_REG	= 0,
+	BPF_JIT_WMEM_PARAM_BASE_REG	= 1,
+	BPF_JIT_WMEM_PARAM_BASE_OFF	= 2,
+	BPF_JIT_WMEM_PARAM_WIDTH	= 3,
+};
+
+enum bpf_jit_addr_calc_param {
+	BPF_JIT_ACALC_PARAM_DST_REG	= 0,
+	BPF_JIT_ACALC_PARAM_BASE_REG	= 1,
+	BPF_JIT_ACALC_PARAM_INDEX_REG	= 2,
+	BPF_JIT_ACALC_PARAM_SCALE	= 3,
+};
+
+enum bpf_jit_cond_select_param {
+	BPF_JIT_SEL_PARAM_DST_REG	= 0,
+	BPF_JIT_SEL_PARAM_COND_OP	= 1,
+	BPF_JIT_SEL_PARAM_COND_A	= 2,
+	BPF_JIT_SEL_PARAM_COND_B	= 3,
+	BPF_JIT_SEL_PARAM_TRUE_VAL	= 4,
+	BPF_JIT_SEL_PARAM_FALSE_VAL	= 5,
+	BPF_JIT_SEL_PARAM_WIDTH		= 6,
+};
+
+struct bpf_jit_binding {
+	__u8 canonical_param;		/* form-specific enum *_param */
+	__u8 source_var;		/* 1..BPF_JIT_MAX_PATTERN_VARS */
+	__u8 source_type;		/* enum bpf_jit_binding_source_type */
+	__u8 reserved;
+	__s32 inline_const;		/* used when source_type=CONST */
+};
+
+struct bpf_jit_rewrite_rule_v2 {
+	__u32 site_start;		/* BPF instruction offset */
+	__u32 cpu_features_required;	/* BPF_JIT_X86_* bits */
+	__u16 site_len;			/* span length in BPF insns */
+	__u16 rule_kind;		/* BPF_JIT_RK_PATTERN */
+	__u16 canonical_form;		/* enum bpf_jit_canonical_form */
+	__u16 native_choice;		/* which native instruction to use */
+	__u16 priority;			/* higher wins on overlap */
+	__u16 pattern_count;		/* number of bpf_jit_pattern_insn */
+	__u16 constraint_count;		/* number of constraints */
+	__u16 binding_count;		/* number of canonical bindings */
+	__u16 rule_len;			/* header + pattern + constraints + bindings */
+	__u16 reserved;
 };
 
 /* Backward-compat: keep v2 magic/version for BPF_PROG_LOAD path */
