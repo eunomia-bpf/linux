@@ -515,6 +515,8 @@ static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
 		return BPF_JIT_CF_ADDR_CALC;
 	case BPF_JIT_RK_COND_SELECT:
 		return BPF_JIT_CF_COND_SELECT;
+	case BPF_JIT_RK_BITFIELD_EXTRACT:
+		return BPF_JIT_CF_BITFIELD_EXTRACT;
 	default:
 		return 0;
 	}
@@ -536,6 +538,8 @@ static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 	case BPF_JIT_CF_ADDR_CALC:
 		return native_choice == BPF_JIT_ACALC_LEA ||
 		       native_choice == BPF_JIT_ACALC_SHIFT_ADD;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		return native_choice == BPF_JIT_BFX_EXTRACT;
 	default:
 		return false;
 	}
@@ -548,12 +552,16 @@ static bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule)
 		return rule->site_len == 4 || rule->site_len == 5 ||
 		       rule->site_len == 6;
 	case BPF_JIT_CF_WIDE_MEM:
-		return rule->site_len == 4 || rule->site_len == 10 ||
+		return rule->site_len == 4 || rule->site_len == 7 ||
+		       rule->site_len == 10 || rule->site_len == 13 ||
+		       rule->site_len == 16 || rule->site_len == 19 ||
 		       rule->site_len == 22;
 	case BPF_JIT_CF_ADDR_CALC:
 		return rule->site_len == 3;
 	case BPF_JIT_CF_COND_SELECT:
 		return rule->site_len == 3 || rule->site_len == 4;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		return rule->site_len == 2 || rule->site_len == 3;
 	default:
 		return false;
 	}
@@ -697,147 +705,127 @@ static bool bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
 	return true;
 }
 
-/**
- * bpf_jit_validate_wide_mem_low_first - validate low-byte-first pattern
- *
- * Pattern (N = 2, 4, or 8 bytes):
- *   [0] ldxb dst, [base+off]
- *   [1] ldxb tmp, [base+off+1]
- *   [2] lsh64 tmp, 8
- *   [3] or64  dst, tmp
- *   ... repeated for each additional byte
- *
- * site_len = 1 + (N-1)*3 = 3N-2
- */
-static bool bpf_jit_validate_wide_mem_low_first(const struct bpf_insn *insns,
-						u32 insn_cnt, u32 idx,
-						u32 site_len)
-{
-	const struct bpf_insn *first;
+struct bpf_jit_wide_mem_shape {
+	u8 dst_reg;
 	u8 base_reg;
 	s16 base_off;
-	u32 expected_bytes;
-	u32 i;
+	u8 width;
+	bool big_endian;
+};
 
-	if (!bpf_jit_site_range_valid(idx, site_len, insn_cnt, NULL))
-		return false;
+static bool bpf_jit_parse_wide_mem_shape(const struct bpf_insn *insns,
+					 u32 insn_cnt, u32 idx,
+					 u32 site_len,
+					 struct bpf_jit_wide_mem_shape *shape)
+{
+	const struct bpf_insn *first;
+	s16 offsets[8];
+	u8 shifts[8];
+	u32 pos, end, count;
+	s16 min_off, max_off;
+	u32 i, j;
+	bool little_endian = true;
+	bool big_endian = true;
 
-	if (site_len < 4)
+	if (!bpf_jit_site_range_valid(idx, site_len, insn_cnt, NULL) ||
+	    site_len < 4)
 		return false;
 
 	first = &insns[idx];
-
-	/* First insn must be BPF_LDX | BPF_MEM | BPF_B */
 	if (first->code != (BPF_LDX | BPF_MEM | BPF_B))
 		return false;
 
-	base_reg = first->src_reg;
-	base_off = first->off;
+	offsets[0] = first->off;
+	shifts[0] = 0;
+	count = 1;
+	pos = idx + 1;
+	end = idx + site_len;
 
-	/* For N bytes: 1 + (N-1)*3 = 3N-2 insns, so N = (site_len + 2) / 3 */
-	if ((site_len + 2) % 3 != 0)
-		return false;
-
-	expected_bytes = (site_len + 2) / 3;
-	if (expected_bytes < 2 || expected_bytes > 8)
-		return false;
-
-	/* Only support power-of-2 widths that the emitter handles */
-	if (expected_bytes != 2 && expected_bytes != 4 && expected_bytes != 8)
-		return false;
-
-	/* Validate each subsequent byte group */
-	for (i = 1; i < expected_bytes; i++) {
-		u32 group_base = idx + 1 + (i - 1) * 3;
-		const struct bpf_insn *load_insn = &insns[group_base];
-		const struct bpf_insn *shift_insn = &insns[group_base + 1];
-		const struct bpf_insn *or_insn = &insns[group_base + 2];
-
-		/* Check ldxb */
-		if (load_insn->code != (BPF_LDX | BPF_MEM | BPF_B))
-			return false;
-		if (load_insn->src_reg != base_reg)
-			return false;
-		if (load_insn->off != base_off + (s16)i)
-			return false;
-
-		/* Check lsh64 imm (shift by i*8) */
-		if (shift_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
-			return false;
-		if (shift_insn->imm != (s32)(i * 8))
-			return false;
-		if (shift_insn->dst_reg != load_insn->dst_reg)
-			return false;
-
-		/* Check or64 */
-		if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
-			return false;
-		if (or_insn->dst_reg != first->dst_reg)
-			return false;
-		if (or_insn->src_reg != load_insn->dst_reg)
-			return false;
+	if (pos < end &&
+	    insns[pos].code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
+	    insns[pos].dst_reg == first->dst_reg &&
+	    insns[pos].off == 0 &&
+	    insns[pos].imm > 0 &&
+	    insns[pos].imm < 64 &&
+	    (insns[pos].imm % 8) == 0) {
+		shifts[0] = (u8)insns[pos].imm;
+		pos++;
 	}
 
-	return true;
-}
+	while (pos < end) {
+		const struct bpf_insn *load_insn = &insns[pos];
+		const struct bpf_insn *or_insn;
+		u32 next = pos + 1;
+		u8 shift_imm = 0;
 
-/**
- * bpf_jit_validate_wide_mem_high_first - validate clang's high-byte-first 2-byte pattern
- *
- * clang generates:
- *   [0] ldxb tmp, [base+off+1]    (high byte FIRST)
- *   [1] lsh64 tmp, 8
- *   [2] ldxb dst, [base+off]      (low byte SECOND)
- *   [3] or64 tmp, dst             (combine into tmp, NOT dst)
- *
- * site_len must be 4 (2-byte only for now).
- * Result register is tmp (insns[0].dst_reg).
- */
-static bool bpf_jit_validate_wide_mem_high_first(const struct bpf_insn *insns,
-						 u32 insn_cnt, u32 idx,
-						 u32 site_len)
-{
-	const struct bpf_insn *hi_load, *shift_insn, *lo_load, *or_insn;
+		if (count == ARRAY_SIZE(offsets))
+			return false;
+		if (load_insn->code != (BPF_LDX | BPF_MEM | BPF_B) ||
+		    load_insn->src_reg != first->src_reg ||
+		    load_insn->dst_reg == first->dst_reg)
+			return false;
 
-	/* Only 2-byte high-first for now */
-	if (site_len != 4)
-		return false;
+		if (next < end &&
+		    insns[next].code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
+		    insns[next].dst_reg == load_insn->dst_reg &&
+		    insns[next].off == 0 &&
+		    insns[next].imm > 0 &&
+		    insns[next].imm < 64 &&
+		    (insns[next].imm % 8) == 0) {
+			shift_imm = (u8)insns[next].imm;
+			next++;
+		}
 
-	if (idx + 4 > insn_cnt)
-		return false;
+		if (next >= end)
+			return false;
 
-	hi_load    = &insns[idx];
-	shift_insn = &insns[idx + 1];
-	lo_load    = &insns[idx + 2];
-	or_insn    = &insns[idx + 3];
+		or_insn = &insns[next];
+		if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X) ||
+		    or_insn->dst_reg != first->dst_reg ||
+		    or_insn->src_reg != load_insn->dst_reg)
+			return false;
 
-	/* [0] ldxb tmp, [base+off+1] */
-	if (hi_load->code != (BPF_LDX | BPF_MEM | BPF_B))
-		return false;
+		offsets[count] = load_insn->off;
+		shifts[count] = shift_imm;
+		count++;
+		pos = next + 1;
+	}
 
-	/* [1] lsh64 tmp, 8 */
-	if (shift_insn->code != (BPF_ALU64 | BPF_LSH | BPF_K))
-		return false;
-	if (shift_insn->imm != 8)
-		return false;
-	if (shift_insn->dst_reg != hi_load->dst_reg)
+	if (count < 2)
 		return false;
 
-	/* [2] ldxb dst, [base+off] — same base register, offset = hi_load.off - 1 */
-	if (lo_load->code != (BPF_LDX | BPF_MEM | BPF_B))
-		return false;
-	if (lo_load->src_reg != hi_load->src_reg)
-		return false;
-	if (lo_load->off != hi_load->off - 1)
+	min_off = offsets[0];
+	max_off = offsets[0];
+	for (i = 0; i < count; i++) {
+		min_off = min(min_off, offsets[i]);
+		max_off = max(max_off, offsets[i]);
+		for (j = i + 1; j < count; j++) {
+			if (offsets[i] == offsets[j])
+				return false;
+		}
+	}
+
+	if (max_off - min_off + 1 != count)
 		return false;
 
-	/* [3] or64 tmp, dst — combine INTO tmp (reversed from low-first) */
-	if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X))
+	for (i = 0; i < count; i++) {
+		u8 le_shift = (u8)((offsets[i] - min_off) * 8);
+		u8 be_shift = (u8)((max_off - offsets[i]) * 8);
+
+		little_endian &= shifts[i] == le_shift;
+		big_endian &= shifts[i] == be_shift;
+	}
+
+	if (!little_endian && !big_endian)
 		return false;
-	if (or_insn->dst_reg != hi_load->dst_reg)
-		return false;
-	if (or_insn->src_reg != lo_load->dst_reg)
-		return false;
+
+	if (shape) {
+		shape->dst_reg = first->dst_reg;
+		shape->base_reg = first->src_reg;
+		shape->base_off = min_off;
+		shape->width = (u8)count;
+		shape->big_endian = !little_endian && big_endian;
+	}
 
 	return true;
 }
@@ -853,25 +841,8 @@ static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 					   u32 insn_cnt,
 					   const struct bpf_jit_rule *rule)
 {
-	u32 idx = rule->site_start;
-	bool shape_ok;
-
-	if (!bpf_jit_site_range_valid(idx, rule->site_len, insn_cnt, NULL))
-		return false;
-
-	if (rule->site_len < 4)
-		return false;
-
-	/* Try low-byte-first pattern first */
-	shape_ok = bpf_jit_validate_wide_mem_low_first(insns, insn_cnt, idx,
-						       rule->site_len);
-
-	/* If that fails, try high-byte-first pattern (2-byte only) */
-	if (!shape_ok)
-		shape_ok = bpf_jit_validate_wide_mem_high_first(insns, insn_cnt,
-								idx, rule->site_len);
-
-	if (!shape_ok)
+	if (!bpf_jit_parse_wide_mem_shape(insns, insn_cnt, rule->site_start,
+					  rule->site_len, NULL))
 		return false;
 
 	/* Reject if any external jump targets the interior of this pattern */
@@ -1365,6 +1336,122 @@ static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 	return true;
 }
 
+struct bpf_jit_bitfield_extract_desc {
+	u8 dst_reg;
+	u8 src_reg;
+	s32 shift;
+	s32 mask;
+	u8 width;
+	bool mask_first;
+};
+
+static bool bpf_jit_parse_bitfield_extract_site(
+	const struct bpf_insn *insns,
+	u32 insn_cnt,
+	const struct bpf_jit_rule *rule,
+	struct bpf_jit_bitfield_extract_desc *desc)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *mov_insn = NULL;
+	const struct bpf_insn *first, *second;
+	u8 mov_opcode, rsh_opcode, and_opcode;
+	u8 dst_reg, src_reg, width;
+	s32 shift, mask;
+	bool mask_first;
+
+	if (rule->site_len == 3) {
+		if (idx + 3 > insn_cnt)
+			return false;
+		mov_insn = &insns[idx];
+		first = &insns[idx + 1];
+		second = &insns[idx + 2];
+	} else if (rule->site_len == 2) {
+		if (idx + 2 > insn_cnt)
+			return false;
+		first = &insns[idx];
+		second = &insns[idx + 1];
+	} else {
+		return false;
+	}
+
+	switch (first->code) {
+	case BPF_ALU64 | BPF_RSH | BPF_K:
+	case BPF_ALU64 | BPF_AND | BPF_K:
+		width = 64;
+		mov_opcode = BPF_ALU64 | BPF_MOV | BPF_X;
+		rsh_opcode = BPF_ALU64 | BPF_RSH | BPF_K;
+		and_opcode = BPF_ALU64 | BPF_AND | BPF_K;
+		break;
+	case BPF_ALU | BPF_RSH | BPF_K:
+	case BPF_ALU | BPF_AND | BPF_K:
+		width = 32;
+		mov_opcode = BPF_ALU | BPF_MOV | BPF_X;
+		rsh_opcode = BPF_ALU | BPF_RSH | BPF_K;
+		and_opcode = BPF_ALU | BPF_AND | BPF_K;
+		break;
+	default:
+		return false;
+	}
+
+	if (mov_insn) {
+		if (mov_insn->code != mov_opcode || mov_insn->off || mov_insn->imm)
+			return false;
+		dst_reg = mov_insn->dst_reg;
+		src_reg = mov_insn->src_reg;
+		if (first->dst_reg != dst_reg || second->dst_reg != dst_reg)
+			return false;
+	} else {
+		dst_reg = first->dst_reg;
+		src_reg = dst_reg;
+		if (second->dst_reg != dst_reg)
+			return false;
+	}
+
+	if (first->off || second->off)
+		return false;
+
+	if (first->code == rsh_opcode && second->code == and_opcode) {
+		shift = first->imm;
+		mask = second->imm;
+		mask_first = false;
+	} else if (first->code == and_opcode && second->code == rsh_opcode) {
+		shift = second->imm;
+		mask = first->imm;
+		mask_first = true;
+	} else {
+		return false;
+	}
+
+	if (shift < 0 || shift >= width)
+		return false;
+
+	if (desc) {
+		desc->dst_reg = dst_reg;
+		desc->src_reg = src_reg;
+		desc->shift = shift;
+		desc->mask = mask;
+		desc->width = width;
+		desc->mask_first = mask_first;
+	}
+
+	return true;
+}
+
+static bool bpf_jit_validate_bitfield_extract_rule(
+	const struct bpf_insn *insns,
+	u32 insn_cnt,
+	const struct bpf_jit_rule *rule)
+{
+	if (!bpf_jit_parse_bitfield_extract_site(insns, insn_cnt, rule, NULL))
+		return false;
+
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start,
+				      rule->site_len))
+		return false;
+
+	return true;
+}
+
 /**
  * bpf_jit_validate_addr_calc_rule - validate an ADDR_CALC rule against prog
  *
@@ -1642,6 +1729,8 @@ static bool bpf_jit_binding_param_valid(u16 form, u8 param)
 		return param <= BPF_JIT_ACALC_PARAM_SCALE;
 	case BPF_JIT_CF_COND_SELECT:
 		return param <= BPF_JIT_SEL_PARAM_WIDTH;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		return param <= BPF_JIT_BFX_PARAM_ORDER;
 	default:
 		return false;
 	}
@@ -1797,7 +1886,7 @@ static bool bpf_jit_validate_canonical_params(
 		       amount > 0 && amount < width;
 	}
 	case BPF_JIT_CF_WIDE_MEM: {
-		s64 width;
+		s64 encoded_width, width, flags;
 
 		if (!bpf_jit_param_is_reg(params, BPF_JIT_WMEM_PARAM_DST_REG) ||
 		    !bpf_jit_param_is_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG) ||
@@ -1805,8 +1894,11 @@ static bool bpf_jit_validate_canonical_params(
 		    !bpf_jit_param_is_imm(params, BPF_JIT_WMEM_PARAM_WIDTH))
 			return false;
 
-		width = params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
-		return width == 2 || width == 4 || width == 8;
+		encoded_width = params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
+		width = encoded_width & BPF_JIT_WMEM_WIDTH_MASK;
+		flags = encoded_width & ~BPF_JIT_WMEM_WIDTH_MASK;
+		return width >= 2 && width <= 8 &&
+		       (flags == 0 || flags == BPF_JIT_WMEM_F_BIG_ENDIAN);
 	}
 	case BPF_JIT_CF_ADDR_CALC: {
 		s64 scale;
@@ -1835,6 +1927,25 @@ static bool bpf_jit_validate_canonical_params(
 		width = params->params[BPF_JIT_SEL_PARAM_WIDTH].value;
 		cond_op = params->params[BPF_JIT_SEL_PARAM_COND_OP].value;
 		return (width == 32 || width == 64) && bpf_jit_cond_op_valid(cond_op);
+	}
+	case BPF_JIT_CF_BITFIELD_EXTRACT: {
+		s64 width, shift, order;
+
+		if (!bpf_jit_param_is_reg(params, BPF_JIT_BFX_PARAM_DST_REG) ||
+		    !bpf_jit_param_is_reg(params, BPF_JIT_BFX_PARAM_SRC_REG) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_SHIFT) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_MASK) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_WIDTH) ||
+		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_ORDER))
+			return false;
+
+		width = params->params[BPF_JIT_BFX_PARAM_WIDTH].value;
+		shift = params->params[BPF_JIT_BFX_PARAM_SHIFT].value;
+		order = params->params[BPF_JIT_BFX_PARAM_ORDER].value;
+		return (width == 32 || width == 64) &&
+		       shift >= 0 && shift < width &&
+		       (order == BPF_JIT_BFX_ORDER_SHIFT_MASK ||
+			order == BPF_JIT_BFX_ORDER_MASK_SHIFT);
 	}
 	default:
 		return false;
@@ -1914,6 +2025,9 @@ static bool bpf_jit_validate_rule(const struct bpf_insn *insns,
 
 	case BPF_JIT_RK_ADDR_CALC:
 		return bpf_jit_validate_addr_calc_rule(insns, insn_cnt, rule);
+	case BPF_JIT_RK_BITFIELD_EXTRACT:
+		return bpf_jit_validate_bitfield_extract_rule(insns, insn_cnt,
+							      rule);
 	case BPF_JIT_RK_PATTERN:
 		return bpf_jit_validate_pattern_rule(insns, insn_cnt, rule,
 						     params);
@@ -2048,6 +2162,12 @@ static bool bpf_jit_validate_constraint_desc(
 	return true;
 }
 
+/*
+ * v1 policy parser — DEPRECATED.
+ * Retained for backward compatibility only. All new directives and patterns
+ * MUST use the v2 (declarative pattern) path via BPF_JIT_RK_PATTERN.
+ * Do NOT add new rule_kind or native_choice handling here.
+ */
 static struct bpf_jit_policy *
 bpf_jit_parse_policy_v1(struct bpf_prog *prog,
 			 const struct bpf_jit_policy_hdr *hdr,

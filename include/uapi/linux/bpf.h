@@ -1494,7 +1494,8 @@ enum bpf_jit_rule_kind {
 	BPF_JIT_RK_WIDE_MEM	= 2,	/* wide load vs byte ladder */
 	BPF_JIT_RK_ROTATE	= 3,	/* rorx/ror vs shift+or */
 	BPF_JIT_RK_ADDR_CALC	= 4,	/* lea vs mov+shl+add */
-	BPF_JIT_RK_PATTERN	= 5,	/* v5 declarative pattern */
+	BPF_JIT_RK_BITFIELD_EXTRACT = 5, /* bextr / compact bitfield extract */
+	BPF_JIT_RK_PATTERN	= 6,	/* v5 declarative pattern */
 };
 
 enum bpf_jit_canonical_form {
@@ -1502,6 +1503,7 @@ enum bpf_jit_canonical_form {
 	BPF_JIT_CF_WIDE_MEM	= 2,	/* maps to WIDE_MEM emitter */
 	BPF_JIT_CF_ADDR_CALC	= 3,	/* maps to ADDR_CALC emitter */
 	BPF_JIT_CF_COND_SELECT	= 4,	/* maps to COND_SELECT emitter */
+	BPF_JIT_CF_BITFIELD_EXTRACT = 5, /* maps to BITFIELD_EXTRACT emitter */
 };
 
 /* COND_SELECT native_choice values */
@@ -1527,6 +1529,11 @@ enum bpf_jit_rotate_native {
 enum bpf_jit_addr_calc_native {
 	BPF_JIT_ACALC_LEA		= 1,	/* x86: lea dst, [base + idx*scale] */
 	BPF_JIT_ACALC_SHIFT_ADD	= 2,	/* stock: mov+shl+add */
+};
+
+/* BITFIELD_EXTRACT native_choice values */
+enum bpf_jit_bitfield_extract_native {
+	BPF_JIT_BFX_EXTRACT	= 1,	/* x86: bextr or compact shift/mask */
 };
 
 /* x86 CPU feature bits for bpf_jit_rewrite_rule.cpu_features_required */
@@ -1607,11 +1614,28 @@ enum bpf_jit_wide_mem_param {
 	BPF_JIT_WMEM_PARAM_WIDTH	= 3,
 };
 
+#define BPF_JIT_WMEM_WIDTH_MASK		0xffU
+#define BPF_JIT_WMEM_F_BIG_ENDIAN	(1U << 8)
+
 enum bpf_jit_addr_calc_param {
 	BPF_JIT_ACALC_PARAM_DST_REG	= 0,
 	BPF_JIT_ACALC_PARAM_BASE_REG	= 1,
 	BPF_JIT_ACALC_PARAM_INDEX_REG	= 2,
 	BPF_JIT_ACALC_PARAM_SCALE	= 3,
+};
+
+enum bpf_jit_bitfield_extract_order {
+	BPF_JIT_BFX_ORDER_SHIFT_MASK = 0,
+	BPF_JIT_BFX_ORDER_MASK_SHIFT = 1,
+};
+
+enum bpf_jit_bitfield_extract_param {
+	BPF_JIT_BFX_PARAM_DST_REG	= 0,
+	BPF_JIT_BFX_PARAM_SRC_REG	= 1,
+	BPF_JIT_BFX_PARAM_SHIFT		= 2,
+	BPF_JIT_BFX_PARAM_MASK		= 3,
+	BPF_JIT_BFX_PARAM_WIDTH		= 4,
+	BPF_JIT_BFX_PARAM_ORDER		= 5,
 };
 
 enum bpf_jit_cond_select_param {
