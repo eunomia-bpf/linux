@@ -286,6 +286,12 @@ static u8 add_2reg(u8 byte, u32 dst_reg, u32 src_reg)
 	return byte + reg2hex[dst_reg] + (reg2hex[src_reg] << 3);
 }
 
+/* rbp/r13 base encodings need at least a disp8 in ModR/M form. */
+static bool x86_base_needs_disp(u32 reg)
+{
+	return reg2hex[reg] == reg2hex[BPF_REG_FP];
+}
+
 /* Some 1-byte opcodes for binary ALU operations */
 static u8 simple_alu_opcodes[] = {
 	[BPF_ADD] = 0x01,
@@ -1581,12 +1587,13 @@ static void emit_insn_suffix(u8 **pprog, u32 ptr_reg, u32 val_reg, int off)
 {
 	u8 *prog = *pprog;
 
-	if (is_imm8(off)) {
+	if (off == 0 && !x86_base_needs_disp(ptr_reg)) {
+		/* Skip the disp8 when the base encoding allows a plain [base]. */
+		EMIT1(add_2reg(0x00, ptr_reg, val_reg));
+	} else if (is_imm8(off)) {
 		/* 1-byte signed displacement.
 		 *
-		 * If off == 0 we could skip this and save one extra byte, but
-		 * special case of x86 R13 which always needs an offset is not
-		 * worth the hassle
+		 * rbp/r13 still need a displacement even when off == 0.
 		 */
 		EMIT2(add_2reg(0x40, ptr_reg, val_reg), off);
 	} else {
@@ -1846,8 +1853,24 @@ static void emit_st_r12(u8 **pprog, u32 size, u32 dst_reg, int off, int imm)
 	emit_st_index(pprog, size, dst_reg, X86_REG_R12, off, imm);
 }
 
+static void emit_st_imm32(u8 **pprog, u32 dst_reg, int off, s32 imm32)
+{
+	u8 *prog = *pprog;
+
+	/* mov qword ptr [dst_reg + off], imm32 (sign-extended to 64 bits) */
+	EMIT2(add_1mod(0x48, dst_reg), 0xC7);
+	emit_insn_suffix(&prog, dst_reg, BPF_REG_0, off);
+	EMIT(imm32, 4);
+	*pprog = prog;
+}
+
 static void emit_store_stack_imm64(u8 **pprog, int reg, int stack_off, u64 imm64)
 {
+	if (imm64 && is_simm32(imm64)) {
+		emit_st_imm32(pprog, BPF_REG_FP, stack_off, (s32)imm64);
+		return;
+	}
+
 	/*
 	 * mov reg, imm64
 	 * mov QWORD PTR [rbp + stack_off], reg
