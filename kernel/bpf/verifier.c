@@ -9,7 +9,6 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
-#include <linux/bpf_jit_directives.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
@@ -26105,9 +26104,6 @@ skip_full_check:
 		env->prog->aux->verifier_zext = bpf_jit_needs_zext() ? !ret
 								     : false;
 	}
-
-	if (ret == 0)
-		ret = bpf_jit_directives_validate(env);
 
 	if (ret == 0)
 		ret = fixup_call_args(env);

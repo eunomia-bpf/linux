@@ -1356,10 +1356,11 @@ static void emit_bpf_mov_value_noflags(u8 **pprog, const struct bpf_insn *insn,
 	emit_mov_imm32_noflags(pprog, is64, dst_reg, insn->imm);
 }
 
-static int emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
-				const struct bpf_insn *then_insn,
-				const struct bpf_insn *else_insn,
-				bool use_priv_fp)
+static __maybe_unused int
+emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
+			 const struct bpf_insn *then_insn,
+			 const struct bpf_insn *else_insn,
+			 bool use_priv_fp)
 {
 	u32 dst_reg = jit_bpf_reg(then_insn->dst_reg, use_priv_fp);
 	bool is64 = BPF_CLASS(then_insn->code) == BPF_ALU64;
@@ -1420,11 +1421,12 @@ static bool is_bpf_cmov_select_compact(const struct bpf_insn *default_insn,
 	return mov_cls == BPF_ALU;
 }
 
-static int emit_bpf_cmov_select_compact(u8 **pprog,
-					const struct bpf_insn *default_insn,
-					const struct bpf_insn *jmp_insn,
-					const struct bpf_insn *override_insn,
-					bool use_priv_fp)
+static __maybe_unused int
+emit_bpf_cmov_select_compact(u8 **pprog,
+				     const struct bpf_insn *default_insn,
+				     const struct bpf_insn *jmp_insn,
+				     const struct bpf_insn *override_insn,
+				     bool use_priv_fp)
 {
 	u32 dst_reg = jit_bpf_reg(default_insn->dst_reg, use_priv_fp);
 	bool is64 = BPF_CLASS(default_insn->code) == BPF_ALU64;
@@ -2462,9 +2464,10 @@ static bool parse_bpf_wide_load_shape(const struct bpf_insn *insns, u32 idx,
 	return true;
 }
 
-static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
-			       const struct bpf_jit_rule *rule,
-			       bool use_priv_fp)
+static __maybe_unused int
+emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
+		       const struct bpf_jit_rule *rule,
+		       bool use_priv_fp)
 {
 	struct bpf_wide_load_shape shape;
 
@@ -2499,9 +2502,10 @@ static int emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
  *   [3] mov64 dst, src; [4] lsh64 dst, N; [5] or64 dst, tmp
  *   Always 32-bit rotate.  Result in dst (insns[3].dst_reg).
  */
-static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
-			    const struct bpf_jit_rule *rule,
-			    bool use_priv_fp)
+static __maybe_unused int
+emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
+		    const struct bpf_jit_rule *rule,
+		    bool use_priv_fp)
 {
 	u32 idx = rule->site_start;
 	u32 dst_reg, src_reg, tmp_reg;
@@ -2647,9 +2651,10 @@ static int emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
  * Emitted: lea dst, [base + idx*scale_factor]
  * where scale_factor = 1<<scale = {2, 4, 8}
  */
-static int emit_bpf_lea_fusion(u8 **pprog, const struct bpf_insn *insns,
-			       const struct bpf_jit_rule *rule,
-			       bool use_priv_fp)
+static __maybe_unused int
+emit_bpf_lea_fusion(u8 **pprog, const struct bpf_insn *insns,
+		        const struct bpf_jit_rule *rule,
+		        bool use_priv_fp)
 {
 	u32 idx = rule->site_start;
 	const struct bpf_insn *mov_insn = &insns[idx];
@@ -3193,23 +3198,7 @@ static __maybe_unused int emit_canonical_bitfield_extract(
 
 static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
 {
-	if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-		return rule->canonical_form;
-
-	switch (rule->rule_kind) {
-	case BPF_JIT_RK_ROTATE:
-		return BPF_JIT_CF_ROTATE;
-	case BPF_JIT_RK_WIDE_MEM:
-		return BPF_JIT_CF_WIDE_MEM;
-	case BPF_JIT_RK_BITFIELD_EXTRACT:
-		return BPF_JIT_CF_BITFIELD_EXTRACT;
-	case BPF_JIT_RK_ADDR_CALC:
-		return BPF_JIT_CF_ADDR_CALC;
-	case BPF_JIT_RK_COND_SELECT:
-		return BPF_JIT_CF_COND_SELECT;
-	default:
-		return 0;
-	}
+	return rule->rule_kind == BPF_JIT_RK_PATTERN ? rule->canonical_form : 0;
 }
 
 static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
@@ -3219,11 +3208,6 @@ static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
 	u32 subprog_start = bpf_prog->aux->subprog_start;
 	u32 site_end;
 
-	/*
-	 * v4 policy rules are validated against the full translated program, so
-	 * sites are program-absolute. Fixed baseline rules are synthesized
-	 * inside do_jit() against the current subprog and therefore stay local.
-	 */
 	if (!(rule->flags & BPF_JIT_REWRITE_F_ACTIVE))
 		return site_start;
 
@@ -3242,28 +3226,25 @@ static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
 }
 
 /*
- * v4 JIT policy framework: general rule dispatcher
+ * Canonical-form dispatcher for validated v5 pattern rules.
  *
  * Called from do_jit() main loop. If a rule covers the current BPF insn,
  * emits the alternative native code and returns the number of BPF insns
- * consumed (>= 1). Returns 0 if no rule applies, or -1 on error.
+ * consumed (>= 1). Returns 0 if stock emission should be used, or -1 on
+ * error.
  */
 static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 				  const struct bpf_jit_rule *rule,
-				  const struct bpf_insn *insns,
 				  bool use_priv_fp)
 {
 	u16 form = bpf_jit_rule_form(rule);
-	struct bpf_jit_rule local_rule;
-	int local_site_start;
 	int err;
 
-	local_site_start = bpf_jit_rule_local_site_start(bpf_prog, rule);
-	if (local_site_start < 0)
+	if (rule->rule_kind != BPF_JIT_RK_PATTERN)
 		return -1;
 
-	local_rule = *rule;
-	local_rule.site_start = local_site_start;
+	if (bpf_jit_rule_local_site_start(bpf_prog, rule) < 0)
+		return -1;
 
 	switch (form) {
 	case BPF_JIT_CF_COND_SELECT:
@@ -3274,27 +3255,7 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
 			return -1;
 
-		if (rule->rule_kind == BPF_JIT_RK_PATTERN) {
-			err = emit_canonical_select(pprog, &rule->params,
-						      use_priv_fp);
-		} else if (local_rule.site_len == 4) {
-			/* Diamond: jcc, mov_false, ja, mov_true */
-			err = emit_bpf_cmov_select(pprog,
-						   &insns[local_rule.site_start],
-						   &insns[local_rule.site_start + 1],
-						   &insns[local_rule.site_start + 3],
-						   use_priv_fp);
-		} else if (local_rule.site_len == 3) {
-			/* Compact: mov_default, jcc, mov_override */
-			err = emit_bpf_cmov_select_compact(pprog,
-							   &insns[local_rule.site_start],
-							   &insns[local_rule.site_start + 1],
-							   &insns[local_rule.site_start + 2],
-							   use_priv_fp);
-		} else {
-			return -1;
-		}
-
+		err = emit_canonical_select(pprog, &rule->params, use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
@@ -3307,12 +3268,7 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
 			return -1;
 
-		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-			err = emit_canonical_wide_load(pprog, &rule->params,
-						       use_priv_fp);
-		else
-			err = emit_bpf_wide_load(pprog, insns, &local_rule,
-						 use_priv_fp);
+		err = emit_canonical_wide_load(pprog, &rule->params, use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
@@ -3326,12 +3282,8 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		    rule->native_choice != BPF_JIT_ROT_RORX)
 			return -1;
 
-		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-			err = emit_canonical_rotate(pprog, &rule->params,
-						      rule->native_choice,
-						      use_priv_fp);
-		else
-			err = emit_bpf_rotate(pprog, insns, &local_rule,
+		err = emit_canonical_rotate(pprog, &rule->params,
+					      rule->native_choice,
 					      use_priv_fp);
 		if (err)
 			return -1;
@@ -3345,24 +3297,16 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 		if (rule->native_choice != BPF_JIT_ACALC_LEA)
 			return -1;
 
-		if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-			err = emit_canonical_lea_fusion(pprog, &rule->params,
-							use_priv_fp);
-		else
-			err = emit_bpf_lea_fusion(pprog, insns, &local_rule,
-						  use_priv_fp);
+		err = emit_canonical_lea_fusion(pprog, &rule->params,
+						use_priv_fp);
 		if (err)
 			return -1;
 		return rule->site_len;
 
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		if (rule->native_choice == BPF_JIT_BFX_EXTRACT) {
-			if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-				err = emit_canonical_bitfield_extract(
-					pprog, &rule->params, use_priv_fp);
-			else
-				err = emit_bpf_bitfield_extract(
-					pprog, insns, &local_rule, use_priv_fp);
+			err = emit_canonical_bitfield_extract(
+				pprog, &rule->params, use_priv_fp);
 			if (err)
 				return -1;
 			return rule->site_len;
@@ -3440,7 +3384,6 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	prog = temp;
 
 	for (i = 1; i <= insn_cnt; i++, insn++) {
-		const struct bpf_jit_directive *directive;
 		const s32 imm32 = insn->imm;
 		u32 dst_reg = insn->dst_reg;
 		u32 src_reg = insn->src_reg;
@@ -3460,28 +3403,27 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 				dst_reg = X86_REG_R9;
 		}
 
-		/* v4 rule dispatch: check if a rewrite rule covers this insn */
+		/* Canonical rule dispatch: check if a rewrite rule covers this insn. */
 		{
-			const struct bpf_jit_policy *v4_policy;
-			const struct bpf_prog_aux *v4_aux;
+			const struct bpf_jit_policy *policy;
+			const struct bpf_prog_aux *main_aux;
 
-			v4_aux = bpf_prog->aux->main_prog_aux ?
-				 bpf_prog->aux->main_prog_aux : bpf_prog->aux;
-			v4_policy = v4_aux->jit_policy;
-			if (v4_policy && v4_policy->active_cnt) {
+			main_aux = bpf_prog->aux->main_prog_aux ?
+				   bpf_prog->aux->main_prog_aux : bpf_prog->aux;
+			policy = main_aux->jit_policy;
+			if (policy && policy->active_cnt) {
 				const struct bpf_jit_rule *rule;
 				u32 abs_insn_idx = i - 1;
 
 				if (bpf_prog->aux->main_prog_aux)
 					abs_insn_idx += bpf_prog->aux->subprog_start;
 
-				rule = bpf_jit_rule_lookup(v4_policy, abs_insn_idx);
+				rule = bpf_jit_rule_lookup(policy, abs_insn_idx);
 				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
 					int consumed;
 
 					consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
 									 rule,
-									 bpf_prog->insnsi,
 									 priv_frame_ptr != NULL);
 					if (consumed > 0) {
 						int region_start = proglen;
@@ -3520,46 +3462,6 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 					/* consumed == 0 means fall through to stock emission */
 					/* consumed < 0 means error, also fall through */
 				}
-			}
-		}
-
-		if (i + 1 < bpf_prog->len && is_bpf_simple_mov(insn)) {
-			directive = bpf_jit_directive_lookup(bpf_prog,
-							     BPF_JIT_DIRECTIVE_CMOV_SELECT,
-							     i);
-			if (directive &&
-			    is_bpf_cmov_select_compact(insn, insn + 1, insn + 2)) {
-				int region_start = proglen;
-
-				if (emit_bpf_cmov_select_compact(&prog, insn, insn + 1,
-								 insn + 2,
-								 priv_frame_ptr != NULL))
-					return -EFAULT;
-
-				ilen = prog - temp;
-				if (ilen > BPF_MAX_INSN_SIZE) {
-					pr_err("bpf_jit: fatal insn size error\n");
-					return -EFAULT;
-				}
-
-				if (image) {
-					if (unlikely(region_start + ilen > oldproglen ||
-						     region_start + ilen != addrs[i + 2])) {
-						pr_err("bpf_jit: fatal error\n");
-						return -EFAULT;
-					}
-					memcpy(rw_image + region_start, temp, ilen);
-				}
-
-				proglen = region_start + ilen;
-				addrs[i - 1] = region_start;
-				addrs[i] = region_start;
-				addrs[i + 1] = region_start;
-				addrs[i + 2] = proglen;
-				prog = temp;
-				insn += 2;
-				i += 2;
-				continue;
 			}
 		}
 
@@ -4370,42 +4272,6 @@ populate_extable:
 		case BPF_JMP32 | BPF_JSLT | BPF_K:
 		case BPF_JMP32 | BPF_JSGE | BPF_K:
 		case BPF_JMP32 | BPF_JSLE | BPF_K:
-			directive = bpf_jit_directive_lookup(bpf_prog,
-							     BPF_JIT_DIRECTIVE_CMOV_SELECT,
-							     i - 1);
-			if (directive) {
-				int region_start = proglen;
-
-				if (emit_bpf_cmov_select(&prog, insn, insn + 1, insn + 3,
-							 priv_frame_ptr != NULL))
-					return -EFAULT;
-
-				ilen = prog - temp;
-				if (ilen > BPF_MAX_INSN_SIZE) {
-					pr_err("bpf_jit: fatal insn size error\n");
-					return -EFAULT;
-				}
-
-				if (image) {
-					if (unlikely(region_start + ilen > oldproglen ||
-						     region_start + ilen != addrs[i + 3])) {
-						pr_err("bpf_jit: fatal error\n");
-						return -EFAULT;
-					}
-					memcpy(rw_image + region_start, temp, ilen);
-				}
-
-				proglen = region_start + ilen;
-				addrs[i] = region_start;
-				addrs[i + 1] = region_start;
-				addrs[i + 2] = region_start;
-				addrs[i + 3] = proglen;
-				prog = temp;
-				insn += 3;
-				i += 3;
-				continue;
-			}
-
 			if (emit_bpf_jmp_cmp(&prog, insn, dst_reg, src_reg))
 				return -EFAULT;
 

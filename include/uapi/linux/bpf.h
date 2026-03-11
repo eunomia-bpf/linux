@@ -1458,20 +1458,13 @@ enum {
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
 
-/* jit_directives_fd/jit_directives_flags are valid for BPF_PROG_LOAD */
-	BPF_F_JIT_DIRECTIVES_FD	= (1U << 20),
 };
 
-enum bpf_jit_directives_load_flags {
-	BPF_F_JIT_DIRECTIVES_LOG = (1U << 0),
-};
-
-/* ---- v4 JIT policy blob format ---- */
+/* ---- BPF JIT policy blob format (v5 only) ---- */
 
 #define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
-#define BPF_JIT_POLICY_VERSION_1	1
 #define BPF_JIT_POLICY_VERSION_2	2
-#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_VERSION_1
+#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_VERSION_2
 
 /* Architecture IDs for policy blob */
 #define BPF_JIT_ARCH_X86_64		1
@@ -1490,11 +1483,6 @@ struct bpf_jit_policy_hdr {
 };
 
 enum bpf_jit_rule_kind {
-	BPF_JIT_RK_COND_SELECT	= 1,	/* cmovcc vs branch */
-	BPF_JIT_RK_WIDE_MEM	= 2,	/* wide load vs byte ladder */
-	BPF_JIT_RK_ROTATE	= 3,	/* rorx/ror vs shift+or */
-	BPF_JIT_RK_ADDR_CALC	= 4,	/* lea vs mov+shl+add */
-	BPF_JIT_RK_BITFIELD_EXTRACT = 5, /* bextr / compact bitfield extract */
 	BPF_JIT_RK_PATTERN	= 6,	/* v5 declarative pattern */
 };
 
@@ -1536,18 +1524,9 @@ enum bpf_jit_bitfield_extract_native {
 	BPF_JIT_BFX_EXTRACT	= 1,	/* x86: bextr or compact shift/mask */
 };
 
-/* x86 CPU feature bits for bpf_jit_rewrite_rule.cpu_features_required */
+/* x86 CPU feature bits for bpf_jit_rewrite_rule_v2.cpu_features_required */
 #define BPF_JIT_X86_CMOV	(1U << 0)
 #define BPF_JIT_X86_BMI2	(1U << 1)
-
-struct bpf_jit_rewrite_rule {
-	__u32 site_start;		/* BPF instruction offset */
-	__u16 site_len;			/* span length in BPF insns */
-	__u16 rule_kind;		/* enum bpf_jit_rule_kind */
-	__u16 native_choice;		/* which native instruction to use */
-	__u16 priority;			/* higher wins on overlap */
-	__u32 cpu_features_required;	/* BPF_JIT_X86_* bits */
-};
 
 #define BPF_JIT_MAX_PATTERN_LEN		24
 #define BPF_JIT_MAX_PATTERN_VARS	15
@@ -1669,34 +1648,6 @@ struct bpf_jit_rewrite_rule_v2 {
 	__u16 binding_count;		/* number of canonical bindings */
 	__u16 rule_len;			/* header + pattern + constraints + bindings */
 	__u16 reserved;
-};
-
-/* Backward-compat: keep v2 magic/version for BPF_PROG_LOAD path */
-#define BPF_JIT_DIRECTIVE_MAGIC		0x4a445243U
-#define BPF_JIT_DIRECTIVE_VERSION	2
-
-enum bpf_jit_directive_kind {
-	BPF_JIT_DIRECTIVE_CMOV_SELECT = 1,
-};
-
-struct bpf_jit_directive_hdr {
-	__u32 magic;
-	__u16 version;
-	__u16 rec_size;
-	__u32 rec_cnt;
-	__u32 insn_cnt;
-};
-
-struct bpf_jit_directive_rec {
-	__u16 kind;
-	__u16 reserved;
-	__u32 site_idx;
-	__u64 payload;
-};
-
-struct bpf_jit_directive_cmov_select {
-	__u32 flags;
-	__u32 reserved;
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -1888,9 +1839,6 @@ union bpf_attr {
 		 * verification.
 		 */
 		__s32		keyring_id;
-		/* Sealed memfd with one BPF JIT directive blob. */
-		__s32		jit_directives_fd;
-		__u32		jit_directives_flags;
 	};
 
 	struct { /* anonymous struct used by BPF_OBJ_* commands */

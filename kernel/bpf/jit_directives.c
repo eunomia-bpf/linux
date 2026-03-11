@@ -1,10 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * BPF JIT directive/policy framework
- *
- * v2 (BPF_PROG_LOAD path): cmov_select via jit_directives_fd
- * v4 (BPF_PROG_JIT_RECOMPILE path): general rewrite rule framework
- */
+/* BPF JIT policy framework (v5 declarative patterns only) */
 #include <linux/bpf.h>
 #include <linux/bpf_jit_directives.h>
 #include <linux/bpf_verifier.h>
@@ -85,16 +80,6 @@ static bool bpf_jit_is_simple_mov(const struct bpf_insn *insn)
 	}
 }
 
-static bool bpf_pseudo_call_insn(const struct bpf_insn *insn)
-{
-	return insn->code == (BPF_JMP | BPF_CALL) &&
-	       insn->src_reg == BPF_PSEUDO_CALL;
-}
-
-/* ================================================================
- * v2 legacy path (BPF_PROG_LOAD with jit_directives_fd)
- * ================================================================ */
-
 static bool bpf_jit_cmov_select_match_diamond(const struct bpf_insn *insns,
 					      u32 insn_cnt, u32 idx)
 {
@@ -109,9 +94,11 @@ static bool bpf_jit_cmov_select_match_diamond(const struct bpf_insn *insns,
 	ja_insn = &insns[idx + 2];
 	target_insn = &insns[idx + 3];
 
-	if (!bpf_jit_is_cmov_cond_jump(jmp_insn) || bpf_jmp_offset((struct bpf_insn *)jmp_insn) != 2)
+	if (!bpf_jit_is_cmov_cond_jump(jmp_insn) ||
+	    bpf_jmp_offset((struct bpf_insn *)jmp_insn) != 2)
 		return false;
-	if (!bpf_jit_is_simple_mov(fallthrough_insn) || !bpf_jit_is_simple_mov(target_insn))
+	if (!bpf_jit_is_simple_mov(fallthrough_insn) ||
+	    !bpf_jit_is_simple_mov(target_insn))
 		return false;
 	if (ja_insn->code != (BPF_JMP | BPF_JA) || ja_insn->off != 1 ||
 	    ja_insn->imm != 0 || ja_insn->dst_reg || ja_insn->src_reg)
@@ -142,9 +129,11 @@ static bool bpf_jit_cmov_select_match_compact(const struct bpf_insn *insns,
 	jmp_insn = &insns[idx];
 	override_insn = &insns[idx + 1];
 
-	if (!bpf_jit_is_simple_mov(default_insn) || !bpf_jit_is_simple_mov(override_insn))
+	if (!bpf_jit_is_simple_mov(default_insn) ||
+	    !bpf_jit_is_simple_mov(override_insn))
 		return false;
-	if (!bpf_jit_is_cmov_cond_jump(jmp_insn) || bpf_jmp_offset((struct bpf_insn *)jmp_insn) != 1)
+	if (!bpf_jit_is_cmov_cond_jump(jmp_insn) ||
+	    bpf_jmp_offset((struct bpf_insn *)jmp_insn) != 1)
 		return false;
 	if (default_insn->dst_reg != override_insn->dst_reg)
 		return false;
@@ -159,320 +148,13 @@ static bool bpf_jit_cmov_select_match_compact(const struct bpf_insn *insns,
 	return mov_cls == BPF_ALU;
 }
 
-static bool bpf_jit_cmov_select_find_region(const struct bpf_insn *insns, u32 insn_cnt,
-					    u32 idx, u32 *start, u32 *end)
+static bool bpf_pseudo_call_insn(const struct bpf_insn *insn)
 {
-	if (bpf_jit_cmov_select_match_diamond(insns, insn_cnt, idx)) {
-		*start = idx;
-		*end = idx + 4;
-		return true;
-	}
-
-	if (bpf_jit_cmov_select_match_compact(insns, insn_cnt, idx)) {
-		*start = idx - 1;
-		*end = idx + 2;
-		return true;
-	}
-
-	return false;
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_CALL;
 }
-
-static bool bpf_jit_cmov_select_has_interior_edge(struct bpf_verifier_env *env,
-						  u32 start, u32 end)
-{
-	u32 i, j;
-
-	for (i = 0; i < env->prog->len; i++) {
-		struct bpf_iarray *succ;
-
-		if (i >= start && i < end)
-			continue;
-
-		succ = bpf_insn_successors(env, i);
-		for (j = 0; j < succ->cnt; j++) {
-			u32 target = succ->items[j];
-
-			if (target > start && target < end)
-				return true;
-		}
-	}
-
-	return false;
-}
-
-static int bpf_jit_find_site_insn_idx(const struct bpf_verifier_env *env, u32 orig_idx)
-{
-	u32 i;
-
-	for (i = 0; i < env->prog->len; i++) {
-		if (env->insn_aux_data[i].orig_idx == orig_idx)
-			return i;
-	}
-
-	return -ENOENT;
-}
-
-static bool bpf_jit_directive_conflicts(const struct bpf_jit_directive_state *state,
-					u32 rec_idx, u32 subprog_idx, u32 insn_idx)
-{
-	u32 i;
-
-	for (i = 0; i < rec_idx; i++) {
-		const struct bpf_jit_directive *other = &state->recs[i];
-
-		if (!(other->flags & BPF_JIT_DIRECTIVE_F_VALIDATED))
-			continue;
-		if (other->kind != state->recs[rec_idx].kind)
-			continue;
-		if (other->subprog_idx == subprog_idx && other->insn_idx == insn_idx)
-			return true;
-	}
-
-	return false;
-}
-
-static int bpf_jit_directive_validate_payload(const struct bpf_jit_directive_rec *rec)
-{
-	struct bpf_jit_directive_cmov_select payload;
-
-	switch (rec->kind) {
-	case BPF_JIT_DIRECTIVE_CMOV_SELECT:
-		memcpy(&payload, &rec->payload, sizeof(payload));
-		if (payload.flags || payload.reserved)
-			return -EINVAL;
-		return 0;
-	default:
-		return -EOPNOTSUPP;
-	}
-}
-
-static int bpf_jit_directive_validate_rec(const struct bpf_jit_directive_rec *rec,
-					  u32 insn_cnt)
-{
-	if (rec->reserved || rec->site_idx >= insn_cnt)
-		return -EINVAL;
-
-	return bpf_jit_directive_validate_payload(rec);
-}
-
-struct bpf_jit_directive_state *
-bpf_jit_directives_load(struct bpf_prog *prog, int fd, u32 flags)
-{
-	const struct bpf_jit_directive_hdr *hdr;
-	struct bpf_jit_directive_state *state = NULL;
-	const struct bpf_jit_directive_rec *recs;
-	struct fd f = fdget(fd);
-	size_t blob_len, expected_len, records_len;
-	void *blob = NULL;
-	loff_t pos = 0;
-	ssize_t nread;
-	u32 i;
-
-	if (!prog)
-		return ERR_PTR(-EINVAL);
-
-	if (flags & ~BPF_F_JIT_DIRECTIVES_LOG)
-		return ERR_PTR(-EINVAL);
-	if (fd_empty(f))
-		return ERR_PTR(-EBADF);
-	if (!bpf_jit_directives_valid_memfd(fd_file(f))) {
-		fdput(f);
-		return ERR_PTR(-EINVAL);
-	}
-
-	blob_len = i_size_read(file_inode(fd_file(f)));
-	if (!blob_len) {
-		fdput(f);
-		return NULL;
-	}
-	if (blob_len > BPF_JIT_DIRECTIVES_MAX_BLOB_SIZE) {
-		fdput(f);
-		return ERR_PTR(-E2BIG);
-	}
-
-	blob = kvzalloc(blob_len, GFP_KERNEL_ACCOUNT);
-	if (!blob) {
-		fdput(f);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	nread = kernel_read(fd_file(f), blob, blob_len, &pos);
-	if (nread < 0) {
-		state = ERR_PTR(nread);
-		goto out;
-	}
-	if (nread != blob_len) {
-		state = ERR_PTR(-EIO);
-		goto out;
-	}
-
-	if (blob_len < sizeof(*hdr)) {
-		state = ERR_PTR(-EINVAL);
-		goto out;
-	}
-
-	hdr = blob;
-	if (hdr->magic != BPF_JIT_DIRECTIVE_MAGIC ||
-	    hdr->version != BPF_JIT_DIRECTIVE_VERSION ||
-	    hdr->rec_size != sizeof(struct bpf_jit_directive_rec) ||
-	    hdr->insn_cnt != prog->len) {
-		state = ERR_PTR(-EINVAL);
-		goto out;
-	}
-
-	if (check_mul_overflow((size_t)hdr->rec_cnt,
-			       sizeof(struct bpf_jit_directive_rec),
-			       &records_len)) {
-		state = ERR_PTR(-E2BIG);
-		goto out;
-	}
-
-	expected_len = sizeof(*hdr) + records_len;
-	if (expected_len != blob_len) {
-		state = ERR_PTR(-EINVAL);
-		goto out;
-	}
-	if (!hdr->rec_cnt)
-		goto out;
-
-	recs = (const struct bpf_jit_directive_rec *)(hdr + 1);
-	for (i = 0; i < hdr->rec_cnt; i++) {
-		u32 j;
-		int err;
-
-		err = bpf_jit_directive_validate_rec(&recs[i], prog->len);
-		if (err) {
-			state = ERR_PTR(err);
-			goto out;
-		}
-
-		for (j = 0; j < i; j++) {
-			if (recs[j].kind == recs[i].kind &&
-			    recs[j].site_idx == recs[i].site_idx) {
-				state = ERR_PTR(-EINVAL);
-				goto out;
-			}
-		}
-	}
-
-	state = kvmalloc(struct_size(state, recs, hdr->rec_cnt), GFP_KERNEL_ACCOUNT);
-	if (!state) {
-		state = ERR_PTR(-ENOMEM);
-		goto out;
-	}
-
-	state->rec_cnt = hdr->rec_cnt;
-	state->validated_cnt = 0;
-	for (i = 0; i < hdr->rec_cnt; i++) {
-		state->recs[i].kind = recs[i].kind;
-		state->recs[i].flags = 0;
-		state->recs[i].site_idx = recs[i].site_idx;
-		state->recs[i].subprog_idx = 0;
-		state->recs[i].insn_idx = 0;
-		state->recs[i].payload = recs[i].payload;
-	}
-
-out:
-	kvfree(blob);
-	fdput(f);
-	return state;
-}
-
-void bpf_jit_directives_free(struct bpf_jit_directive_state *state)
-{
-	kvfree(state);
-}
-
-int bpf_jit_directives_validate(struct bpf_verifier_env *env)
-{
-	struct bpf_jit_directive_state *state = env->prog->aux->jit_directives;
-	u32 i;
-
-	if (!state)
-		return 0;
-
-	state->validated_cnt = 0;
-	for (i = 0; i < state->rec_cnt; i++) {
-		struct bpf_jit_directive *rec = &state->recs[i];
-		struct bpf_subprog_info *subprog;
-		u32 subprog_idx;
-		int insn_idx;
-
-		rec->flags &= ~BPF_JIT_DIRECTIVE_F_VALIDATED;
-		rec->subprog_idx = 0;
-		rec->insn_idx = 0;
-
-		insn_idx = bpf_jit_find_site_insn_idx(env, rec->site_idx);
-		if (insn_idx < 0)
-			continue;
-
-		switch (rec->kind) {
-		case BPF_JIT_DIRECTIVE_CMOV_SELECT:
-		{
-			u32 region_start, region_end;
-
-			if (!bpf_jit_cmov_select_find_region(env->prog->insnsi, env->prog->len,
-							     insn_idx, &region_start,
-							     &region_end))
-				continue;
-			subprog = bpf_find_containing_subprog(env, region_start);
-			if (!subprog ||
-			    bpf_find_containing_subprog(env, region_end - 1) != subprog)
-				continue;
-			if (bpf_jit_cmov_select_has_interior_edge(env, region_start, region_end))
-				continue;
-			subprog_idx = subprog - env->subprog_info;
-			if (bpf_jit_directive_conflicts(state, i, subprog_idx,
-							insn_idx - subprog->start))
-				continue;
-			rec->flags |= BPF_JIT_DIRECTIVE_F_VALIDATED;
-			rec->subprog_idx = subprog_idx;
-			rec->insn_idx = insn_idx - subprog->start;
-			state->validated_cnt++;
-			break;
-		}
-		default:
-			break;
-		}
-	}
-
-	return 0;
-}
-
-const struct bpf_jit_directive *
-bpf_jit_directive_lookup(const struct bpf_prog *prog, u16 kind, u32 insn_idx)
-{
-	const struct bpf_prog_aux *main_aux;
-	const struct bpf_jit_directive_state *state;
-	u32 func_idx;
-	u32 i;
-
-	if (prog->blinded)
-		return NULL;
-
-	main_aux = prog->aux->main_prog_aux ? prog->aux->main_prog_aux : prog->aux;
-	state = main_aux->jit_directives;
-	if (!state || !state->validated_cnt)
-		return NULL;
-
-	func_idx = prog->aux->func_idx;
-	for (i = 0; i < state->rec_cnt; i++) {
-		const struct bpf_jit_directive *rec = &state->recs[i];
-
-		if (!(rec->flags & BPF_JIT_DIRECTIVE_F_VALIDATED))
-			continue;
-		if (rec->kind != kind)
-			continue;
-		if (rec->subprog_idx != func_idx || rec->insn_idx != insn_idx)
-			continue;
-		return rec;
-	}
-
-	return NULL;
-}
-
 /* ================================================================
- * v4 JIT rewrite rule framework (BPF_PROG_JIT_RECOMPILE path)
+ * BPF_PROG_JIT_RECOMPILE policy framework (v5 only)
  * ================================================================ */
 
 void bpf_jit_free_policy(struct bpf_jit_policy *policy)
@@ -503,23 +185,7 @@ static int rule_cmp(const void *a, const void *b)
 
 static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
 {
-	if (rule->rule_kind == BPF_JIT_RK_PATTERN)
-		return rule->canonical_form;
-
-	switch (rule->rule_kind) {
-	case BPF_JIT_RK_ROTATE:
-		return BPF_JIT_CF_ROTATE;
-	case BPF_JIT_RK_WIDE_MEM:
-		return BPF_JIT_CF_WIDE_MEM;
-	case BPF_JIT_RK_ADDR_CALC:
-		return BPF_JIT_CF_ADDR_CALC;
-	case BPF_JIT_RK_COND_SELECT:
-		return BPF_JIT_CF_COND_SELECT;
-	case BPF_JIT_RK_BITFIELD_EXTRACT:
-		return BPF_JIT_CF_BITFIELD_EXTRACT;
-	default:
-		return 0;
-	}
+	return rule->rule_kind == BPF_JIT_RK_PATTERN ? rule->canonical_form : 0;
 }
 
 static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
@@ -545,26 +211,25 @@ static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 	}
 }
 
-static bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule)
+static bool bpf_jit_canonical_form_valid(u16 form)
 {
-	switch (rule->canonical_form) {
-	case BPF_JIT_CF_ROTATE:
-		return rule->site_len == 4 || rule->site_len == 5 ||
-		       rule->site_len == 6;
-	case BPF_JIT_CF_WIDE_MEM:
-		return rule->site_len == 4 || rule->site_len == 7 ||
-		       rule->site_len == 10 || rule->site_len == 13 ||
-		       rule->site_len == 16 || rule->site_len == 19 ||
-		       rule->site_len == 22;
-	case BPF_JIT_CF_ADDR_CALC:
-		return rule->site_len == 3;
+	switch (form) {
 	case BPF_JIT_CF_COND_SELECT:
-		return rule->site_len == 3 || rule->site_len == 4;
+	case BPF_JIT_CF_WIDE_MEM:
+	case BPF_JIT_CF_ROTATE:
+	case BPF_JIT_CF_ADDR_CALC:
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
-		return rule->site_len == 2 || rule->site_len == 3;
+		return true;
 	default:
 		return false;
 	}
+}
+
+static bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule)
+{
+	return rule->site_len > 0 &&
+	       rule->site_len <= BPF_JIT_MAX_PATTERN_LEN &&
+	       bpf_jit_canonical_form_valid(rule->canonical_form);
 }
 
 static bool bpf_jit_compute_site_end(u32 site_start, u32 site_len, u32 *site_end)
@@ -674,9 +339,10 @@ static bool bpf_jit_has_interior_edge(const struct bpf_insn *insns,
  * jump from outside the pattern targets an interior instruction (which would
  * corrupt addrs[] after the cmov transformation).
  */
-static bool bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
-					      u32 insn_cnt,
-					      const struct bpf_jit_rule *rule)
+static __maybe_unused bool
+bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
+				      u32 insn_cnt,
+				      const struct bpf_jit_rule *rule)
 {
 	u32 idx = rule->site_start;
 	bool shape_ok;
@@ -837,9 +503,10 @@ static bool bpf_jit_parse_wide_mem_shape(const struct bpf_insn *insns,
  *   1. Low-byte-first: ldxb dst, [base+off]; ldxb tmp, [base+off+1]; lsh tmp, 8; or dst, tmp; ...
  *   2. High-byte-first (clang): ldxb tmp, [base+off+1]; lsh tmp, 8; ldxb dst, [base+off]; or tmp, dst
  */
-static bool bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
-					   u32 insn_cnt,
-					   const struct bpf_jit_rule *rule)
+static __maybe_unused bool
+bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
+				   u32 insn_cnt,
+				   const struct bpf_jit_rule *rule)
 {
 	if (!bpf_jit_parse_wide_mem_shape(insns, insn_cnt, rule->site_start,
 					  rule->site_len, NULL))
@@ -1305,9 +972,10 @@ static bool bpf_jit_validate_rotate_6insn(const struct bpf_insn *insns,
  *   site_len==5: 5-insn two-copy 64-bit rotate (mov+rsh+mov+lsh+or)
  *   site_len==6: clang's 6-insn masked 32-bit rotate (mov+and+rsh+mov+lsh+or)
  */
-static bool bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
-					 u32 insn_cnt,
-					 const struct bpf_jit_rule *rule)
+static __maybe_unused bool
+bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
+				 u32 insn_cnt,
+				 const struct bpf_jit_rule *rule)
 {
 	bool shape_ok;
 
@@ -1437,10 +1105,10 @@ static bool bpf_jit_parse_bitfield_extract_site(
 	return true;
 }
 
-static bool bpf_jit_validate_bitfield_extract_rule(
-	const struct bpf_insn *insns,
-	u32 insn_cnt,
-	const struct bpf_jit_rule *rule)
+static __maybe_unused bool
+bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
+					   u32 insn_cnt,
+					   const struct bpf_jit_rule *rule)
 {
 	if (!bpf_jit_parse_bitfield_extract_site(insns, insn_cnt, rule, NULL))
 		return false;
@@ -1462,9 +1130,10 @@ static bool bpf_jit_validate_bitfield_extract_rule(
  *
  * site_len must be 3.
  */
-static bool bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
-					    u32 insn_cnt,
-					    const struct bpf_jit_rule *rule)
+static __maybe_unused bool
+bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
+				    u32 insn_cnt,
+				    const struct bpf_jit_rule *rule)
 {
 	u32 idx = rule->site_start;
 	const struct bpf_insn *mov_insn, *lsh_insn, *add_insn;
@@ -2013,28 +1682,10 @@ static bool bpf_jit_validate_rule(const struct bpf_insn *insns,
 	if (bpf_jit_site_has_side_effects(insns, rule->site_start, rule->site_len))
 		return false;
 
-	switch (rule->rule_kind) {
-	case BPF_JIT_RK_COND_SELECT:
-		return bpf_jit_validate_cond_select_rule(insns, insn_cnt, rule);
-
-	case BPF_JIT_RK_WIDE_MEM:
-		return bpf_jit_validate_wide_mem_rule(insns, insn_cnt, rule);
-
-	case BPF_JIT_RK_ROTATE:
-		return bpf_jit_validate_rotate_rule(insns, insn_cnt, rule);
-
-	case BPF_JIT_RK_ADDR_CALC:
-		return bpf_jit_validate_addr_calc_rule(insns, insn_cnt, rule);
-	case BPF_JIT_RK_BITFIELD_EXTRACT:
-		return bpf_jit_validate_bitfield_extract_rule(insns, insn_cnt,
-							      rule);
-	case BPF_JIT_RK_PATTERN:
-		return bpf_jit_validate_pattern_rule(insns, insn_cnt, rule,
-						     params);
-
-	default:
+	if (rule->rule_kind != BPF_JIT_RK_PATTERN)
 		return false;
-	}
+
+	return bpf_jit_validate_pattern_rule(insns, insn_cnt, rule, params);
 }
 
 static bool bpf_jit_rule_within_single_subprog(const struct bpf_prog *prog,
@@ -2160,70 +1811,6 @@ static bool bpf_jit_validate_constraint_desc(
 	}
 
 	return true;
-}
-
-/*
- * v1 policy parser — DEPRECATED.
- * Retained for backward compatibility only. All new directives and patterns
- * MUST use the v2 (declarative pattern) path via BPF_JIT_RK_PATTERN.
- * Do NOT add new rule_kind or native_choice handling here.
- */
-static struct bpf_jit_policy *
-bpf_jit_parse_policy_v1(struct bpf_prog *prog,
-			 const struct bpf_jit_policy_hdr *hdr,
-			 size_t blob_len)
-{
-	const struct bpf_jit_rewrite_rule *urules;
-	struct bpf_jit_policy *policy;
-	size_t expected_len, rules_len;
-	u32 i;
-
-	if (check_mul_overflow((size_t)hdr->rule_cnt,
-			       sizeof(struct bpf_jit_rewrite_rule),
-			       &rules_len))
-		return ERR_PTR(-E2BIG);
-
-	expected_len = sizeof(*hdr) + rules_len;
-	if (expected_len != blob_len)
-		return ERR_PTR(-EINVAL);
-
-	policy = bpf_jit_alloc_policy(hdr->rule_cnt);
-	if (IS_ERR(policy))
-		return policy;
-
-	urules = (const struct bpf_jit_rewrite_rule *)(hdr + 1);
-	for (i = 0; i < hdr->rule_cnt; i++) {
-		struct bpf_jit_rule *rule = &policy->rules[i];
-		bool active;
-
-		rule->rule_kind = urules[i].rule_kind;
-		rule->canonical_form = 0;
-		rule->native_choice = urules[i].native_choice;
-		rule->pattern_count = 0;
-		rule->constraint_count = 0;
-		rule->binding_count = 0;
-		rule->reserved = 0;
-		rule->pattern = NULL;
-		rule->constraints = NULL;
-		rule->bindings = NULL;
-		memset(&rule->params, 0, sizeof(rule->params));
-		rule->site_start = urules[i].site_start;
-		rule->site_len = urules[i].site_len;
-		rule->priority = urules[i].priority;
-		rule->cpu_features_required = urules[i].cpu_features_required;
-
-		active = bpf_jit_rule_within_single_subprog(prog, rule) &&
-			 bpf_jit_validate_rule(prog->insnsi, prog->len, rule,
-					       NULL);
-		if (active) {
-			rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
-			policy->active_cnt++;
-		} else {
-			rule->flags = 0;
-		}
-	}
-
-	return policy;
 }
 
 static struct bpf_jit_policy *
@@ -2445,19 +2032,14 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 		goto out;
 	}
 
-	switch (hdr->version) {
-	case BPF_JIT_POLICY_VERSION_1:
-		policy = bpf_jit_parse_policy_v1(prog, hdr, blob_len);
-		break;
-	case BPF_JIT_POLICY_VERSION_2:
-		policy = bpf_jit_parse_policy_v2(prog, hdr, blob, blob_len);
-		if (!IS_ERR(policy))
-			blob = NULL;
-		break;
-	default:
+	if (hdr->version != BPF_JIT_POLICY_VERSION_2) {
 		policy = ERR_PTR(-EINVAL);
-		break;
+		goto out;
 	}
+
+	policy = bpf_jit_parse_policy_v2(prog, hdr, blob, blob_len);
+	if (!IS_ERR(policy))
+		blob = NULL;
 	if (IS_ERR(policy))
 		goto out;
 
@@ -2531,7 +2113,7 @@ bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx)
  * bpf_prog_jit_recompile - BPF_PROG_JIT_RECOMPILE syscall handler
  *
  * Takes a prog_fd for an already-loaded program and a policy_fd
- * for a sealed memfd containing a v4 policy blob.
+ * for a sealed memfd containing a v5 policy blob.
  * Parses the policy, validates rules, stores the policy on the prog,
  * and triggers a re-JIT.
  */
