@@ -1468,120 +1468,34 @@ emit_bpf_cmov_select_compact(u8 **pprog,
 	return 0;
 }
 
-static bool bpf_jit_value_is_noop(const struct bpf_jit_binding_value *value,
-				  u8 dst_bpf_reg)
-{
-	return value->type == BPF_JIT_BIND_VAL_REG &&
-	       (u8)value->value == dst_bpf_reg;
-}
-
-static int emit_bpf_canonical_value_noflags(
-	u8 **pprog,
-	const struct bpf_jit_binding_value *value,
-	u32 dst_reg,
-	bool is64,
-	bool use_priv_fp)
-{
-	if (value->type == BPF_JIT_BIND_VAL_REG) {
-		u32 src_reg = jit_bpf_reg((u8)value->value, use_priv_fp);
-
-		if (src_reg != dst_reg)
-			emit_mov_reg(pprog, is64, dst_reg, src_reg);
-		return 0;
-	}
-
-	if (value->type != BPF_JIT_BIND_VAL_IMM)
-		return -EINVAL;
-
-	emit_mov_imm32_noflags(pprog, is64, dst_reg, (s32)value->value);
-	return 0;
-}
-
 static int emit_canonical_select(u8 **pprog,
-				 const struct bpf_jit_canonical_params *params,
+				 const struct bpf_insn *insns,
+				 u32 insn_cnt, u32 idx, u32 site_len,
 				 bool use_priv_fp)
 {
-	const struct bpf_jit_binding_value *dst_value;
-	const struct bpf_jit_binding_value *cond_op_value;
-	const struct bpf_jit_binding_value *cond_a_value;
-	const struct bpf_jit_binding_value *cond_b_value;
-	const struct bpf_jit_binding_value *true_value;
-	const struct bpf_jit_binding_value *false_value;
-	const struct bpf_jit_binding_value *width_value;
-	struct bpf_insn cmp_insn = {};
-	u32 dst_reg, cond_a_reg, cond_b_reg = 0;
-	u32 cmov_src_reg;
-	u8 cond_op, cmov_op;
-	bool is64, false_is_noop;
-	int err;
-
-	dst_value = &params->params[BPF_JIT_SEL_PARAM_DST_REG];
-	cond_op_value = &params->params[BPF_JIT_SEL_PARAM_COND_OP];
-	cond_a_value = &params->params[BPF_JIT_SEL_PARAM_COND_A];
-	cond_b_value = &params->params[BPF_JIT_SEL_PARAM_COND_B];
-	true_value = &params->params[BPF_JIT_SEL_PARAM_TRUE_VAL];
-	false_value = &params->params[BPF_JIT_SEL_PARAM_FALSE_VAL];
-	width_value = &params->params[BPF_JIT_SEL_PARAM_WIDTH];
-
-	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
-	    cond_op_value->type != BPF_JIT_BIND_VAL_IMM ||
-	    cond_a_value->type != BPF_JIT_BIND_VAL_REG ||
-	    (cond_b_value->type != BPF_JIT_BIND_VAL_REG &&
-	     cond_b_value->type != BPF_JIT_BIND_VAL_IMM) ||
-	    (true_value->type != BPF_JIT_BIND_VAL_REG &&
-	     true_value->type != BPF_JIT_BIND_VAL_IMM) ||
-	    (false_value->type != BPF_JIT_BIND_VAL_REG &&
-	     false_value->type != BPF_JIT_BIND_VAL_IMM) ||
-	    width_value->type != BPF_JIT_BIND_VAL_IMM)
+	if (!insns || idx + site_len > insn_cnt)
 		return -EINVAL;
 
-	if (width_value->value != 32 && width_value->value != 64)
-		return -EINVAL;
+	/*
+	 * The x86 CMOV emitter only implements the original simple forms:
+	 *   - diamond: jcc, mov_false, ja, mov_true
+	 *   - compact: mov_true, jcc, mov_false
+	 *
+	 * Broadened COND_SELECT patterns (guarded updates, switch chains, etc.)
+	 * carry extra ALU/control-flow semantics that a plain cmp+cmov lowering
+	 * cannot preserve, so fail closed and fall back to stock emission.
+	 */
+	if (site_len == 4)
+		return emit_bpf_cmov_select(pprog, &insns[idx], &insns[idx + 3],
+					    &insns[idx + 1], use_priv_fp);
 
-	is64 = width_value->value == 64;
-	cond_op = (u8)cond_op_value->value;
-	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
-	cond_a_reg = jit_bpf_reg((u8)cond_a_value->value, use_priv_fp);
-	false_is_noop = bpf_jit_value_is_noop(false_value, (u8)dst_value->value);
+	if (site_len == 3)
+		return emit_bpf_cmov_select_compact(pprog, &insns[idx],
+						    &insns[idx + 1],
+						    &insns[idx + 2],
+						    use_priv_fp);
 
-	cmp_insn.code = (is64 ? BPF_JMP : BPF_JMP32) | cond_op |
-			(cond_b_value->type == BPF_JIT_BIND_VAL_REG ? BPF_X : BPF_K);
-	cmp_insn.dst_reg = (u8)cond_a_value->value;
-	if (cond_b_value->type == BPF_JIT_BIND_VAL_REG) {
-		cmp_insn.src_reg = (u8)cond_b_value->value;
-		cond_b_reg = jit_bpf_reg((u8)cond_b_value->value, use_priv_fp);
-	} else {
-		cmp_insn.imm = (s32)cond_b_value->value;
-	}
-
-	err = emit_bpf_jmp_cmp(pprog, &cmp_insn, cond_a_reg, cond_b_reg);
-	if (err)
-		return err;
-
-	err = bpf_jmp_to_x86_cmov(cond_op, &cmov_op);
-	if (err)
-		return err;
-
-	if (true_value->type == BPF_JIT_BIND_VAL_REG) {
-		cmov_src_reg = jit_bpf_reg((u8)true_value->value, use_priv_fp);
-		if (cmov_src_reg == dst_reg && !false_is_noop) {
-			emit_mov_reg(pprog, is64, AUX_REG, dst_reg);
-			cmov_src_reg = AUX_REG;
-		}
-	} else {
-		emit_mov_imm32_noflags(pprog, is64, AUX_REG, (s32)true_value->value);
-		cmov_src_reg = AUX_REG;
-	}
-
-	if (!false_is_noop) {
-		err = emit_bpf_canonical_value_noflags(pprog, false_value, dst_reg,
-						       is64, use_priv_fp);
-		if (err)
-			return err;
-	}
-
-	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
-	return 0;
+	return -EOPNOTSUPP;
 }
 
 /* Emit the suffix (ModR/M etc) for addressing *(ptr_reg + off) and val_reg */
@@ -3795,9 +3709,10 @@ static void emit_bextr(u8 **pprog, u32 dst_reg, u32 src_reg,
 {
 	u8 *prog = *pprog;
 
+	/* BEXTR encodes dst in ModRM.reg and src in ModRM.r/m. */
 	emit_3vex(&prog, is_ereg(dst_reg), false, is_ereg(src_reg), 2,
 		  is64, control_reg, false, 0);
-	EMIT2(0xf7, add_2reg(0xC0, dst_reg, src_reg));
+	EMIT2(0xf7, add_2reg(0xC0, src_reg, dst_reg));
 	*pprog = prog;
 }
 
@@ -3854,7 +3769,13 @@ static int emit_bitfield_extract_core(u8 **pprog, u32 dst_reg, u32 src_reg,
 	}
 
 #if defined(CONFIG_X86_64)
-	if (boot_cpu_has(X86_FEATURE_BMI1) &&
+	/*
+	 * Keep the BEXTR fast path for in-place extracts only. Cross-register
+	 * extracts are lowered conservatively as mov+shift+and to avoid
+	 * emitting the BMI1 form on the problematic dst!=src path.
+	 */
+	if (dst_reg == src_reg &&
+	    boot_cpu_has(X86_FEATURE_BMI1) &&
 	    bitfield_low_mask_width(effective_mask, &field_width)) {
 		u32 control = ((field_width & 0xff) << 8) | (shift & 0xff);
 
@@ -4011,7 +3932,11 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 			if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
 				return -EINVAL;
 
-			err = emit_canonical_select(pprog, &rule->params, use_priv_fp);
+			err = emit_canonical_select(pprog, bpf_prog->insnsi,
+						    bpf_prog->len,
+						    local_site_start,
+						    rule->site_len,
+						    use_priv_fp);
 			if (err)
 				return err;
 			return rule->site_len;
@@ -4713,7 +4638,13 @@ populate_extable:
 				u32 arena_reg, fixup_reg;
 				s64 delta;
 
-				if (!bpf_prog->aux->extable)
+				/*
+				 * Exception-table entries are materialized only on
+				 * the final image pass. During re-JIT, aux->extable
+				 * may still point at the previous RO image while
+				 * image/rw_image are not set up for the new pass yet.
+				 */
+				if (!bpf_prog->aux->extable || !image || !rw_image)
 					break;
 
 				if (excnt >= bpf_prog->aux->num_exentries) {

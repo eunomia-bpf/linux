@@ -1338,6 +1338,29 @@ static bool bpf_jit_zero_ext_elide_is_alu32(const struct bpf_insn *insn)
 	return BPF_CLASS(insn->code) == BPF_ALU && BPF_OP(insn->code) != BPF_END;
 }
 
+static bool bpf_jit_zero_ext_elide_is_tail(const struct bpf_insn *insn, u8 dst_reg)
+{
+	if (insn_is_zext(insn))
+		return insn->dst_reg == dst_reg &&
+		       insn->src_reg == dst_reg &&
+		       !insn->off;
+
+	if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X)) {
+		return insn->dst_reg == dst_reg &&
+		       insn->src_reg == dst_reg &&
+		       !insn->off &&
+		       !insn->imm;
+	}
+
+	if (insn->code == (BPF_ALU64 | BPF_AND | BPF_K)) {
+		return insn->dst_reg == dst_reg &&
+		       !insn->off &&
+		       insn->imm == -1;
+	}
+
+	return false;
+}
+
 static __maybe_unused bool
 bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
 				     u32 insn_cnt,
@@ -1356,18 +1379,8 @@ bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
 	if (!bpf_jit_zero_ext_elide_is_alu32(alu32_insn))
 		return false;
 
-	if (zext_insn->code == (BPF_ALU64 | BPF_MOV | BPF_X)) {
-		if (zext_insn->dst_reg != alu32_insn->dst_reg ||
-		    zext_insn->src_reg != alu32_insn->dst_reg ||
-		    zext_insn->off || zext_insn->imm)
-			return false;
-	} else if (zext_insn->code == (BPF_ALU64 | BPF_AND | BPF_K)) {
-		if (zext_insn->dst_reg != alu32_insn->dst_reg ||
-		    zext_insn->off || zext_insn->imm != -1)
-			return false;
-	} else {
+	if (!bpf_jit_zero_ext_elide_is_tail(zext_insn, alu32_insn->dst_reg))
 		return false;
-	}
 
 	return true;
 }
@@ -2120,6 +2133,21 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 					    const struct bpf_jit_canonical_params *params)
 {
 	switch (rule->canonical_form) {
+	case BPF_JIT_CF_COND_SELECT:
+		if (!bpf_jit_validate_cond_select_rule(insns, insn_cnt, rule)) {
+			bpf_jit_recompile_rule_log(prog, rule,
+						   "canonical site validation failed");
+			return false;
+		}
+		break;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		if (!bpf_jit_validate_bitfield_extract_rule(insns, insn_cnt,
+							    rule)) {
+			bpf_jit_recompile_rule_log(prog, rule,
+						   "canonical site validation failed");
+			return false;
+		}
+		break;
 	case BPF_JIT_CF_ZERO_EXT_ELIDE:
 		if (!bpf_jit_validate_zero_ext_elide_rule(insns, insn_cnt, rule)) {
 			bpf_jit_recompile_rule_log(prog, rule,
@@ -2835,6 +2863,21 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	if (!prog->jited) {
 		bpf_jit_recompile_prog_log(prog, "program is not JITed\n");
 		err = -EINVAL;
+		goto out_put;
+	}
+
+	/*
+	 * Attached struct_ops callbacks are invoked through per-member
+	 * trampolines that hardcode the current prog->bpf_func. Re-JITing the
+	 * program body alone would leave the live trampoline calling the stale
+	 * image.
+	 */
+	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS &&
+	    rcu_access_pointer(prog->aux->st_ops_assoc)) {
+		bpf_jit_recompile_prog_log(
+			prog,
+			"attached struct_ops programs are not supported: associated trampoline must be regenerated\n");
+		err = -EOPNOTSUPP;
 		goto out_put;
 	}
 
