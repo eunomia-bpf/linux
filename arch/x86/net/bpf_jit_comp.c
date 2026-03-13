@@ -2916,6 +2916,9 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	user_vm_start = bpf_arena_get_user_vm_start(bpf_prog->aux->arena);
 
 	detect_reg_usage(insn, insn_cnt, callee_regs_used);
+#ifdef CONFIG_BPF_JIT_FIXED_ALL_CALLEE_SAVED
+	memcpy(callee_regs_used, all_callee_regs_used, sizeof(callee_regs_used));
+#endif
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,

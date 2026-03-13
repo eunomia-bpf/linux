@@ -104,6 +104,15 @@ config BPF_JIT_FIXED_CMOV
 	  intentionally disabled by default because it can hurt predictable
 	  workloads.
 
+config BPF_JIT_FIXED_ALL_CALLEE_SAVED
+	bool "Force-save all callee-saved registers in the x86 BPF JIT"
+	depends on BPF_JIT && X86_64
+	default n
+	help
+	  Enable an ablation baseline that always saves/restores all x86
+	  callee-saved registers in JITed BPF programs, even when a program
+	  does not use them.
+
 config BPF_UNPRIV_DEFAULT_OFF
 	bool "Disable unprivileged BPF by default"
 	default y
