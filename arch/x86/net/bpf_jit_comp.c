@@ -3300,14 +3300,16 @@ static int emit_bitfield_extract_core(u8 **pprog, u32 dst_reg, u32 src_reg,
 
 #if defined(CONFIG_X86_64)
 	/*
-	 * Use BEXTR when BMI1 is available and the effective mask is a
-	 * contiguous low-bit field.  BEXTR encodes both src and dst
-	 * independently (VEX r/m = src, reg = dst), so it works whether or
-	 * not dst == src.  For with-copy sites (dst != src) this replaces
-	 * three instructions (MOV+SHR+AND) with two (MOV_imm32+BEXTR),
-	 * saving one instruction per site.
+	 * Use BEXTR when BMI1 is available, the effective mask is a
+	 * contiguous low-bit field, and src != dst (with-copy pattern).
+	 * For with-copy sites BEXTR replaces three instructions (MOV+SHR+AND)
+	 * with two (MOV_imm32+BEXTR), saving one instruction per site.
+	 * For without-copy sites (src == dst) BEXTR would expand two
+	 * instructions (SHR+AND, 6B) to two instructions (MOV_imm32+BEXTR,
+	 * 9B), wasting 3B per site, so we fall through to the SHR+AND path.
 	 */
 	if (boot_cpu_has(X86_FEATURE_BMI1) &&
+	    src_reg != dst_reg &&
 	    bitfield_low_mask_width(effective_mask, &field_width)) {
 		u32 control = ((field_width & 0xff) << 8) | (shift & 0xff);
 
