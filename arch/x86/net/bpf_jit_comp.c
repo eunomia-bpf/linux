@@ -1475,6 +1475,72 @@ static int emit_bpf_cmov_select_compact(u8 **pprog,
 	return 0;
 }
 
+/*
+ * Guarded update: jcc +1, mov dst, src
+ *
+ * When condition is TRUE the branch skips the mov (dst unchanged).
+ * When condition is FALSE the mov runs (dst = src).
+ * Equivalent CMOV form: cmp; cmov(NOT_condition) dst, src
+ *
+ * This is the degenerate 2-insn COND_SELECT where there is no "true" branch
+ * body — only a conditional update on the false path.
+ */
+static int emit_bpf_cmov_guarded_update(u8 **pprog,
+					const struct bpf_insn *jmp_insn,
+					const struct bpf_insn *update_insn,
+					bool use_priv_fp)
+{
+	u32 dst_reg = jit_bpf_reg(update_insn->dst_reg, use_priv_fp);
+	bool is64 = BPF_CLASS(update_insn->code) == BPF_ALU64;
+	u32 cmov_src_reg;
+	u8 inv_op, cmov_op;
+	int err;
+
+	if (!is_bpf_simple_mov(update_insn))
+		return -EINVAL;
+	if (!is_bpf_cmov_cond_jump(jmp_insn) || jmp_insn->off != 1)
+		return -EINVAL;
+
+	/* Verify jump width matches update width. */
+	if (BPF_CLASS(jmp_insn->code) == BPF_JMP && !is64)
+		return -EINVAL;
+	if (BPF_CLASS(jmp_insn->code) == BPF_JMP32 && is64)
+		return -EINVAL;
+
+	/* Emit the comparison. */
+	err = emit_bpf_jmp_cmp(pprog, jmp_insn,
+				jit_bpf_reg(jmp_insn->dst_reg, use_priv_fp),
+				jit_bpf_reg(jmp_insn->src_reg, use_priv_fp));
+	if (err)
+		return err;
+
+	/* If update is a self-assign noop, nothing to emit. */
+	if (bpf_mov_is_noop(update_insn))
+		return 0;
+
+	/*
+	 * Branch skips update when condition TRUE → cmov fires on NOT-condition.
+	 */
+	err = bpf_jmp_invert(BPF_OP(jmp_insn->code), &inv_op);
+	if (err)
+		return err;
+	err = bpf_jmp_to_x86_cmov(inv_op, &cmov_op);
+	if (err)
+		return err;
+
+	if (BPF_SRC(update_insn->code) == BPF_X) {
+		cmov_src_reg = jit_bpf_reg(update_insn->src_reg, use_priv_fp);
+		if (cmov_src_reg == dst_reg)
+			return 0; /* src == dst: always a noop update. */
+	} else {
+		emit_bpf_mov_value_noflags(pprog, update_insn, AUX_REG, use_priv_fp);
+		cmov_src_reg = AUX_REG;
+	}
+
+	emit_cmov_reg(pprog, cmov_op, is64, dst_reg, cmov_src_reg);
+	return 0;
+}
+
 static int emit_canonical_select(u8 **pprog,
 				 const struct bpf_insn *insns,
 				 u32 insn_cnt, u32 idx, u32 site_len,
@@ -1484,24 +1550,35 @@ static int emit_canonical_select(u8 **pprog,
 		return -EINVAL;
 
 	/*
-	 * The x86 CMOV emitter only implements the original simple forms:
-	 *   - diamond: jcc, mov_false, ja, mov_true
-	 *   - compact: mov_true, jcc, mov_false
-	 *
-	 * Broadened COND_SELECT patterns (guarded updates, switch chains, etc.)
-	 * carry extra ALU/control-flow semantics that a plain cmp+cmov lowering
-	 * cannot preserve, so fail closed and fall back to stock emission.
+	 * COND_SELECT site_len=2: guarded update — jcc +1, mov dst, src.
+	 * The branch skips the assignment when condition is true; CMOV on the
+	 * inverted condition replicates this without any taken branch.
+	 */
+	if (site_len == 2)
+		return emit_bpf_cmov_guarded_update(pprog, &insns[idx],
+						    &insns[idx + 1], use_priv_fp);
+
+	/*
+	 * COND_SELECT site_len=4: diamond — jcc, mov_false, ja, mov_true.
 	 */
 	if (site_len == 4)
 		return emit_bpf_cmov_select(pprog, &insns[idx], &insns[idx + 3],
 					    &insns[idx + 1], use_priv_fp);
 
+	/*
+	 * COND_SELECT site_len=3: compact — mov_true, jcc, mov_false.
+	 */
 	if (site_len == 3)
 		return emit_bpf_cmov_select_compact(pprog, &insns[idx],
 						    &insns[idx + 1],
 						    &insns[idx + 2],
 						    use_priv_fp);
 
+	/*
+	 * Larger site_len patterns (switch chains, etc.) carry extra
+	 * control-flow semantics that a plain cmp+cmov cannot preserve.
+	 * Fall back to stock emission.
+	 */
 	return -EOPNOTSUPP;
 }
 
