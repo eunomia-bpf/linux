@@ -2,13 +2,19 @@
 #ifndef _LINUX_BPF_JIT_DIRECTIVES_H
 #define _LINUX_BPF_JIT_DIRECTIVES_H
 
+#include <linux/errno.h>
 #include <linux/types.h>
 
+#if defined(BPF_JIT_MAX_CANONICAL_PARAMS) && \
+	BPF_JIT_MAX_CANONICAL_PARAMS != 16
+#error "BPF_JIT_MAX_CANONICAL_PARAMS must stay in sync with UAPI"
+#endif
 #ifndef BPF_JIT_MAX_CANONICAL_PARAMS
-#define BPF_JIT_MAX_CANONICAL_PARAMS 16
+#define BPF_JIT_MAX_CANONICAL_PARAMS	16
 #endif
 
 struct bpf_prog;
+struct exception_table_entry;
 struct bpf_jit_pattern_insn;
 struct bpf_jit_pattern_constraint;
 struct bpf_jit_binding;
@@ -103,13 +109,76 @@ void __printf(2, 3) bpf_jit_recompile_prog_log(const struct bpf_prog *prog,
 void __printf(3, 4) bpf_jit_recompile_rule_log(const struct bpf_prog *prog,
 					       const struct bpf_jit_rule *rule,
 					       const char *fmt, ...);
+void bpf_jit_recompile_note_rule(const struct bpf_prog *prog,
+				 const struct bpf_jit_rule *rule,
+				 bool applied);
 
 /* Policy blob parsing & validation */
 struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd);
 void bpf_jit_free_policy(struct bpf_jit_policy *policy);
 
-/* Rule lookup during JIT emission */
+/* Rule lookup during JIT emission by absolute rule site_start. */
 const struct bpf_jit_rule *
 bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx);
+
+#if defined(CONFIG_X86_64)
+bool bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog);
+void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog);
+u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog);
+u32 bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog);
+u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog);
+struct exception_table_entry *
+bpf_jit_recompile_staged_extable(const struct bpf_prog *prog);
+u32 bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog);
+int bpf_jit_recompile_commit(struct bpf_prog *prog);
+void bpf_jit_recompile_abort(struct bpf_prog *prog);
+#else
+static inline bool
+bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog)
+{
+	return false;
+}
+
+static inline void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog)
+{
+	return NULL;
+}
+
+static inline u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline u32 bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline struct exception_table_entry *
+bpf_jit_recompile_staged_extable(const struct bpf_prog *prog)
+{
+	return NULL;
+}
+
+static inline u32
+bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog)
+{
+	return 0;
+}
+
+static inline int bpf_jit_recompile_commit(struct bpf_prog *prog)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void bpf_jit_recompile_abort(struct bpf_prog *prog)
+{
+}
+#endif
 
 #endif /* _LINUX_BPF_JIT_DIRECTIVES_H */

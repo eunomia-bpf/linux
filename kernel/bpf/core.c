@@ -136,10 +136,12 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 #ifdef CONFIG_FINEIBT
 	INIT_LIST_HEAD_RCU(&fp->aux->ksym_prefix.lnode);
 #endif
+	INIT_LIST_HEAD_RCU(&fp->aux->jit_recompile_ksym.lnode);
 	mutex_init(&fp->aux->used_maps_mutex);
 	mutex_init(&fp->aux->ext_mutex);
 	mutex_init(&fp->aux->dst_mutex);
 	mutex_init(&fp->aux->st_ops_assoc_mutex);
+	mutex_init(&fp->aux->jit_recompile_mutex);
 
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_prog_stream_init(fp);
@@ -291,6 +293,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->used_maps_mutex);
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
+		mutex_destroy(&fp->aux->jit_recompile_mutex);
 		bpf_jit_free_policy(fp->aux->jit_policy);
 		kfree(fp->aux->poke_tab);
 		kfree(fp->aux);
@@ -638,12 +641,17 @@ static DEFINE_SPINLOCK(bpf_lock);
 static LIST_HEAD(bpf_kallsyms);
 static struct latch_tree_root bpf_tree __cacheline_aligned;
 
-void bpf_ksym_add(struct bpf_ksym *ksym)
+static void __bpf_ksym_add(struct bpf_ksym *ksym)
 {
-	spin_lock_bh(&bpf_lock);
 	WARN_ON_ONCE(!list_empty(&ksym->lnode));
 	list_add_tail_rcu(&ksym->lnode, &bpf_kallsyms);
 	latch_tree_insert(&ksym->tnode, &bpf_tree, &bpf_tree_ops);
+}
+
+void bpf_ksym_add(struct bpf_ksym *ksym)
+{
+	spin_lock_bh(&bpf_lock);
+	__bpf_ksym_add(ksym);
 	spin_unlock_bh(&bpf_lock);
 }
 
@@ -668,6 +676,40 @@ static bool bpf_prog_kallsyms_candidate(const struct bpf_prog *fp)
 	return fp->jited && !bpf_prog_was_classic(fp);
 }
 
+static void bpf_ksym_reset(struct bpf_ksym *ksym)
+{
+	INIT_LIST_HEAD_RCU(&ksym->lnode);
+	memset(&ksym->tnode, 0, sizeof(ksym->tnode));
+}
+
+static void bpf_prog_ksym_set_meta(struct bpf_prog *fp, struct bpf_ksym *ksym,
+				   struct exception_table_entry *extable,
+				   u32 num_exentries, u32 fp_start, u32 fp_end)
+{
+	ksym->prog = true;
+	ksym->owner = fp;
+	ksym->extable = extable;
+	ksym->num_exentries = num_exentries;
+	ksym->fp_start = fp_start;
+	ksym->fp_end = fp_end;
+}
+
+#ifdef CONFIG_FINEIBT
+static void bpf_prog_ksym_set_prefix(struct bpf_prog *fp,
+				      unsigned long start,
+				      struct exception_table_entry *extable,
+				      u32 num_exentries)
+{
+	snprintf(fp->aux->ksym_prefix.name, KSYM_NAME_LEN,
+		 "__cfi_%s", fp->aux->ksym.name);
+	fp->aux->ksym_prefix.start = start - 16;
+	fp->aux->ksym_prefix.end = start;
+	bpf_ksym_reset(&fp->aux->ksym_prefix);
+	bpf_prog_ksym_set_meta(fp, &fp->aux->ksym_prefix, extable,
+			       num_exentries, 0, 0);
+}
+#endif
+
 void bpf_prog_kallsyms_add(struct bpf_prog *fp)
 {
 	if (!bpf_prog_kallsyms_candidate(fp) ||
@@ -676,7 +718,11 @@ void bpf_prog_kallsyms_add(struct bpf_prog *fp)
 
 	bpf_prog_ksym_set_addr(fp);
 	bpf_prog_ksym_set_name(fp);
-	fp->aux->ksym.prog = true;
+	bpf_ksym_reset(&fp->aux->ksym);
+	bpf_prog_ksym_set_meta(fp, &fp->aux->ksym, fp->aux->extable,
+			       fp->aux->num_exentries,
+			       fp->aux->ksym.fp_start,
+			       fp->aux->ksym.fp_end);
 
 	bpf_ksym_add(&fp->aux->ksym);
 
@@ -688,14 +734,48 @@ void bpf_prog_kallsyms_add(struct bpf_prog *fp)
 	if (cfi_mode != CFI_FINEIBT)
 		return;
 
-	snprintf(fp->aux->ksym_prefix.name, KSYM_NAME_LEN,
-		 "__cfi_%s", fp->aux->ksym.name);
-
-	fp->aux->ksym_prefix.start = (unsigned long) fp->bpf_func - 16;
-	fp->aux->ksym_prefix.end   = (unsigned long) fp->bpf_func;
-
+	bpf_prog_ksym_set_prefix(fp, (unsigned long)fp->bpf_func,
+				 fp->aux->extable,
+				 fp->aux->num_exentries);
 	bpf_ksym_add(&fp->aux->ksym_prefix);
 #endif
+}
+
+void bpf_prog_kallsyms_replace(struct bpf_prog *fp,
+			       struct bpf_ksym *shadow_ksym,
+			       unsigned long new_start, u32 new_len,
+			       struct exception_table_entry *new_extable,
+			       u32 new_num_exentries,
+			       u32 new_fp_start, u32 new_fp_end)
+{
+	if (!bpf_prog_kallsyms_candidate(fp) ||
+	    !bpf_token_capable(fp->aux->token, CAP_BPF))
+		return;
+
+	bpf_prog_ksym_set_name(fp);
+	spin_lock_bh(&bpf_lock);
+	__bpf_ksym_del(&fp->aux->ksym);
+#ifdef CONFIG_FINEIBT
+	if (cfi_mode == CFI_FINEIBT)
+		__bpf_ksym_del(&fp->aux->ksym_prefix);
+#endif
+	if (shadow_ksym)
+		__bpf_ksym_del(shadow_ksym);
+
+	fp->aux->ksym.start = new_start;
+	fp->aux->ksym.end = new_start + new_len;
+	bpf_ksym_reset(&fp->aux->ksym);
+	bpf_prog_ksym_set_meta(fp, &fp->aux->ksym, new_extable,
+			       new_num_exentries, new_fp_start, new_fp_end);
+	__bpf_ksym_add(&fp->aux->ksym);
+#ifdef CONFIG_FINEIBT
+	if (cfi_mode == CFI_FINEIBT) {
+		bpf_prog_ksym_set_prefix(fp, new_start, new_extable,
+					 new_num_exentries);
+		__bpf_ksym_add(&fp->aux->ksym_prefix);
+	}
+#endif
+	spin_unlock_bh(&bpf_lock);
 }
 
 void bpf_prog_kallsyms_del(struct bpf_prog *fp)
@@ -761,9 +841,7 @@ struct bpf_prog *bpf_prog_ksym_find(unsigned long addr)
 	WARN_ON_ONCE(!rcu_read_lock_held());
 	ksym = bpf_ksym_find(addr);
 
-	return ksym && ksym->prog ?
-	       container_of(ksym, struct bpf_prog_aux, ksym)->prog :
-	       NULL;
+	return ksym && ksym->prog ? ksym->owner : NULL;
 }
 
 bool bpf_has_frame_pointer(unsigned long ip)
@@ -785,16 +863,16 @@ bool bpf_has_frame_pointer(unsigned long ip)
 const struct exception_table_entry *search_bpf_extables(unsigned long addr)
 {
 	const struct exception_table_entry *e = NULL;
-	struct bpf_prog *prog;
+	struct bpf_ksym *ksym;
 
 	rcu_read_lock();
-	prog = bpf_prog_ksym_find(addr);
-	if (!prog)
+	ksym = bpf_ksym_find(addr);
+	if (!ksym || !ksym->prog)
 		goto out;
-	if (!prog->aux->num_exentries)
+	if (!ksym->num_exentries || !ksym->extable)
 		goto out;
 
-	e = search_extable(prog->aux->extable, prog->aux->num_exentries, addr);
+	e = search_extable(ksym->extable, ksym->num_exentries, addr);
 out:
 	rcu_read_unlock();
 	return e;

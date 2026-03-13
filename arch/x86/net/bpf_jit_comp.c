@@ -325,6 +325,8 @@ struct jit_context {
 	 */
 	int tail_call_direct_label;
 	int tail_call_indirect_label;
+	u32 fp_start;
+	u32 fp_end;
 };
 
 /* Maximum number of bytes emitted while JITing one eBPF insn */
@@ -1157,6 +1159,13 @@ static int bpf_jmp_invert(u8 op, u8 *inv_op)
 	case BPF_JSLE:
 		*inv_op = BPF_JSGT;
 		return 0;
+	case BPF_JSET:
+		/*
+		 * emit_bpf_jmp_cmp() lowers JSET as test+jne, so the inverted
+		 * x86 condition is je.
+		 */
+		*inv_op = BPF_JEQ;
+		return 0;
 	default:
 		return -EFAULT;
 	}
@@ -1356,11 +1365,10 @@ static void emit_bpf_mov_value_noflags(u8 **pprog, const struct bpf_insn *insn,
 	emit_mov_imm32_noflags(pprog, is64, dst_reg, insn->imm);
 }
 
-static __maybe_unused int
-emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
-			 const struct bpf_insn *then_insn,
-			 const struct bpf_insn *else_insn,
-			 bool use_priv_fp)
+static int emit_bpf_cmov_select(u8 **pprog, const struct bpf_insn *jmp_insn,
+				const struct bpf_insn *then_insn,
+				const struct bpf_insn *else_insn,
+				bool use_priv_fp)
 {
 	u32 dst_reg = jit_bpf_reg(then_insn->dst_reg, use_priv_fp);
 	bool is64 = BPF_CLASS(then_insn->code) == BPF_ALU64;
@@ -1421,12 +1429,11 @@ static bool is_bpf_cmov_select_compact(const struct bpf_insn *default_insn,
 	return mov_cls == BPF_ALU;
 }
 
-static __maybe_unused int
-emit_bpf_cmov_select_compact(u8 **pprog,
-				     const struct bpf_insn *default_insn,
-				     const struct bpf_insn *jmp_insn,
-				     const struct bpf_insn *override_insn,
-				     bool use_priv_fp)
+static int emit_bpf_cmov_select_compact(u8 **pprog,
+					const struct bpf_insn *default_insn,
+					const struct bpf_insn *jmp_insn,
+					const struct bpf_insn *override_insn,
+					bool use_priv_fp)
 {
 	u32 dst_reg = jit_bpf_reg(default_insn->dst_reg, use_priv_fp);
 	bool is64 = BPF_CLASS(default_insn->code) == BPF_ALU64;
@@ -2143,20 +2150,7 @@ static int emit_spectre_bhb_barrier(u8 **pprog, u8 *ip,
 	return 0;
 }
 
-/*
- * v4 JIT policy framework: wide_load emitter
- *
- * Replaces a byte-load ladder (N byte loads + shifts + ORs) with a smaller
- * native load/recompose sequence. Supports 2..8-byte ladders, including
- * packet-style big-endian gathers.
- */
-struct bpf_wide_load_shape {
-	u32 result_reg;
-	u32 base_reg;
-	s16 off;
-	u32 width;
-	bool big_endian;
-};
+/* Shared helper for canonical WIDE_MEM lowering. */
 
 static void emit_or64_reg(u8 **pprog, u32 dst_reg, u32 src_reg)
 {
@@ -2273,376 +2267,34 @@ static int emit_wide_load_sequence(u8 **pprog, u32 result_reg, u32 base_reg,
 	return 0;
 }
 
-static bool parse_bpf_wide_load_shape(const struct bpf_insn *insns, u32 idx,
-				      u32 site_len, bool use_priv_fp,
-				      struct bpf_wide_load_shape *shape)
+static void emit_lea_base_index(u8 **pprog, u32 dst_reg, u32 base_reg,
+				u32 index_reg, u8 sib_scale)
 {
-	const struct bpf_insn *first = &insns[idx];
-	s16 offsets[8];
-	u8 shifts[8];
-	u32 pos = idx + 1, end = idx + site_len, count = 1;
-	s16 min_off, max_off;
-	u32 i, j;
-	bool little_endian = true;
-	bool big_endian = true;
-
-	if (site_len < 4 || first->code != (BPF_LDX | BPF_MEM | BPF_B))
-		return false;
-
-	offsets[0] = first->off;
-	shifts[0] = 0;
-
-	if (pos < end &&
-	    insns[pos].code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
-	    insns[pos].dst_reg == first->dst_reg &&
-	    insns[pos].off == 0 &&
-	    insns[pos].imm > 0 &&
-	    insns[pos].imm < 64 &&
-	    (insns[pos].imm % 8) == 0) {
-		shifts[0] = (u8)insns[pos].imm;
-		pos++;
-	}
-
-	while (pos < end) {
-		const struct bpf_insn *load_insn = &insns[pos];
-		const struct bpf_insn *or_insn;
-		u32 next = pos + 1;
-		u8 shift_imm = 0;
-
-		if (count == ARRAY_SIZE(offsets))
-			return false;
-		if (load_insn->code != (BPF_LDX | BPF_MEM | BPF_B) ||
-		    load_insn->src_reg != first->src_reg ||
-		    load_insn->dst_reg == first->dst_reg)
-			return false;
-
-		if (next < end &&
-		    insns[next].code == (BPF_ALU64 | BPF_LSH | BPF_K) &&
-		    insns[next].dst_reg == load_insn->dst_reg &&
-		    insns[next].off == 0 &&
-		    insns[next].imm > 0 &&
-		    insns[next].imm < 64 &&
-		    (insns[next].imm % 8) == 0) {
-			shift_imm = (u8)insns[next].imm;
-			next++;
-		}
-
-		if (next >= end)
-			return false;
-
-		or_insn = &insns[next];
-		if (or_insn->code != (BPF_ALU64 | BPF_OR | BPF_X) ||
-		    or_insn->dst_reg != first->dst_reg ||
-		    or_insn->src_reg != load_insn->dst_reg)
-			return false;
-
-		offsets[count] = load_insn->off;
-		shifts[count] = shift_imm;
-		count++;
-		pos = next + 1;
-	}
-
-	if (count < 2)
-		return false;
-
-	min_off = offsets[0];
-	max_off = offsets[0];
-	for (i = 0; i < count; i++) {
-		min_off = min(min_off, offsets[i]);
-		max_off = max(max_off, offsets[i]);
-		for (j = i + 1; j < count; j++) {
-			if (offsets[i] == offsets[j])
-				return false;
-		}
-	}
-
-	if (max_off - min_off + 1 != count)
-		return false;
-
-	for (i = 0; i < count; i++) {
-		u8 le_shift = (u8)((offsets[i] - min_off) * 8);
-		u8 be_shift = (u8)((max_off - offsets[i]) * 8);
-
-		little_endian &= shifts[i] == le_shift;
-		big_endian &= shifts[i] == be_shift;
-	}
-
-	if (!little_endian && !big_endian)
-		return false;
-
-	shape->result_reg = jit_bpf_reg(first->dst_reg, use_priv_fp);
-	shape->base_reg = jit_bpf_reg(first->src_reg, use_priv_fp);
-	shape->off = min_off;
-	shape->width = count;
-	shape->big_endian = !little_endian && big_endian;
-	return true;
-}
-
-static __maybe_unused int
-emit_bpf_wide_load(u8 **pprog, const struct bpf_insn *insns,
-		       const struct bpf_jit_rule *rule,
-		       bool use_priv_fp)
-{
-	struct bpf_wide_load_shape shape;
-
-	if (!parse_bpf_wide_load_shape(insns, rule->site_start, rule->site_len,
-				       use_priv_fp, &shape))
-		return -EINVAL;
-
-	return emit_wide_load_sequence(pprog, shape.result_reg, shape.base_reg,
-				       shape.off, shape.width,
-				       shape.big_endian);
-}
-
-/*
- * v4 JIT policy framework: rotate emitter
- *
- * Replaces a rotate idiom with a single ror or rorx instruction.
- *
- * Three patterns supported:
- *
- * 4-insn (classic or commuted):
- *   Classic: [0] mov tmp, dst; [1] lsh dst, N; [2] rsh tmp, (W-N); [3] or dst, tmp
- *   Commuted: [0] mov tmp, dst; [1] rsh tmp, (W-N); [2] lsh dst, N; [3] or dst, tmp
- *   Left rotate by N = right rotate by (W-N).
- *
- * 5-insn (two-copy 64-bit):
- *   [0] mov64 tmp, src; [1] rsh64 tmp, (64-N); [2] mov64 dst, src;
- *   [3] lsh64 dst, N; [4] or64 dst, tmp
- *   Result in dst (insns[idx+2].dst_reg).
- *
- * 6-insn (clang masked 32-bit):
- *   [0] mov64 tmp, src; [1] and64 tmp, mask; [2] rsh64 tmp, (32-N);
- *   [3] mov64 dst, src; [4] lsh64 dst, N; [5] or64 dst, tmp
- *   Always 32-bit rotate.  Result in dst (insns[3].dst_reg).
- */
-static __maybe_unused int
-emit_bpf_rotate(u8 **pprog, const struct bpf_insn *insns,
-		    const struct bpf_jit_rule *rule,
-		    bool use_priv_fp)
-{
-	u32 idx = rule->site_start;
-	u32 dst_reg, src_reg, tmp_reg;
-	bool is64;
-	u32 width, rot_amount;
-	u8 ror_imm;
 	u8 *prog = *pprog;
+	u8 rex = 0x48;
+	u8 modrm;
+	u8 sib;
 
-	if (rule->site_len == 6) {
-		/* 6-insn masked 32-bit rotate */
-		const struct bpf_insn *mov1 = &insns[idx];
-		const struct bpf_insn *lsh_insn = &insns[idx + 4];
+	if (is_ereg(dst_reg))
+		rex |= 0x04; /* REX.R */
+	if (is_ereg(index_reg))
+		rex |= 0x02; /* REX.X */
+	if (is_ereg(base_reg))
+		rex |= 0x01; /* REX.B */
 
-		src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
-		dst_reg = jit_bpf_reg(insns[idx + 3].dst_reg, use_priv_fp);
-		tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
-		is64 = false;
-		width = 32;
-		rot_amount = (u32)lsh_insn->imm;
-	} else if (rule->site_len == 5) {
-		const struct bpf_insn *mov1 = &insns[idx];
-		const struct bpf_insn *insn1 = &insns[idx + 1];
-
-		if (BPF_OP(insn1->code) == BPF_AND) {
-			/*
-			 * 5-insn masked 32-bit rotate: mov+and+{rsh,lsh}+{lsh,rsh}+or
-			 * Find the LSH among positions 2 and 3.
-			 */
-			const struct bpf_insn *lsh_insn;
-
-			if (BPF_OP(insns[idx + 2].code) == BPF_LSH)
-				lsh_insn = &insns[idx + 2];
-			else
-				lsh_insn = &insns[idx + 3];
-
-			src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
-			dst_reg = src_reg; /* result stays in original register */
-			tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
-			is64 = false;
-			width = 32;
-			rot_amount = (u32)lsh_insn->imm;
-		} else {
-			/*
-			 * 5-insn two-copy 64-bit rotate: mov+rsh+mov+lsh+or
-			 */
-			const struct bpf_insn *mov2 = &insns[idx + 2];
-			const struct bpf_insn *lsh_insn = &insns[idx + 3];
-
-			src_reg = jit_bpf_reg(mov1->src_reg, use_priv_fp);
-			dst_reg = jit_bpf_reg(mov2->dst_reg, use_priv_fp);
-			tmp_reg = jit_bpf_reg(mov1->dst_reg, use_priv_fp);
-			is64 = true;
-			width = 64;
-			rot_amount = (u32)lsh_insn->imm;
-		}
-	} else {
-		/*
-		 * 4-insn rotate (classic or commuted).
-		 * Find the LSH instruction at either idx+1 or idx+2.
-		 */
-		const struct bpf_insn *mov_insn = &insns[idx];
-		const struct bpf_insn *lsh_insn;
-
-		if (BPF_OP(insns[idx + 1].code) == BPF_LSH)
-			lsh_insn = &insns[idx + 1]; /* classic */
-		else
-			lsh_insn = &insns[idx + 2]; /* commuted */
-
-		dst_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
-		src_reg = dst_reg;
-		tmp_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
-		is64 = BPF_CLASS(mov_insn->code) == BPF_ALU64;
-		width = is64 ? 64 : 32;
-		rot_amount = (u32)lsh_insn->imm;
-	}
-
-	ror_imm = (u8)(width - rot_amount);
-
-	if (rule->native_choice == BPF_JIT_ROT_RORX) {
-#if defined(CONFIG_X86_64)
-		if (!boot_cpu_has(X86_FEATURE_BMI2))
-			return -EINVAL;
-#endif
-		/*
-		 * rorx dst, src, imm8
-		 * VEX.LZ.F2.0F3A.W1 F0 /r ib  (64-bit)
-		 * VEX.LZ.F2.0F3A.W0 F0 /r ib  (32-bit)
-		 */
-		u8 byte2, byte3, modrm;
-
-		byte2 = 0x03;
-		if (!is_ereg(dst_reg))
-			byte2 |= 0x80;
-		byte2 |= 0x40;
-		if (!is_ereg(src_reg))
-			byte2 |= 0x20;
-
-		byte3 = 0x7B;
-		if (is64)
-			byte3 |= 0x80;
-
-		modrm = 0xC0 | (reg2hex[dst_reg] << 3) | reg2hex[src_reg];
-
-		EMIT4(0xC4, byte2, byte3, 0xF0);
-		EMIT2(modrm, ror_imm);
-
-		(void)tmp_reg;
-	} else {
-		/*
-		 * ror dst, imm8
-		 * REX.W + C1 /1 ib  (64-bit)
-		 * C1 /1 ib           (32-bit, with REX if ereg)
-		 *
-		 * For 5-insn/6-insn: if src != dst, we need mov dst, src first.
-		 */
-		if ((rule->site_len == 5 || rule->site_len == 6) &&
-		    src_reg != dst_reg) {
-			emit_mov_reg(&prog, is64, dst_reg, src_reg);
-		}
-
-		if (is64)
-			EMIT1(add_1mod(0x48, dst_reg));
-		else if (is_ereg(dst_reg))
-			EMIT1(add_1mod(0x40, dst_reg));
-		EMIT3(0xC1, add_1reg(0xC8, dst_reg), ror_imm);
-	}
-
-	*pprog = prog;
-	return 0;
-}
-
-/*
- * v4 JIT policy framework: LEA fusion emitter
- *
- * Replaces a 3-insn address calculation (mov+shl+add) with a single
- * LEA instruction.
- *
- * Pattern:
- *   [0] mov   dst, idx        (copy index)
- *   [1] lsh64 dst, scale      (scale in {1,2,3})
- *   [2] add64 dst, base       (add base register)
- *
- * Emitted: lea dst, [base + idx*scale_factor]
- * where scale_factor = 1<<scale = {2, 4, 8}
- */
-static __maybe_unused int
-emit_bpf_lea_fusion(u8 **pprog, const struct bpf_insn *insns,
-		        const struct bpf_jit_rule *rule,
-		        bool use_priv_fp)
-{
-	u32 idx = rule->site_start;
-	const struct bpf_insn *mov_insn = &insns[idx];
-	const struct bpf_insn *lsh_insn = &insns[idx + 1];
-	const struct bpf_insn *add_insn = &insns[idx + 2];
-	u32 dst_reg = jit_bpf_reg(mov_insn->dst_reg, use_priv_fp);
-	u32 index_reg = jit_bpf_reg(mov_insn->src_reg, use_priv_fp);
-	u32 base_reg = jit_bpf_reg(add_insn->src_reg, use_priv_fp);
-	u32 scale = (u32)lsh_insn->imm; /* 1, 2, or 3 */
-	u8 sib_scale;
-	u8 *prog = *pprog;
-
-	/*
-	 * SIB scale encoding: 00=1, 01=2, 10=4, 11=8
-	 * scale=1 -> *2 -> SIB scale=01
-	 * scale=2 -> *4 -> SIB scale=10
-	 * scale=3 -> *8 -> SIB scale=11
-	 */
-	sib_scale = (u8)scale; /* conveniently maps directly */
-
-	/*
-	 * lea dst, [base + index*scale_factor]
-	 * REX.W + 0x8D + ModRM + SIB
-	 *
-	 * ModRM: mod=00, reg=dst, rm=100 (SIB follows)
-	 * SIB: scale | index<<3 | base
-	 *
-	 * Special case: if base is RBP (reg2hex=5), mod=00 means
-	 * [disp32 + index*s], so we need mod=01 with disp8=0.
-	 * Similarly for R13 (reg2hex=5).
-	 */
-	{
-		u8 rex = add_3mod(0x48, dst_reg, BPF_REG_0, index_reg);
-		/* Fix: add_3mod sets REX.B from r1 (dst in lea is /r field),
-		 * REX.X from index, REX.R from r2. For LEA:
-		 * REX.R = dst (reg field), REX.X = index, REX.B = base
-		 * We need to build REX manually.
-		 */
-		rex = 0x48;
-		if (is_ereg(dst_reg))
-			rex |= 0x04; /* REX.R */
-		if (is_ereg(index_reg))
-			rex |= 0x02; /* REX.X */
-		if (is_ereg(base_reg))
-			rex |= 0x01; /* REX.B */
-
-		EMIT1(rex);
-	}
-
+	EMIT1(rex);
 	EMIT1(0x8D); /* LEA opcode */
 
-	{
-		u8 modrm;
-		u8 sib;
-		bool base_needs_disp = (reg2hex[base_reg] == 5); /* RBP or R13 */
+	modrm = (x86_base_needs_disp(base_reg) ? 0x44 : 0x04) |
+		(reg2hex[dst_reg] << 3);
+	sib = (sib_scale << 6) | (reg2hex[index_reg] << 3) |
+	      reg2hex[base_reg];
 
-		if (base_needs_disp) {
-			/* mod=01, reg=dst, rm=100 */
-			modrm = 0x44 | (reg2hex[dst_reg] << 3);
-		} else {
-			/* mod=00, reg=dst, rm=100 */
-			modrm = 0x04 | (reg2hex[dst_reg] << 3);
-		}
-
-		sib = (sib_scale << 6) | (reg2hex[index_reg] << 3) | reg2hex[base_reg];
-
-		EMIT2(modrm, sib);
-
-		if (base_needs_disp)
-			EMIT1(0); /* disp8 = 0 */
-	}
+	EMIT2(modrm, sib);
+	if (x86_base_needs_disp(base_reg))
+		EMIT1(0); /* disp8 = 0 */
 
 	*pprog = prog;
-	return 0;
 }
 
 static int emit_canonical_wide_load(u8 **pprog,
@@ -2733,6 +2385,7 @@ static int emit_canonical_rotate(u8 **pprog,
 
 		EMIT4(0xC4, byte2, byte3, 0xF0);
 		EMIT2(modrm, ror_imm);
+		*pprog = prog;
 		return 0;
 #else
 		return -EINVAL;
@@ -2782,40 +2435,7 @@ static int emit_canonical_lea_fusion(
 		return -EINVAL;
 
 	sib_scale = (u8)scale;
-
-	{
-		u8 rex = 0x48;
-
-		if (is_ereg(dst_reg))
-			rex |= 0x04;
-		if (is_ereg(index_reg))
-			rex |= 0x02;
-		if (is_ereg(base_reg))
-			rex |= 0x01;
-
-		EMIT1(rex);
-	}
-
-	EMIT1(0x8D);
-
-	{
-		u8 modrm;
-		u8 sib;
-		bool base_needs_disp = reg2hex[base_reg] == 5;
-
-		if (base_needs_disp)
-			modrm = 0x44 | (reg2hex[dst_reg] << 3);
-		else
-			modrm = 0x04 | (reg2hex[dst_reg] << 3);
-
-		sib = (sib_scale << 6) | (reg2hex[index_reg] << 3) |
-		      reg2hex[base_reg];
-
-		EMIT2(modrm, sib);
-		if (base_needs_disp)
-			EMIT1(0);
-	}
-
+	emit_lea_base_index(&prog, dst_reg, base_reg, index_reg, sib_scale);
 	*pprog = prog;
 	return 0;
 }
@@ -3507,13 +3127,14 @@ static int emit_local_jump(u8 **pprog, s32 jmp_offset)
 
 static int emit_canonical_branch_flip(u8 **pprog,
 				      const struct bpf_prog *bpf_prog,
-				      u32 site_start,
+				      u32 site_start, u32 site_len,
 				      const struct bpf_jit_canonical_params *params,
 				      bool use_priv_fp)
 {
 	const struct bpf_insn *jcc_insn = &bpf_prog->insnsi[site_start];
 	u32 body_a_len, body_b_len, body_a_start, body_b_start;
 	u32 body_a_size = 0, body_b_size = 0;
+	u32 body_span;
 	u32 jmp_join_size;
 	u32 dst_reg, src_reg = 0;
 	u8 inv_op, jmp_cond;
@@ -3527,6 +3148,10 @@ static int emit_canonical_branch_flip(u8 **pprog,
 	body_a_len = (u32)params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
 	body_b_len = (u32)params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
 	if (!body_a_len || body_a_len > 16 || !body_b_len || body_b_len > 16)
+		return -EINVAL;
+	if (check_add_overflow(body_a_len, body_b_len, &body_span) ||
+	    check_add_overflow(body_span, 2U, &body_span) ||
+	    body_span != site_len)
 		return -EINVAL;
 
 	body_a_start = site_start + 1;
@@ -3572,101 +3197,6 @@ static int emit_canonical_branch_flip(u8 **pprog,
 
 	return emit_branch_flip_body(pprog, bpf_prog, body_a_start, body_a_len,
 				     use_priv_fp);
-}
-
-struct bpf_bitfield_extract_site {
-	u8 dst_bpf_reg;
-	u8 src_bpf_reg;
-	s32 shift;
-	s32 mask;
-	u8 width;
-	bool mask_first;
-};
-
-static bool parse_bpf_bitfield_extract_site(const struct bpf_insn *insns,
-					    const struct bpf_jit_rule *rule,
-					    struct bpf_bitfield_extract_site *site)
-{
-	u32 idx = rule->site_start;
-	const struct bpf_insn *mov_insn = NULL;
-	const struct bpf_insn *first, *second;
-	u8 mov_opcode, rsh_opcode, and_opcode;
-	u8 dst_bpf_reg, src_bpf_reg, width;
-	s32 shift, mask;
-	bool mask_first;
-
-	if (rule->site_len == 3) {
-		mov_insn = &insns[idx];
-		first = &insns[idx + 1];
-		second = &insns[idx + 2];
-	} else if (rule->site_len == 2) {
-		first = &insns[idx];
-		second = &insns[idx + 1];
-	} else {
-		return false;
-	}
-
-	switch (first->code) {
-	case BPF_ALU64 | BPF_RSH | BPF_K:
-	case BPF_ALU64 | BPF_AND | BPF_K:
-		width = 64;
-		mov_opcode = BPF_ALU64 | BPF_MOV | BPF_X;
-		rsh_opcode = BPF_ALU64 | BPF_RSH | BPF_K;
-		and_opcode = BPF_ALU64 | BPF_AND | BPF_K;
-		break;
-	case BPF_ALU | BPF_RSH | BPF_K:
-	case BPF_ALU | BPF_AND | BPF_K:
-		width = 32;
-		mov_opcode = BPF_ALU | BPF_MOV | BPF_X;
-		rsh_opcode = BPF_ALU | BPF_RSH | BPF_K;
-		and_opcode = BPF_ALU | BPF_AND | BPF_K;
-		break;
-	default:
-		return false;
-	}
-
-	if (mov_insn) {
-		if (mov_insn->code != mov_opcode || mov_insn->off || mov_insn->imm)
-			return false;
-		dst_bpf_reg = mov_insn->dst_reg;
-		src_bpf_reg = mov_insn->src_reg;
-		if (first->dst_reg != dst_bpf_reg || second->dst_reg != dst_bpf_reg)
-			return false;
-	} else {
-		dst_bpf_reg = first->dst_reg;
-		src_bpf_reg = dst_bpf_reg;
-		if (second->dst_reg != dst_bpf_reg)
-			return false;
-	}
-
-	if (first->off || second->off)
-		return false;
-
-	if (first->code == rsh_opcode && second->code == and_opcode) {
-		shift = first->imm;
-		mask = second->imm;
-		mask_first = false;
-	} else if (first->code == and_opcode && second->code == rsh_opcode) {
-		shift = second->imm;
-		mask = first->imm;
-		mask_first = true;
-	} else {
-		return false;
-	}
-
-	if (shift < 0 || shift >= width)
-		return false;
-
-	if (site) {
-		site->dst_bpf_reg = dst_bpf_reg;
-		site->src_bpf_reg = src_bpf_reg;
-		site->shift = shift;
-		site->mask = mask;
-		site->width = width;
-		site->mask_first = mask_first;
-	}
-
-	return true;
 }
 
 static u64 bitfield_mask_from_imm(s32 mask, u32 width)
@@ -3810,27 +3340,7 @@ static int emit_bitfield_extract_core(u8 **pprog, u32 dst_reg, u32 src_reg,
 	return 0;
 }
 
-static __maybe_unused int emit_bpf_bitfield_extract(
-	u8 **pprog, const struct bpf_insn *insns,
-	const struct bpf_jit_rule *rule,
-	bool use_priv_fp)
-{
-	struct bpf_bitfield_extract_site site;
-	u32 dst_reg, src_reg;
-
-	if (!parse_bpf_bitfield_extract_site(insns, rule, &site))
-		return -EINVAL;
-
-	dst_reg = jit_bpf_reg(site.dst_bpf_reg, use_priv_fp);
-	src_reg = jit_bpf_reg(site.src_bpf_reg, use_priv_fp);
-	return emit_bitfield_extract_core(pprog, dst_reg, src_reg, site.width,
-					  (u32)site.shift,
-					  bitfield_mask_from_imm(site.mask,
-							       site.width),
-					  site.mask_first);
-}
-
-static __maybe_unused int emit_canonical_bitfield_extract(
+static int emit_canonical_bitfield_extract(
 	u8 **pprog,
 	const struct bpf_jit_canonical_params *params,
 	bool use_priv_fp)
@@ -3862,6 +3372,9 @@ static __maybe_unused int emit_canonical_bitfield_extract(
 	shift = (u32)shift_value->value;
 	if ((width != 32 && width != 64) || shift >= width)
 		return -EINVAL;
+	if (order_value->value != BPF_JIT_BFX_ORDER_SHIFT_MASK &&
+	    order_value->value != BPF_JIT_BFX_ORDER_MASK_SHIFT)
+		return -EINVAL;
 
 	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
 	src_reg = jit_bpf_reg((u8)src_value->value, use_priv_fp);
@@ -3876,15 +3389,28 @@ static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
 	return rule->rule_kind == BPF_JIT_RK_PATTERN ? rule->canonical_form : 0;
 }
 
+static const struct bpf_jit_rule *
+bpf_jit_rule_lookup_prog(const struct bpf_prog *bpf_prog, u32 insn_idx)
+{
+	const struct bpf_jit_policy *policy;
+	const struct bpf_prog_aux *main_aux = bpf_prog_main_aux(bpf_prog);
+
+	policy = main_aux->jit_policy;
+	if (!policy || !policy->active_cnt)
+		return NULL;
+
+	if (bpf_prog->aux->main_prog_aux)
+		insn_idx += bpf_prog->aux->subprog_start;
+
+	return bpf_jit_rule_lookup(policy, insn_idx);
+}
+
 static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
 					 const struct bpf_jit_rule *rule)
 {
 	u32 site_start = rule->site_start;
 	u32 subprog_start = bpf_prog->aux->subprog_start;
 	u32 site_end;
-
-	if (!(rule->flags & BPF_JIT_REWRITE_F_ACTIVE))
-		return site_start;
 
 	if (!bpf_prog->aux->main_prog_aux)
 		return site_start;
@@ -3903,14 +3429,14 @@ static int bpf_jit_rule_local_site_start(const struct bpf_prog *bpf_prog,
 /*
  * Canonical-form dispatcher for validated v5 pattern rules.
  *
- * Called from do_jit() main loop. If a rule covers the current BPF insn,
+ * Called from do_jit() main loop. If a rule starts at the current BPF insn,
  * emits the alternative native code and returns the number of BPF insns
- * consumed (>= 1). Returns 0 if stock emission should be used, or -1 on
- * error.
+ * consumed (>= 1). Returns 0 if stock emission should be used, or a negative
+ * errno on error.
  */
 static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
-				  const struct bpf_jit_rule *rule,
-				  bool use_priv_fp)
+				 const struct bpf_jit_rule *rule,
+				 bool use_priv_fp)
 {
 	u16 form = bpf_jit_rule_form(rule);
 	int local_site_start;
@@ -3925,117 +3451,191 @@ static int bpf_jit_try_emit_rule(u8 **pprog, struct bpf_prog *bpf_prog,
 
 	switch (form) {
 	case BPF_JIT_CF_COND_SELECT:
-			if (rule->native_choice == BPF_JIT_SEL_BRANCH) {
-				/* Stock emission requested — return 0 to fall through */
-				return 0;
-			}
-			if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
-				return -EINVAL;
+		if (rule->native_choice == BPF_JIT_SEL_BRANCH)
+			return 0;
+		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
+			return -EINVAL;
 
-			err = emit_canonical_select(pprog, bpf_prog->insnsi,
-						    bpf_prog->len,
-						    local_site_start,
-						    rule->site_len,
-						    use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_select(pprog, bpf_prog->insnsi,
+					    bpf_prog->len,
+					    local_site_start,
+					    rule->site_len,
+					    use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_WIDE_MEM:
-			if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS) {
-				/* Stock emission requested */
-				return 0;
-			}
-			if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
-				return -EINVAL;
+		if (rule->native_choice == BPF_JIT_WMEM_BYTE_LOADS)
+			return 0;
+		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
+			return -EINVAL;
 
-			err = emit_canonical_wide_load(pprog, &rule->params, use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_wide_load(pprog, &rule->params, use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_ROTATE:
-			if (rule->native_choice == BPF_JIT_ROT_SHIFT) {
-				/* Stock emission requested */
-				return 0;
-			}
-			if (rule->native_choice != BPF_JIT_ROT_ROR &&
-			    rule->native_choice != BPF_JIT_ROT_RORX)
-				return -EINVAL;
+		if (rule->native_choice == BPF_JIT_ROT_SHIFT)
+			return 0;
+		if (rule->native_choice != BPF_JIT_ROT_ROR &&
+		    rule->native_choice != BPF_JIT_ROT_RORX)
+			return -EINVAL;
 
-			err = emit_canonical_rotate(pprog, &rule->params,
-						      rule->native_choice,
-						      use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_rotate(pprog, &rule->params,
+					 rule->native_choice, use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_ADDR_CALC:
-			if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD) {
-				/* Stock emission requested */
-				return 0;
-			}
-			if (rule->native_choice != BPF_JIT_ACALC_LEA)
-				return -EINVAL;
+		if (rule->native_choice == BPF_JIT_ACALC_SHIFT_ADD)
+			return 0;
+		if (rule->native_choice != BPF_JIT_ACALC_LEA)
+			return -EINVAL;
 
-			err = emit_canonical_lea_fusion(pprog, &rule->params,
-							use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_lea_fusion(pprog, &rule->params, use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
-			if (rule->native_choice == BPF_JIT_BFX_EXTRACT) {
-				err = emit_canonical_bitfield_extract(
-					pprog, &rule->params, use_priv_fp);
-				if (err)
-					return err;
-				return rule->site_len;
-			}
+		if (rule->native_choice != BPF_JIT_BFX_EXTRACT)
 			return -EINVAL;
+
+		err = emit_canonical_bitfield_extract(pprog, &rule->params,
+					      use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-			if (rule->native_choice != BPF_JIT_ZEXT_ELIDE)
-				return -EINVAL;
+		if (rule->native_choice != BPF_JIT_ZEXT_ELIDE)
+			return -EINVAL;
 
-			err = emit_canonical_zero_ext_elide(pprog, bpf_prog,
-						       (u32)local_site_start,
-						       use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_zero_ext_elide(pprog, bpf_prog,
+					    (u32)local_site_start,
+					    use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_ENDIAN_FUSION:
-			if (rule->native_choice != BPF_JIT_ENDIAN_MOVBE)
-				return -EINVAL;
+		if (rule->native_choice != BPF_JIT_ENDIAN_MOVBE)
+			return -EINVAL;
 
-			err = emit_canonical_endian_fusion(pprog, &rule->params,
-							use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
+		err = emit_canonical_endian_fusion(pprog, &rule->params, use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
 
 	case BPF_JIT_CF_BRANCH_FLIP:
-			if (rule->native_choice == BPF_JIT_BFLIP_ORIGINAL)
-				return 0;
-			if (rule->native_choice != BPF_JIT_BFLIP_FLIPPED)
-				return -EINVAL;
-
-			err = emit_canonical_branch_flip(pprog, bpf_prog,
-						       (u32)local_site_start,
-						       &rule->params,
-						       use_priv_fp);
-			if (err)
-				return err;
-			return rule->site_len;
-
-		default:
+		if (rule->native_choice == BPF_JIT_BFLIP_ORIGINAL)
+			return 0;
+		if (rule->native_choice != BPF_JIT_BFLIP_FLIPPED)
 			return -EINVAL;
-		}
+
+		err = emit_canonical_branch_flip(pprog, bpf_prog,
+						 (u32)local_site_start,
+						 rule->site_len,
+						 &rule->params, use_priv_fp);
+		if (err)
+			return err;
+		return rule->site_len;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int bpf_jit_try_emit_prog_rule(u8 **pprog, struct bpf_prog *bpf_prog,
+				      u32 insn_idx, bool use_priv_fp,
+				      const struct bpf_jit_rule **rulep)
+{
+	const struct bpf_jit_rule *rule;
+
+	rule = bpf_jit_rule_lookup_prog(bpf_prog, insn_idx);
+	if (!rule)
+		return 0;
+
+	if (rulep)
+		*rulep = rule;
+
+	return bpf_jit_try_emit_rule(pprog, bpf_prog, rule, use_priv_fp);
+}
+
+static int bpf_jit_commit_rule_region(u8 *temp, u8 **pprog, int *addrs,
+				      u8 *image, u8 *rw_image, int oldproglen,
+				      int *proglen, u32 addrs_idx, int consumed)
+{
+	int region_start = *proglen;
+	int ilen = *pprog - temp;
+	int j;
+
+	if (ilen > BPF_MAX_INSN_SIZE) {
+		pr_err("bpf_jit: fatal insn size error\n");
+		return -EFAULT;
 	}
 
+	if (image) {
+		if (unlikely(region_start + ilen > oldproglen)) {
+			pr_err("bpf_jit: fatal error\n");
+			return -EFAULT;
+		}
+		memcpy(rw_image + region_start, temp, ilen);
+	}
+
+	*proglen = region_start + ilen;
+	for (j = 0; j < consumed - 1; j++)
+		addrs[addrs_idx + j] = region_start;
+	addrs[addrs_idx + consumed - 1] = *proglen;
+	*pprog = temp;
+	return 0;
+}
+
+static int bpf_jit_apply_prog_rule(u8 *temp, u8 **pprog,
+				   struct bpf_prog *bpf_prog, int *addrs,
+				   u8 *image, u8 *rw_image, int oldproglen,
+				   int *proglen, u32 addrs_idx,
+				   bool use_priv_fp)
+{
+	const struct bpf_jit_rule *rule = NULL;
+	int consumed;
+	int err;
+
+	consumed = bpf_jit_try_emit_prog_rule(pprog, bpf_prog, addrs_idx - 1,
+					      use_priv_fp, &rule);
+	if (consumed <= 0) {
+		if (rule && image) {
+			bpf_jit_recompile_note_rule(bpf_prog, rule, false);
+			if (consumed < 0)
+				bpf_jit_recompile_rule_log(
+					bpf_prog, rule,
+					"emitter fallback (err=%d)",
+					consumed);
+		}
+		return 0;
+	}
+
+	err = bpf_jit_commit_rule_region(temp, pprog, addrs, image, rw_image,
+					 oldproglen, proglen, addrs_idx,
+					 consumed);
+	if (err)
+		return err;
+
+	if (image) {
+		bpf_jit_recompile_note_rule(bpf_prog, rule, true);
+		bpf_jit_recompile_rule_log(bpf_prog, rule,
+					   "applied successfully");
+	}
+
+	return consumed;
+}
+
 static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image,
-		  int oldproglen, struct jit_context *ctx, bool jmp_padding)
+		  int oldproglen, struct jit_context *ctx, bool jmp_padding,
+		  void __percpu *priv_stack_ptr_override,
+		  struct exception_table_entry *extable, u32 num_exentries)
 {
 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
 	struct bpf_insn *insn = bpf_prog->insnsi;
@@ -4053,7 +3653,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	int err;
 
 	stack_depth = bpf_prog->aux->stack_depth;
-	priv_stack_ptr = bpf_prog->aux->priv_stack_ptr;
+	priv_stack_ptr = priv_stack_ptr_override ?: bpf_prog->aux->priv_stack_ptr;
 	if (priv_stack_ptr) {
 		priv_frame_ptr = priv_stack_ptr + PRIV_STACK_GUARD_SZ + round_up(stack_depth, 8);
 		stack_depth = 0;
@@ -4068,7 +3668,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
 		      bpf_is_subprog(bpf_prog), bpf_prog->aux->exception_cb);
 
-	bpf_prog->aux->ksym.fp_start = prog - temp;
+	ctx->fp_start = prog - temp;
 
 	/* Exception callback will clobber callee regs for its own use, and
 	 * restore the original callee regs from main prog's stack frame.
@@ -4119,75 +3719,17 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 				dst_reg = X86_REG_R9;
 		}
 
-		/* Canonical rule dispatch: check if a rewrite rule covers this insn. */
-		{
-			const struct bpf_jit_policy *policy;
-			const struct bpf_prog_aux *main_aux;
-
-			main_aux = bpf_prog->aux->main_prog_aux ?
-				   bpf_prog->aux->main_prog_aux : bpf_prog->aux;
-			policy = main_aux->jit_policy;
-			if (policy && policy->active_cnt) {
-				const struct bpf_jit_rule *rule;
-				u32 abs_insn_idx = i - 1;
-
-				if (bpf_prog->aux->main_prog_aux)
-					abs_insn_idx += bpf_prog->aux->subprog_start;
-
-				rule = bpf_jit_rule_lookup(policy, abs_insn_idx);
-				if (rule && (rule->flags & BPF_JIT_REWRITE_F_ACTIVE)) {
-					int consumed;
-
-						consumed = bpf_jit_try_emit_rule(&prog, bpf_prog,
-										 rule,
-										 priv_frame_ptr != NULL);
-						if (consumed > 0) {
-							int region_start = proglen;
-						int j;
-
-						ilen = prog - temp;
-						if (ilen > BPF_MAX_INSN_SIZE) {
-							pr_err("bpf_jit: fatal insn size error\n");
-							return -EFAULT;
-						}
-
-						if (image) {
-							if (unlikely(region_start + ilen > oldproglen)) {
-								pr_err("bpf_jit: fatal error\n");
-								return -EFAULT;
-							}
-							memcpy(rw_image + region_start, temp, ilen);
-						}
-
-						proglen = region_start + ilen;
-
-						/*
-						 * Fill addrs for all consumed insns.
-						 * addrs[i+j] for j=0..consumed-2 -> region_start
-						 * addrs[i+consumed-1] -> proglen (end of block)
-						 */
-							for (j = 0; j < consumed - 1; j++)
-								addrs[i + j] = region_start;
-							addrs[i + consumed - 1] = proglen;
-							if (image)
-								bpf_jit_recompile_rule_log(
-									bpf_prog, rule,
-									"applied successfully");
-
-							prog = temp;
-							insn += consumed - 1;
-							i += consumed - 1;
-							continue;
-						}
-						/* consumed == 0 means fall through to stock emission */
-						if (consumed < 0 && image)
-							bpf_jit_recompile_rule_log(
-								bpf_prog, rule,
-								"emitter fallback (err=%d)",
-								consumed);
-					}
-				}
-			}
+		err = bpf_jit_apply_prog_rule(temp, &prog, bpf_prog, addrs,
+					      image, rw_image, oldproglen,
+					      &proglen, i,
+					      priv_frame_ptr != NULL);
+		if (err < 0)
+			return err;
+		if (err > 0) {
+			insn += err - 1;
+			i += err - 1;
+			continue;
+		}
 
 		switch (insn->code) {
 			/* ALU */
@@ -4644,14 +4186,14 @@ populate_extable:
 				 * may still point at the previous RO image while
 				 * image/rw_image are not set up for the new pass yet.
 				 */
-				if (!bpf_prog->aux->extable || !image || !rw_image)
+				if (!extable || !image || !rw_image)
 					break;
 
-				if (excnt >= bpf_prog->aux->num_exentries) {
+				if (excnt >= num_exentries) {
 					pr_err("mem32 extable bug\n");
 					return -EFAULT;
 				}
-				ex = &bpf_prog->aux->extable[excnt++];
+				ex = &extable[excnt++];
 
 				delta = _insn - (u8 *)&ex->insn;
 				/* switch ex to rw buffer for writes */
@@ -4768,14 +4310,14 @@ populate_extable:
 				/* populate jmp_offset for JMP above */
 				start_of_ldx[-1] = prog - start_of_ldx;
 
-				if (!bpf_prog->aux->extable)
+				if (!extable || !image || !rw_image)
 					break;
 
-				if (excnt >= bpf_prog->aux->num_exentries) {
+				if (excnt >= num_exentries) {
 					pr_err("ex gen bug\n");
 					return -EFAULT;
 				}
-				ex = &bpf_prog->aux->extable[excnt++];
+				ex = &extable[excnt++];
 
 				delta = _insn - (u8 *)&ex->insn;
 				if (!is_simm32(delta)) {
@@ -5149,7 +4691,7 @@ emit_jmp:
 					pop_r12(&prog);
 			}
 			EMIT1(0xC9);         /* leave */
-			bpf_prog->aux->ksym.fp_end = prog - temp;
+			ctx->fp_end = prog - temp;
 
 			emit_return(&prog, image + addrs[i - 1] + (prog - temp));
 			break;
@@ -5192,7 +4734,7 @@ emit_jmp:
 		prog = temp;
 	}
 
-	if (image && excnt != bpf_prog->aux->num_exentries) {
+	if (image && excnt != num_exentries) {
 		pr_err("extable is not populated\n");
 		return -EFAULT;
 	}
@@ -6100,7 +5642,7 @@ static void priv_stack_check_guard(void __percpu *priv_stack_ptr, int alloc_size
 		stack_ptr = per_cpu_ptr(priv_stack_ptr, cpu);
 		if (stack_ptr[0] != PRIV_STACK_GUARD_VAL ||
 		    stack_ptr[underflow_idx] != PRIV_STACK_GUARD_VAL) {
-			pr_err("BPF private stack overflow/underflow detected for prog %sx\n",
+			pr_err("BPF private stack overflow/underflow detected for prog %s\n",
 			       bpf_jit_get_prog_name(prog));
 			break;
 		}
@@ -6110,27 +5652,86 @@ static void priv_stack_check_guard(void __percpu *priv_stack_ptr, int alloc_size
 struct x64_jit_data {
 	struct bpf_binary_header *rw_header;
 	struct bpf_binary_header *header;
+	struct exception_table_entry *extable;
 	int *addrs;
 	u8 *image;
 	int proglen;
+	u32 jited_len;
+	u32 num_exentries;
+	void __percpu *priv_stack_ptr;
+	bool allocated_priv_stack;
 	struct jit_context ctx;
 };
 
 #define MAX_PASSES 20
 #define PADDING_PASSES (MAX_PASSES - 5)
 
+static void bpf_jit_recompile_clear_stage(struct bpf_prog *prog)
+{
+	prog->aux->jit_recompile_staged = false;
+	prog->aux->jit_recompile_exception_boundary = false;
+	prog->aux->jit_recompile_fp_start = 0;
+	prog->aux->jit_recompile_fp_end = 0;
+	prog->aux->jit_recompile_jited_len = 0;
+	prog->aux->jit_recompile_num_exentries = 0;
+	prog->aux->jit_recompile_bpf_func = NULL;
+	prog->aux->jit_recompile_priv_stack_ptr = NULL;
+	prog->aux->jit_recompile_extable = NULL;
+}
+
+bool bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_staged &&
+	       prog->aux->jit_recompile_bpf_func;
+}
+
+void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_bpf_func;
+}
+
+u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_jited_len;
+}
+
+u32 bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_fp_start;
+}
+
+u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_fp_end;
+}
+
+struct exception_table_entry *
+bpf_jit_recompile_staged_extable(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_extable;
+}
+
+u32 bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_num_exentries;
+}
+
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
 	struct bpf_binary_header *rw_header = NULL;
 	struct bpf_binary_header *header = NULL;
+	struct exception_table_entry *extable = NULL;
 	struct bpf_prog *tmp, *orig_prog = prog;
 	void __percpu *priv_stack_ptr = NULL;
 	struct x64_jit_data *jit_data;
 	int priv_stack_alloc_sz;
 	int proglen, oldproglen = 0;
 	struct jit_context ctx = {};
+	bool allocated_priv_stack = false;
 	bool tmp_blinded = false;
 	bool extra_pass = false;
+	bool keep_staged = false;
+	bool recompile = prog->aux->jit_recompile_active;
 	bool padding = false;
 	u8 *rw_image = NULL;
 	u8 *image = NULL;
@@ -6151,7 +5752,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	if (tmp != prog) {
 		tmp_blinded = true;
 		prog = tmp;
+		recompile = prog->aux->jit_recompile_active;
 	}
+	if (recompile)
+		bpf_jit_recompile_clear_stage(prog);
 
 	jit_data = prog->aux->jit_data;
 	if (!jit_data) {
@@ -6163,6 +5767,24 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		prog->aux->jit_data = jit_data;
 	}
 	priv_stack_ptr = prog->aux->priv_stack_ptr;
+	addrs = jit_data->addrs;
+	if (addrs) {
+		ctx = jit_data->ctx;
+		oldproglen = jit_data->proglen;
+		image = jit_data->image;
+		header = jit_data->header;
+		rw_header = jit_data->rw_header;
+		extable = jit_data->extable;
+		priv_stack_ptr = jit_data->priv_stack_ptr;
+		allocated_priv_stack = jit_data->allocated_priv_stack;
+		if (rw_header)
+			rw_image = (void *)rw_header + ((void *)image -
+							(void *)header);
+		extra_pass = true;
+		padding = true;
+		goto skip_init_addrs;
+	}
+
 	if (!priv_stack_ptr && prog->aux->jits_use_priv_stack) {
 		/* Allocate actual private stack size with verifier-calculated
 		 * stack size plus two memory guards to protect overflow and
@@ -6177,19 +5799,9 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		}
 
 		priv_stack_init_guard(priv_stack_ptr, priv_stack_alloc_sz);
-		prog->aux->priv_stack_ptr = priv_stack_ptr;
-	}
-	addrs = jit_data->addrs;
-	if (addrs) {
-		ctx = jit_data->ctx;
-		oldproglen = jit_data->proglen;
-		image = jit_data->image;
-		header = jit_data->header;
-		rw_header = jit_data->rw_header;
-		rw_image = (void *)rw_header + ((void *)image - (void *)header);
-		extra_pass = true;
-		padding = true;
-		goto skip_init_addrs;
+		if (!recompile)
+			prog->aux->priv_stack_ptr = priv_stack_ptr;
+		allocated_priv_stack = true;
 	}
 	addrs = kvmalloc_objs(*addrs, prog->len + 1);
 	if (!addrs) {
@@ -6217,7 +5829,9 @@ skip_init_addrs:
 	for (pass = 0; pass < MAX_PASSES || image; pass++) {
 		if (!padding && pass >= PADDING_PASSES)
 			padding = true;
-		proglen = do_jit(prog, addrs, image, rw_image, oldproglen, &ctx, padding);
+		proglen = do_jit(prog, addrs, image, rw_image, oldproglen, &ctx,
+				 padding, priv_stack_ptr, extable,
+				 prog->aux->num_exentries);
 		if (proglen <= 0) {
 out_image:
 			image = NULL;
@@ -6228,7 +5842,9 @@ out_image:
 			}
 			/* Fall back to interpreter mode */
 			prog = orig_prog;
-			if (extra_pass) {
+			if (recompile) {
+				bpf_jit_recompile_clear_stage(prog);
+			} else if (extra_pass) {
 				prog->bpf_func = NULL;
 				prog->jited = 0;
 				prog->jited_len = 0;
@@ -6262,7 +5878,9 @@ out_image:
 				prog = orig_prog;
 				goto out_addrs;
 			}
-			prog->aux->extable = (void *) image + roundup(proglen, align);
+			extable = (void *)image + roundup(proglen, align);
+			if (!recompile)
+				prog->aux->extable = extable;
 		}
 		oldproglen = proglen;
 		cond_resched();
@@ -6285,57 +5903,140 @@ out_image:
 				header = NULL;
 				goto out_image;
 			}
+			rw_header = NULL;
 
 			bpf_tail_call_direct_fixup(prog);
-		} else {
+		}
+
+		keep_staged = recompile || (prog->is_func && !extra_pass);
+		if (keep_staged) {
 			jit_data->addrs = addrs;
 			jit_data->ctx = ctx;
 			jit_data->proglen = proglen;
 			jit_data->image = image;
 			jit_data->header = header;
 			jit_data->rw_header = rw_header;
+			jit_data->extable = extable;
+			jit_data->jited_len = proglen - cfi_get_offset();
+			jit_data->num_exentries = prog->aux->num_exentries;
+			jit_data->priv_stack_ptr = priv_stack_ptr;
+			jit_data->allocated_priv_stack = allocated_priv_stack;
 		}
+		if (recompile) {
+			prog->aux->jit_recompile_staged = !prog->is_func || extra_pass;
+			prog->aux->jit_recompile_bpf_func =
+				(void *)image + cfi_get_offset();
+			prog->aux->jit_recompile_jited_len =
+				proglen - cfi_get_offset();
+			prog->aux->jit_recompile_extable = extable;
+			prog->aux->jit_recompile_num_exentries =
+				prog->aux->num_exentries;
+			prog->aux->jit_recompile_priv_stack_ptr = priv_stack_ptr;
+			prog->aux->jit_recompile_exception_boundary =
+				prog->aux->exception_boundary;
+			prog->aux->jit_recompile_fp_start = ctx.fp_start;
+			prog->aux->jit_recompile_fp_end = ctx.fp_end;
+		} else {
+			/*
+			 * The bpf_prog_update_insn_ptrs function expects addrs to
+			 * point to the first byte of the jitted instruction
+			 * (unlike the bpf_prog_fill_jited_linfo below, which, for
+			 * historical reasons, expects to point to the next
+			 * instruction).
+			 */
+			bpf_prog_update_insn_ptrs(prog, addrs, image);
 
-		/*
-		 * The bpf_prog_update_insn_ptrs function expects addrs to
-		 * point to the first byte of the jitted instruction (unlike
-		 * the bpf_prog_fill_jited_linfo below, which, for historical
-		 * reasons, expects to point to the next instruction)
-		 */
-		bpf_prog_update_insn_ptrs(prog, addrs, image);
-
-		/*
-		 * ctx.prog_offset is used when CFI preambles put code *before*
-		 * the function. See emit_cfi(). For FineIBT specifically this code
-		 * can also be executed and bpf_prog_kallsyms_add() will
-		 * generate an additional symbol to cover this, hence also
-		 * decrement proglen.
-		 */
-		prog->bpf_func = (void *)image + cfi_get_offset();
-		prog->jited = 1;
-		prog->jited_len = proglen - cfi_get_offset();
+			/*
+			 * ctx.prog_offset is used when CFI preambles put code
+			 * *before* the function. See emit_cfi(). For FineIBT
+			 * specifically this code can also be executed and
+			 * bpf_prog_kallsyms_add() will generate an additional
+			 * symbol to cover this, hence also decrement proglen.
+			 */
+			prog->aux->ksym.fp_start = ctx.fp_start;
+			prog->aux->ksym.fp_end = ctx.fp_end;
+			prog->bpf_func = (void *)image + cfi_get_offset();
+			prog->jited = 1;
+			prog->jited_len = proglen - cfi_get_offset();
+		}
 	} else {
 		prog = orig_prog;
 	}
 
-	if (!image || !prog->is_func || extra_pass) {
+	if (!keep_staged) {
 		if (image)
 			bpf_prog_fill_jited_linfo(prog, addrs + 1);
 out_addrs:
 		kvfree(addrs);
-		if (!image && priv_stack_ptr) {
+		if (!image && allocated_priv_stack) {
 			free_percpu(priv_stack_ptr);
-			prog->aux->priv_stack_ptr = NULL;
+			if (!recompile)
+				prog->aux->priv_stack_ptr = NULL;
 		}
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;
+		if (recompile)
+			bpf_jit_recompile_clear_stage(prog);
 	}
 out:
 	if (tmp_blinded)
 		bpf_jit_prog_release_other(prog, prog == orig_prog ?
 					   tmp : orig_prog);
 	return prog;
+}
+
+int bpf_jit_recompile_commit(struct bpf_prog *prog)
+{
+	struct x64_jit_data *jit_data = prog->aux->jit_data;
+	bpf_func_t staged_func;
+
+	if (!jit_data || !bpf_jit_recompile_has_staged_image(prog))
+		return -EINVAL;
+
+	bpf_prog_update_insn_ptrs(prog, jit_data->addrs, jit_data->image);
+	bpf_prog_fill_jited_linfo(prog, jit_data->addrs + 1);
+
+	prog->aux->priv_stack_ptr = prog->aux->jit_recompile_priv_stack_ptr;
+	prog->aux->extable = prog->aux->jit_recompile_extable;
+	prog->aux->num_exentries = prog->aux->jit_recompile_num_exentries;
+	prog->aux->exception_boundary =
+		prog->aux->jit_recompile_exception_boundary;
+	prog->aux->ksym.fp_start = prog->aux->jit_recompile_fp_start;
+	prog->aux->ksym.fp_end = prog->aux->jit_recompile_fp_end;
+	prog->jited = 1;
+	prog->jited_len = prog->aux->jit_recompile_jited_len;
+	staged_func = prog->aux->jit_recompile_bpf_func;
+	smp_store_release(&prog->bpf_func, staged_func);
+
+	kvfree(jit_data->addrs);
+	kfree(jit_data);
+	prog->aux->jit_data = NULL;
+	bpf_jit_recompile_clear_stage(prog);
+	return 0;
+}
+
+void bpf_jit_recompile_abort(struct bpf_prog *prog)
+{
+	struct x64_jit_data *jit_data = prog->aux->jit_data;
+
+	if (!jit_data)
+		goto out_clear;
+
+	if (jit_data->header) {
+		if (jit_data->rw_header)
+			bpf_arch_text_copy(&jit_data->header->size,
+					   &jit_data->rw_header->size,
+					   sizeof(jit_data->rw_header->size));
+		bpf_jit_binary_pack_free(jit_data->header, jit_data->rw_header);
+	}
+	kvfree(jit_data->addrs);
+	if (jit_data->allocated_priv_stack)
+		free_percpu(jit_data->priv_stack_ptr);
+	kfree(jit_data);
+	prog->aux->jit_data = NULL;
+out_clear:
+	bpf_jit_recompile_clear_stage(prog);
 }
 
 bool bpf_jit_supports_kfunc_call(void)
@@ -6363,6 +6064,11 @@ bool bpf_jit_supports_percpu_insn(void)
 
 void bpf_jit_free(struct bpf_prog *prog)
 {
+	if (prog->aux->jit_recompile_active ||
+	    prog->aux->jit_recompile_bpf_func ||
+	    prog->aux->jit_recompile_staged)
+		bpf_jit_recompile_abort(prog);
+
 	if (prog->jited) {
 		struct x64_jit_data *jit_data = prog->aux->jit_data;
 		struct bpf_binary_header *hdr;
@@ -6374,6 +6080,10 @@ void bpf_jit_free(struct bpf_prog *prog)
 		 * the program may not be finalized yet. Call finalize here
 		 * before freeing it.
 		 */
+		if (jit_data && prog->aux->jit_recompile_staged) {
+			bpf_jit_recompile_abort(prog);
+			jit_data = NULL;
+		}
 		if (jit_data) {
 			bpf_jit_binary_pack_finalize(jit_data->header,
 						     jit_data->rw_header);

@@ -441,6 +441,8 @@ static void print_prog_header_json(struct bpf_prog_info *info, int fd)
 	}
 	if (info->recursion_misses)
 		jsonw_uint_field(json_wtr, "recursion_misses", info->recursion_misses);
+	if (info->recompile_count)
+		jsonw_uint_field(json_wtr, "recompile_count", info->recompile_count);
 }
 
 static void print_prog_json(struct bpf_prog_info *info, int fd, bool orphaned)
@@ -526,6 +528,8 @@ static void print_prog_header_plain(struct bpf_prog_info *info, int fd)
 		       info->run_time_ns, info->run_cnt);
 	if (info->recursion_misses)
 		printf(" recursion_misses %llu", info->recursion_misses);
+	if (info->recompile_count)
+		printf(" recompile_count %u", info->recompile_count);
 	printf("\n");
 }
 

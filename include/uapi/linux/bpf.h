@@ -1463,8 +1463,13 @@ enum {
 /* ---- BPF JIT policy blob format (v5 only) ---- */
 
 #define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
-#define BPF_JIT_POLICY_VERSION_2	2
-#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_VERSION_2
+/*
+ * The v5 declarative rewrite rules use on-wire policy format version 2.
+ * Keep the legacy _2 alias for existing userspace helpers.
+ */
+#define BPF_JIT_POLICY_FORMAT_VERSION	2
+#define BPF_JIT_POLICY_VERSION_2	BPF_JIT_POLICY_FORMAT_VERSION
+#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_FORMAT_VERSION
 
 /* Architecture IDs for policy blob */
 #define BPF_JIT_ARCH_X86_64		1
@@ -1712,6 +1717,11 @@ struct bpf_jit_rewrite_rule_v2 {
 #define BPF_F_TEST_XDP_LIVE_FRAMES	(1U << 1)
 /* If set, apply CHECKSUM_COMPLETE to skb and validate the checksum */
 #define BPF_F_TEST_SKB_CHECKSUM_COMPLETE	(1U << 2)
+
+/* Flags for BPF_PROG_JIT_RECOMPILE */
+
+/* If set, preserve the current JIT image and policy until recompile succeeds. */
+#define BPF_F_RECOMPILE_ROLLBACK	(1U << 0)
 
 /* type for BPF_ENABLE_STATS */
 enum bpf_stats_type {
@@ -2162,7 +2172,7 @@ union bpf_attr {
 
 	struct { /* struct used by BPF_PROG_JIT_RECOMPILE command */
 		__u32		prog_fd;
-		__s32		policy_fd;	/* sealed memfd with policy blob; 0 = stock re-JIT */
+		__s32		policy_fd;	/* sealed memfd policy; 0 = stock re-JIT */
 		__u32		flags;
 		__u32		log_level;
 		__u32		log_size;
@@ -6943,6 +6953,7 @@ struct bpf_prog_info {
 	__u32 verified_insns;
 	__u32 attach_btf_obj_id;
 	__u32 attach_btf_id;
+	__u32 recompile_count;
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {

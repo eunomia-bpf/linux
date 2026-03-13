@@ -1305,6 +1305,9 @@ struct bpf_ksym {
 	struct list_head	 lnode;
 	struct latch_tree_node	 tnode;
 	bool			 prog;
+	struct bpf_prog		*owner;
+	struct exception_table_entry *extable;
+	u32			 num_exentries;
 	u32			 fp_start;
 	u32			 fp_end;
 };
@@ -1539,6 +1542,12 @@ void bpf_image_ksym_add(struct bpf_ksym *ksym);
 void bpf_image_ksym_del(struct bpf_ksym *ksym);
 void bpf_ksym_add(struct bpf_ksym *ksym);
 void bpf_ksym_del(struct bpf_ksym *ksym);
+void bpf_prog_kallsyms_replace(struct bpf_prog *fp,
+			       struct bpf_ksym *shadow_ksym,
+			       unsigned long new_start, u32 new_len,
+			       struct exception_table_entry *new_extable,
+			       u32 new_num_exentries,
+			       u32 new_fp_start, u32 new_fp_end);
 bool bpf_has_frame_pointer(unsigned long ip);
 int bpf_jit_charge_modmem(u32 size);
 void bpf_jit_uncharge_modmem(u32 size);
@@ -1709,8 +1718,21 @@ struct bpf_prog_aux {
 	struct bpf_prog **func;
 	struct bpf_prog_aux *main_prog_aux;
 	void *jit_data; /* JIT specific data. arch dependent */
-	struct bpf_jit_policy *jit_policy;	/* v5 rewrite rules */
+	bool jit_recompile_active;
+	bool jit_recompile_staged;
+	bool jit_recompile_exception_boundary;
+	u32 jit_recompile_fp_start;
+	u32 jit_recompile_fp_end;
+	u32 jit_recompile_jited_len;
+	u32 jit_recompile_num_exentries;
+	bpf_func_t jit_recompile_bpf_func;
+	void __percpu *jit_recompile_priv_stack_ptr;
+	struct exception_table_entry *jit_recompile_extable;
+	struct mutex jit_recompile_mutex; /* serializes BPF_PROG_JIT_RECOMPILE */
+	struct bpf_jit_policy *jit_policy; /* active JIT rewrite policy */
 	struct bpf_jit_recompile_log *jit_recompile_log;
+	u32 recompile_count; /* successful recompiles, saturated at U32_MAX */
+	u32 jit_recompile_num_applied; /* rules applied in current recompile */
 	struct bpf_jit_poke_descriptor *poke_tab;
 	struct bpf_kfunc_desc_tab *kfunc_tab;
 	struct bpf_kfunc_btf_tab *kfunc_btf_tab;
@@ -1718,6 +1740,7 @@ struct bpf_prog_aux {
 #ifdef CONFIG_FINEIBT
 	struct bpf_ksym ksym_prefix;
 #endif
+	struct bpf_ksym jit_recompile_ksym;
 	struct bpf_ksym ksym;
 	const struct bpf_prog_ops *ops;
 	const struct bpf_struct_ops *st_ops;
@@ -1814,6 +1837,12 @@ struct bpf_prog {
 		DECLARE_FLEX_ARRAY(struct bpf_insn, insnsi);
 	};
 };
+
+/* Shared recompile state is owned by the main program's aux. */
+static inline struct bpf_prog_aux *bpf_prog_main_aux(const struct bpf_prog *prog)
+{
+	return prog->aux->main_prog_aux ?: prog->aux;
+}
 
 struct bpf_array_aux {
 	/* Programs with direct jumps into programs part of this array. */

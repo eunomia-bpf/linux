@@ -3143,6 +3143,7 @@ static bool bpf_stack_walker(void *cookie, u64 ip, u64 sp, u64 bp)
 
 __bpf_kfunc void bpf_throw(u64 cookie)
 {
+	u64 (*exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
 	struct bpf_throw_ctx ctx = {};
 
 	arch_bpf_stack_walk(bpf_stack_walker, &ctx);
@@ -3156,7 +3157,10 @@ __bpf_kfunc void bpf_throw(u64 cookie)
 	 * which skips compiler generated instrumentation to do the same.
 	 */
 	kasan_unpoison_task_stack_below((void *)(long)ctx.sp);
-	ctx.aux->bpf_exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
+	exception_cb = READ_ONCE(ctx.aux->bpf_exception_cb);
+	if (WARN_ON_ONCE(!exception_cb))
+		return;
+	exception_cb(cookie, ctx.sp, ctx.bp, 0, 0);
 	WARN(1, "A call to BPF exception callback should never return\n");
 }
 
