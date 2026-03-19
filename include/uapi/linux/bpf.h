@@ -1463,10 +1463,7 @@ enum {
 /* ---- BPF JIT policy blob format (v5 only) ---- */
 
 #define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
-/*
- * The v5 declarative rewrite rules use on-wire policy format version 2.
- * Keep the legacy _2 alias for existing userspace helpers.
- */
+/* The simplified v5 rewrite rules use on-wire policy format version 2. */
 #define BPF_JIT_POLICY_FORMAT_VERSION	2
 #define BPF_JIT_POLICY_VERSION_2	BPF_JIT_POLICY_FORMAT_VERSION
 #define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_FORMAT_VERSION
@@ -1487,10 +1484,6 @@ struct bpf_jit_policy_hdr {
 	__u16 flags;		/* reserved */
 };
 
-enum bpf_jit_rule_kind {
-	BPF_JIT_RK_PATTERN	= 6,	/* v5 declarative pattern */
-};
-
 enum bpf_jit_canonical_form {
 	BPF_JIT_CF_ROTATE	= 1,	/* maps to ROTATE emitter */
 	BPF_JIT_CF_WIDE_MEM	= 2,	/* maps to WIDE_MEM emitter */
@@ -1505,26 +1498,22 @@ enum bpf_jit_canonical_form {
 /* COND_SELECT native_choice values */
 enum bpf_jit_select_native {
 	BPF_JIT_SEL_CMOVCC	= 1,	/* x86: cmp + cmovcc */
-	BPF_JIT_SEL_BRANCH	= 2,	/* x86: cmp + jcc + mov (stock) */
 };
 
 /* WIDE_MEM native_choice values */
 enum bpf_jit_wide_mem_native {
 	BPF_JIT_WMEM_WIDE_LOAD	= 1,	/* x86: wide mov + extract */
-	BPF_JIT_WMEM_BYTE_LOADS	= 2,	/* stock: multiple byte loads */
 };
 
 /* ROTATE native_choice values */
 enum bpf_jit_rotate_native {
 	BPF_JIT_ROT_ROR		= 1,	/* x86: ror reg, imm */
 	BPF_JIT_ROT_RORX	= 2,	/* x86: rorx reg, reg, imm (BMI2) */
-	BPF_JIT_ROT_SHIFT	= 3,	/* stock: shl+shr+or */
 };
 
 /* ADDR_CALC native_choice values */
 enum bpf_jit_addr_calc_native {
 	BPF_JIT_ACALC_LEA		= 1,	/* x86: lea dst, [base + idx*scale] */
-	BPF_JIT_ACALC_SHIFT_ADD	= 2,	/* stock: mov+shl+add */
 };
 
 /* BITFIELD_EXTRACT native_choice values */
@@ -1544,161 +1533,14 @@ enum bpf_jit_endian_fusion_native {
 
 /* BRANCH_FLIP native_choice values */
 enum bpf_jit_branch_flip_native {
-	BPF_JIT_BFLIP_ORIGINAL	= 1,	/* stock ordering */
 	BPF_JIT_BFLIP_FLIPPED	= 2,	/* inverted jcc, swapped bodies */
-};
-
-/* x86 CPU feature bits for bpf_jit_rewrite_rule_v2.cpu_features_required */
-#define BPF_JIT_X86_CMOV	(1U << 0)
-#define BPF_JIT_X86_BMI2	(1U << 1)
-#define BPF_JIT_X86_MOVBE	(1U << 2)
-
-#define BPF_JIT_MAX_PATTERN_LEN		64
-#define BPF_JIT_MAX_PATTERN_VARS	15
-#define BPF_JIT_MAX_CONSTRAINTS		16
-#define BPF_JIT_MAX_BINDINGS		16
-#define BPF_JIT_MAX_CANONICAL_PARAMS	16
-
-/* bpf_jit_pattern_insn.flags */
-#define BPF_JIT_PATTERN_F_EXPECT_IMM	(1U << 0)
-#define BPF_JIT_PATTERN_F_EXPECT_DST_REG	(1U << 1)
-#define BPF_JIT_PATTERN_F_EXPECT_SRC_REG	(1U << 2)
-#define BPF_JIT_PATTERN_F_EXPECT_OFF	(1U << 3)
-
-enum bpf_jit_pattern_constraint_type {
-	BPF_JIT_CSTR_EQUAL	= 1,
-	BPF_JIT_CSTR_SUM_CONST	= 2,
-	BPF_JIT_CSTR_IMM_RANGE	= 3,
-	BPF_JIT_CSTR_NOT_ZERO	= 4,
-	BPF_JIT_CSTR_MASK_BITS	= 5,
-	BPF_JIT_CSTR_DIFF_CONST	= 6,
-	BPF_JIT_CSTR_NOT_EQUAL	= 7,
-};
-
-struct bpf_jit_pattern_insn {
-	__u8 opcode;		/* exact BPF opcode */
-	__u8 dst_binding;	/* variable ID for dst_reg, 0 = unused */
-	__u8 src_binding;	/* variable ID for src_reg, 0 = unused */
-	__u8 imm_binding;	/* variable ID for imm, 0 = unused */
-	__u8 off_binding;	/* variable ID for off, 0 = unused */
-	__u8 flags;		/* BPF_JIT_PATTERN_F_* */
-	__u8 expected_dst_reg;
-	__u8 expected_src_reg;
-	__s16 expected_off;
-	__s32 expected_imm;
-};
-
-struct bpf_jit_pattern_constraint {
-	__u8 type;		/* enum bpf_jit_pattern_constraint_type */
-	__u8 var_a;		/* 1..BPF_JIT_MAX_PATTERN_VARS */
-	__u8 var_b;		/* optional second variable */
-	__u8 reserved;
-	__s32 constant;
-	__s32 constant_hi;
-	__u32 reserved2;
-};
-
-enum bpf_jit_binding_source_type {
-	BPF_JIT_BIND_SOURCE_REG		= 0,
-	BPF_JIT_BIND_SOURCE_IMM		= 1,
-	BPF_JIT_BIND_SOURCE_CONST	= 2,
-};
-
-enum bpf_jit_rotate_param {
-	BPF_JIT_ROT_PARAM_DST_REG	= 0,
-	BPF_JIT_ROT_PARAM_SRC_REG	= 1,
-	BPF_JIT_ROT_PARAM_AMOUNT	= 2,
-	BPF_JIT_ROT_PARAM_WIDTH		= 3,
-};
-
-enum bpf_jit_wide_mem_param {
-	BPF_JIT_WMEM_PARAM_DST_REG	= 0,
-	BPF_JIT_WMEM_PARAM_BASE_REG	= 1,
-	BPF_JIT_WMEM_PARAM_BASE_OFF	= 2,
-	BPF_JIT_WMEM_PARAM_WIDTH	= 3,
-};
-
-#define BPF_JIT_WMEM_WIDTH_MASK		0xffU
-#define BPF_JIT_WMEM_F_BIG_ENDIAN	(1U << 8)
-
-enum bpf_jit_addr_calc_param {
-	BPF_JIT_ACALC_PARAM_DST_REG	= 0,
-	BPF_JIT_ACALC_PARAM_BASE_REG	= 1,
-	BPF_JIT_ACALC_PARAM_INDEX_REG	= 2,
-	BPF_JIT_ACALC_PARAM_SCALE	= 3,
-};
-
-enum bpf_jit_bitfield_extract_order {
-	BPF_JIT_BFX_ORDER_SHIFT_MASK = 0,
-	BPF_JIT_BFX_ORDER_MASK_SHIFT = 1,
-};
-
-enum bpf_jit_bitfield_extract_param {
-	BPF_JIT_BFX_PARAM_DST_REG	= 0,
-	BPF_JIT_BFX_PARAM_SRC_REG	= 1,
-	BPF_JIT_BFX_PARAM_SHIFT		= 2,
-	BPF_JIT_BFX_PARAM_MASK		= 3,
-	BPF_JIT_BFX_PARAM_WIDTH		= 4,
-	BPF_JIT_BFX_PARAM_ORDER		= 5,
-};
-
-enum bpf_jit_zero_ext_param {
-	BPF_JIT_ZEXT_PARAM_DST_REG	= 0,
-};
-
-enum bpf_jit_endian_fusion_direction {
-	BPF_JIT_ENDIAN_LOAD_SWAP	= 0,
-	BPF_JIT_ENDIAN_SWAP_STORE	= 1,
-};
-
-enum bpf_jit_endian_fusion_param {
-	BPF_JIT_ENDIAN_PARAM_DATA_REG	= 0,
-	BPF_JIT_ENDIAN_PARAM_BASE_REG	= 1,
-	BPF_JIT_ENDIAN_PARAM_OFFSET	= 2,
-	BPF_JIT_ENDIAN_PARAM_WIDTH	= 3,
-	BPF_JIT_ENDIAN_PARAM_DIRECTION	= 4,
-};
-
-enum bpf_jit_branch_flip_param {
-	BPF_JIT_BFLIP_PARAM_COND_OP	= 0,
-	BPF_JIT_BFLIP_PARAM_BODY_A_START = 1,
-	BPF_JIT_BFLIP_PARAM_BODY_A_LEN	= 2,
-	BPF_JIT_BFLIP_PARAM_BODY_B_START = 3,
-	BPF_JIT_BFLIP_PARAM_BODY_B_LEN	= 4,
-	BPF_JIT_BFLIP_PARAM_JOIN_TARGET = 5,
-};
-
-enum bpf_jit_cond_select_param {
-	BPF_JIT_SEL_PARAM_DST_REG	= 0,
-	BPF_JIT_SEL_PARAM_COND_OP	= 1,
-	BPF_JIT_SEL_PARAM_COND_A	= 2,
-	BPF_JIT_SEL_PARAM_COND_B	= 3,
-	BPF_JIT_SEL_PARAM_TRUE_VAL	= 4,
-	BPF_JIT_SEL_PARAM_FALSE_VAL	= 5,
-	BPF_JIT_SEL_PARAM_WIDTH		= 6,
-};
-
-struct bpf_jit_binding {
-	__u8 canonical_param;		/* form-specific enum *_param */
-	__u8 source_var;		/* 1..BPF_JIT_MAX_PATTERN_VARS */
-	__u8 source_type;		/* enum bpf_jit_binding_source_type */
-	__u8 reserved;
-	__s32 inline_const;		/* used when source_type=CONST */
 };
 
 struct bpf_jit_rewrite_rule_v2 {
 	__u32 site_start;		/* BPF instruction offset */
-	__u32 cpu_features_required;	/* BPF_JIT_X86_* bits */
 	__u16 site_len;			/* span length in BPF insns */
-	__u16 rule_kind;		/* BPF_JIT_RK_PATTERN */
 	__u16 canonical_form;		/* enum bpf_jit_canonical_form */
 	__u16 native_choice;		/* which native instruction to use */
-	__u16 priority;			/* higher wins on overlap */
-	__u16 pattern_count;		/* number of bpf_jit_pattern_insn */
-	__u16 constraint_count;		/* number of constraints */
-	__u16 binding_count;		/* number of canonical bindings */
-	__u16 rule_len;			/* header + pattern + constraints + bindings */
-	__u16 reserved;
 };
 
 /* Flags for BPF_PROG_QUERY. */

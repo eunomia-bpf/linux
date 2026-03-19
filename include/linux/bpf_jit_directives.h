@@ -12,12 +12,12 @@
 #ifndef BPF_JIT_MAX_CANONICAL_PARAMS
 #define BPF_JIT_MAX_CANONICAL_PARAMS	16
 #endif
+#ifndef BPF_JIT_MAX_PATTERN_LEN
+#define BPF_JIT_MAX_PATTERN_LEN		64
+#endif
 
 struct bpf_prog;
 struct exception_table_entry;
-struct bpf_jit_pattern_insn;
-struct bpf_jit_pattern_constraint;
-struct bpf_jit_binding;
 
 #define BPF_JIT_REWRITE_F_ACTIVE  (1U << 0)
 
@@ -51,41 +51,111 @@ struct bpf_jit_canonical_params {
 	u8 param_count;
 };
 
+enum bpf_jit_rotate_param {
+	BPF_JIT_ROT_PARAM_DST_REG	= 0,
+	BPF_JIT_ROT_PARAM_SRC_REG	= 1,
+	BPF_JIT_ROT_PARAM_AMOUNT	= 2,
+	BPF_JIT_ROT_PARAM_WIDTH		= 3,
+};
+
+enum bpf_jit_wide_mem_param {
+	BPF_JIT_WMEM_PARAM_DST_REG	= 0,
+	BPF_JIT_WMEM_PARAM_BASE_REG	= 1,
+	BPF_JIT_WMEM_PARAM_BASE_OFF	= 2,
+	BPF_JIT_WMEM_PARAM_WIDTH	= 3,
+};
+
+#define BPF_JIT_WMEM_WIDTH_MASK		0xffU
+#define BPF_JIT_WMEM_F_BIG_ENDIAN	(1U << 8)
+
+enum bpf_jit_addr_calc_param {
+	BPF_JIT_ACALC_PARAM_DST_REG	= 0,
+	BPF_JIT_ACALC_PARAM_BASE_REG	= 1,
+	BPF_JIT_ACALC_PARAM_INDEX_REG	= 2,
+	BPF_JIT_ACALC_PARAM_SCALE	= 3,
+};
+
+enum bpf_jit_bitfield_extract_order {
+	BPF_JIT_BFX_ORDER_SHIFT_MASK = 0,
+	BPF_JIT_BFX_ORDER_MASK_SHIFT = 1,
+};
+
+enum bpf_jit_bitfield_extract_param {
+	BPF_JIT_BFX_PARAM_DST_REG	= 0,
+	BPF_JIT_BFX_PARAM_SRC_REG	= 1,
+	BPF_JIT_BFX_PARAM_SHIFT		= 2,
+	BPF_JIT_BFX_PARAM_MASK		= 3,
+	BPF_JIT_BFX_PARAM_WIDTH		= 4,
+	BPF_JIT_BFX_PARAM_ORDER		= 5,
+};
+
+enum bpf_jit_zero_ext_param {
+	BPF_JIT_ZEXT_PARAM_DST_REG	= 0,
+};
+
+enum bpf_jit_endian_fusion_direction {
+	BPF_JIT_ENDIAN_LOAD_SWAP	= 0,
+	BPF_JIT_ENDIAN_SWAP_STORE	= 1,
+};
+
+enum bpf_jit_endian_fusion_param {
+	BPF_JIT_ENDIAN_PARAM_DATA_REG	= 0,
+	BPF_JIT_ENDIAN_PARAM_BASE_REG	= 1,
+	BPF_JIT_ENDIAN_PARAM_OFFSET	= 2,
+	BPF_JIT_ENDIAN_PARAM_WIDTH	= 3,
+	BPF_JIT_ENDIAN_PARAM_DIRECTION	= 4,
+};
+
+enum bpf_jit_branch_flip_param {
+	BPF_JIT_BFLIP_PARAM_COND_OP	= 0,
+	BPF_JIT_BFLIP_PARAM_BODY_A_START = 1,
+	BPF_JIT_BFLIP_PARAM_BODY_A_LEN	= 2,
+	BPF_JIT_BFLIP_PARAM_BODY_B_START = 3,
+	BPF_JIT_BFLIP_PARAM_BODY_B_LEN	= 4,
+	BPF_JIT_BFLIP_PARAM_JOIN_TARGET = 5,
+};
+
+enum bpf_jit_cond_select_param {
+	BPF_JIT_SEL_PARAM_DST_REG	= 0,
+	BPF_JIT_SEL_PARAM_COND_OP	= 1,
+	BPF_JIT_SEL_PARAM_COND_A	= 2,
+	BPF_JIT_SEL_PARAM_COND_B	= 3,
+	BPF_JIT_SEL_PARAM_TRUE_VAL	= 4,
+	BPF_JIT_SEL_PARAM_FALSE_VAL	= 5,
+	BPF_JIT_SEL_PARAM_WIDTH		= 6,
+};
+
+/*
+ * Kernel-only normalized params populated by canonical-site validators.
+ * These are not user-bindable policy params; they carry validated emitter
+ * inputs that do not fit the public scalar binding model.
+ */
+enum bpf_jit_zero_ext_internal_param {
+	BPF_JIT_ZEXT_PARAM_ALU32_PTR = 1,
+};
+
+enum bpf_jit_branch_flip_internal_param {
+	BPF_JIT_BFLIP_PARAM_SITE_PTR = 6,
+};
+
 /**
  * struct bpf_jit_rule - validated v5 rewrite rule (kernel-internal)
- * @rule_kind:       enum bpf_jit_rule_kind (BPF_JIT_RK_PATTERN only)
- * @canonical_form:  canonical emitter target
- * @native_choice:   requested native emission mode
- * @pattern_count:   pattern length
- * @constraint_count: arithmetic constraint count
- * @binding_count:   canonical binding count
- * @pattern:         inline pattern array stored in policy->blob
- * @constraints:     inline constraint array stored in policy->blob
- * @bindings:        inline canonical binding array stored in policy->blob
- * @params:          extracted canonical parameters for emitters
- * @site_start:      BPF insn offset (in xlated program)
- * @site_len:        how many BPF insns this rule covers
- * @flags:           BPF_JIT_REWRITE_F_*
- * @priority:        higher wins on overlap
+ * @canonical_form: canonical emitter target
+ * @native_choice:  requested native emission mode
+ * @params:         canonical parameters synthesized by per-form validators
+ * @site_start:     BPF insn offset (in xlated program)
+ * @site_len:       how many BPF insns this rule covers
+ * @flags:          BPF_JIT_REWRITE_F_*
+ * @user_index:     original blob order for logging/tie-breaks
  */
 struct bpf_jit_rule {
-	u16 rule_kind;
 	u16 canonical_form;
 	u16 native_choice;
-	u16 pattern_count;
-	u16 constraint_count;
-	u16 binding_count;
-	u16 reserved;
-	const struct bpf_jit_pattern_insn *pattern;
-	const struct bpf_jit_pattern_constraint *constraints;
-	const struct bpf_jit_binding *bindings;
 	struct bpf_jit_canonical_params params;
 	u32 site_start;
 	u16 site_len;
 	u16 flags;
-	u16 priority;
 	u16 user_index;
-	u32 cpu_features_required;
 };
 
 /**

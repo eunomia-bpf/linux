@@ -11,15 +11,11 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
-#include <linux/timekeeping.h>
 #include <linux/uaccess.h>
 #include <uapi/linux/fcntl.h>
 #if defined(CONFIG_X86_64)
 #include <asm/cpufeature.h>
 #endif
-
-#define CREATE_TRACE_POINTS
-#include <trace/events/bpf.h>
 
 #define BPF_JIT_DIRECTIVES_MAX_BLOB_SIZE SZ_512K
 #define BPF_JIT_RECOMPILE_LOG_MAX_SIZE SZ_64K
@@ -56,14 +52,6 @@ struct bpf_jit_recompile_rollback_state {
 	u32 prog_state_cnt;
 };
 
-static struct bpf_prog_aux *bpf_jit_main_aux(const struct bpf_prog *prog)
-{
-	if (!prog || !prog->aux)
-		return NULL;
-
-	return prog->aux->main_prog_aux ? prog->aux->main_prog_aux : prog->aux;
-}
-
 static struct bpf_jit_recompile_log *
 bpf_jit_recompile_log_ctx(const struct bpf_prog *prog)
 {
@@ -72,7 +60,7 @@ bpf_jit_recompile_log_ctx(const struct bpf_prog *prog)
 	if (!prog || !prog->aux)
 		return NULL;
 
-	main_aux = bpf_jit_main_aux(prog);
+	main_aux = bpf_prog_main_aux(prog);
 	return main_aux->jit_recompile_log;
 }
 
@@ -203,17 +191,13 @@ void bpf_jit_recompile_note_rule(const struct bpf_prog *prog,
 				 const struct bpf_jit_rule *rule,
 				 bool applied)
 {
-	struct bpf_prog_aux *main_aux = bpf_jit_main_aux(prog);
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 
 	if (!main_aux || !rule)
 		return;
 
 	if (applied)
 		main_aux->jit_recompile_num_applied++;
-
-	trace_bpf_jit_recompile_rule(main_aux->id, rule->site_start,
-				     rule->canonical_form,
-				     rule->native_choice, applied);
 }
 
 static void
@@ -234,20 +218,6 @@ bpf_jit_recompile_save_prog_state(struct bpf_jit_recompile_prog_state *state,
 				     array_size(prog->len,
 						sizeof(*prog->insnsi)),
 				     GFP_KERNEL_ACCOUNT);
-}
-
-static void bpf_jit_recompile_reset_prog_aux(struct bpf_prog *prog)
-{
-	prog->aux->jit_recompile_active = false;
-	prog->aux->jit_recompile_staged = false;
-	prog->aux->jit_recompile_exception_boundary = false;
-	prog->aux->jit_recompile_fp_start = 0;
-	prog->aux->jit_recompile_fp_end = 0;
-	prog->aux->jit_recompile_jited_len = 0;
-	prog->aux->jit_recompile_num_exentries = 0;
-	prog->aux->jit_recompile_bpf_func = NULL;
-	prog->aux->jit_recompile_priv_stack_ptr = NULL;
-	prog->aux->jit_recompile_extable = NULL;
 }
 
 static void
@@ -294,7 +264,7 @@ static int
 bpf_jit_recompile_snapshot(struct bpf_prog *prog,
 			   struct bpf_jit_recompile_rollback_state *state)
 {
-	struct bpf_prog_aux *main_aux = bpf_jit_main_aux(prog);
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 	u32 real_func_cnt = main_aux->real_func_cnt ? : main_aux->func_cnt;
 	u32 cnt = 1;
 	u32 i = 0;
@@ -438,7 +408,7 @@ static void bpf_jit_recompile_shadow_ksym_del(struct bpf_prog *prog)
 static struct bpf_prog *
 bpf_jit_recompile_image_prog(struct bpf_prog *prog, u32 idx)
 {
-	struct bpf_prog_aux *main_aux = bpf_jit_main_aux(prog);
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 
 	if (main_aux->func_cnt && main_aux->func)
 		return main_aux->func[idx];
@@ -449,13 +419,14 @@ bpf_jit_recompile_image_prog(struct bpf_prog *prog, u32 idx)
 static struct bpf_prog *
 bpf_jit_recompile_ksym_prog(struct bpf_prog *prog, u32 idx)
 {
-	struct bpf_prog_aux *main_aux = bpf_jit_main_aux(prog);
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
+	u32 real_func_cnt = bpf_jit_recompile_real_func_cnt(main_aux);
 
 	if (!(main_aux->func_cnt && main_aux->func))
 		return prog;
 	if (!idx)
 		return prog;
-	if (idx < main_aux->func_cnt)
+	if (idx < real_func_cnt)
 		return main_aux->func[idx];
 
 	return NULL;
@@ -617,35 +588,30 @@ static int rule_cmp(const void *a, const void *b)
 		return -1;
 	if (ra->site_start > rb->site_start)
 		return 1;
-	/* Higher priority first on tie */
-	if (ra->priority > rb->priority)
+	if (ra->user_index < rb->user_index)
 		return -1;
-	if (ra->priority < rb->priority)
+	if (ra->user_index > rb->user_index)
 		return 1;
 	return 0;
 }
 
 static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
 {
-	return rule->rule_kind == BPF_JIT_RK_PATTERN ? rule->canonical_form : 0;
+	return rule->canonical_form;
 }
 
 static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 {
 	switch (form) {
 	case BPF_JIT_CF_COND_SELECT:
-		return native_choice == BPF_JIT_SEL_CMOVCC ||
-		       native_choice == BPF_JIT_SEL_BRANCH;
+		return native_choice == BPF_JIT_SEL_CMOVCC;
 	case BPF_JIT_CF_WIDE_MEM:
-		return native_choice == BPF_JIT_WMEM_WIDE_LOAD ||
-		       native_choice == BPF_JIT_WMEM_BYTE_LOADS;
+		return native_choice == BPF_JIT_WMEM_WIDE_LOAD;
 	case BPF_JIT_CF_ROTATE:
 		return native_choice == BPF_JIT_ROT_ROR ||
-		       native_choice == BPF_JIT_ROT_RORX ||
-		       native_choice == BPF_JIT_ROT_SHIFT;
+		       native_choice == BPF_JIT_ROT_RORX;
 	case BPF_JIT_CF_ADDR_CALC:
-		return native_choice == BPF_JIT_ACALC_LEA ||
-		       native_choice == BPF_JIT_ACALC_SHIFT_ADD;
+		return native_choice == BPF_JIT_ACALC_LEA;
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		return native_choice == BPF_JIT_BFX_EXTRACT;
 	case BPF_JIT_CF_ZERO_EXT_ELIDE:
@@ -653,8 +619,7 @@ static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
 	case BPF_JIT_CF_ENDIAN_FUSION:
 		return native_choice == BPF_JIT_ENDIAN_MOVBE;
 	case BPF_JIT_CF_BRANCH_FLIP:
-		return native_choice == BPF_JIT_BFLIP_ORIGINAL ||
-		       native_choice == BPF_JIT_BFLIP_FLIPPED;
+		return native_choice == BPF_JIT_BFLIP_FLIPPED;
 	default:
 		return false;
 	}
@@ -703,20 +668,6 @@ static bool bpf_jit_site_range_valid(u32 site_start, u32 site_len,
 		*site_end = end;
 
 	return true;
-}
-
-static u32 bpf_jit_cpu_features_for_native_choice(u16 form, u16 native_choice)
-{
-	switch (form) {
-	case BPF_JIT_CF_COND_SELECT:
-		return native_choice == BPF_JIT_SEL_CMOVCC ? BPF_JIT_X86_CMOV : 0;
-	case BPF_JIT_CF_ROTATE:
-		return native_choice == BPF_JIT_ROT_RORX ? BPF_JIT_X86_BMI2 : 0;
-	case BPF_JIT_CF_ENDIAN_FUSION:
-		return native_choice == BPF_JIT_ENDIAN_MOVBE ? BPF_JIT_X86_MOVBE : 0;
-	default:
-		return 0;
-	}
 }
 
 /**
@@ -785,42 +736,6 @@ static bool bpf_jit_has_interior_edge(const struct bpf_insn *insns,
 	return false;
 }
 
-/**
- * bpf_jit_validate_cond_select_rule - validate a COND_SELECT rule against prog
- *
- * Check that the BPF insn sequence at site_start matches either a diamond
- * (jcc+2, mov, ja+1, mov) or compact (mov, jcc+1, mov) shape, and that no
- * jump from outside the pattern targets an interior instruction (which would
- * corrupt addrs[] after the cmov transformation).
- */
-static bool
-bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
-				      u32 insn_cnt,
-				      const struct bpf_jit_rule *rule)
-{
-	u32 idx = rule->site_start;
-	bool shape_ok;
-
-	if (rule->site_len == 4) {
-		/* Diamond: jcc+2, mov_false, ja+1, mov_true */
-		shape_ok = bpf_jit_cmov_select_match_diamond(insns, insn_cnt, idx);
-	} else if (rule->site_len == 3) {
-		/* Compact: mov_default, jcc+1, mov_override
-		 * The match function expects idx pointing at the jcc,
-		 * so idx+1 is the jcc in a compact form where site_start
-		 * is the mov_default.
-		 */
-		shape_ok = bpf_jit_cmov_select_match_compact(insns, insn_cnt, idx + 1);
-	} else {
-		return false;
-	}
-
-	if (!shape_ok)
-		return false;
-
-	return true;
-}
-
 struct bpf_jit_wide_mem_shape {
 	u8 dst_reg;
 	u8 base_reg;
@@ -829,12 +744,213 @@ struct bpf_jit_wide_mem_shape {
 	bool big_endian;
 };
 
+struct bpf_jit_cond_select_shape {
+	u8 dst_reg;
+	u8 cond_op;
+	u8 cond_a;
+	struct bpf_jit_binding_value cond_b;
+	struct bpf_jit_binding_value true_val;
+	struct bpf_jit_binding_value false_val;
+	u8 width;
+};
+
+static void bpf_jit_param_set_reg(
+	struct bpf_jit_canonical_params *params, u8 param, u8 reg)
+{
+	params->params[param].type = BPF_JIT_BIND_VAL_REG;
+	params->params[param].value = reg;
+	params->present_mask |= 1U << param;
+	if (params->param_count <= param)
+		params->param_count = param + 1;
+}
+
+static void bpf_jit_param_set_imm(
+	struct bpf_jit_canonical_params *params, u8 param, s64 imm)
+{
+	params->params[param].type = BPF_JIT_BIND_VAL_IMM;
+	params->params[param].value = imm;
+	params->present_mask |= 1U << param;
+	if (params->param_count <= param)
+		params->param_count = param + 1;
+}
+
+static void bpf_jit_param_set_ptr(struct bpf_jit_canonical_params *params,
+				  u8 param, const void *ptr)
+{
+	bpf_jit_param_set_imm(params, param, (long)ptr);
+}
+
+static void bpf_jit_param_set_value(
+	struct bpf_jit_canonical_params *params, u8 param,
+	const struct bpf_jit_binding_value *value)
+{
+	if (value->type == BPF_JIT_BIND_VAL_REG)
+		bpf_jit_param_set_reg(params, param, value->value);
+	else
+		bpf_jit_param_set_imm(params, param, value->value);
+}
+
+static void bpf_jit_cond_select_get_mov_value(
+	const struct bpf_insn *mov_insn,
+	struct bpf_jit_binding_value *value)
+{
+	if (BPF_SRC(mov_insn->code) == BPF_X) {
+		value->type = BPF_JIT_BIND_VAL_REG;
+		value->value = mov_insn->src_reg;
+	} else {
+		value->type = BPF_JIT_BIND_VAL_IMM;
+		value->value = mov_insn->imm;
+	}
+}
+
+static bool bpf_jit_cmov_select_match_guarded_update(const struct bpf_insn *insns,
+						     u32 insn_cnt, u32 idx)
+{
+	const struct bpf_insn *jmp_insn, *update_insn;
+	u8 mov_cls;
+
+	if (idx + 1 >= insn_cnt)
+		return false;
+
+	jmp_insn = &insns[idx];
+	update_insn = &insns[idx + 1];
+
+	if (!bpf_jit_is_cmov_cond_jump(jmp_insn) ||
+	    bpf_jmp_offset((struct bpf_insn *)jmp_insn) != 1)
+		return false;
+	if (!bpf_jit_is_simple_mov(update_insn))
+		return false;
+
+	mov_cls = BPF_CLASS(update_insn->code);
+	if (BPF_CLASS(jmp_insn->code) == BPF_JMP)
+		return mov_cls == BPF_ALU64;
+
+	return mov_cls == BPF_ALU;
+}
+
+static bool bpf_jit_parse_cond_select_shape(
+	const struct bpf_insn *insns,
+	u32 insn_cnt,
+	const struct bpf_jit_rule *rule,
+	struct bpf_jit_cond_select_shape *shape)
+{
+	u32 idx = rule->site_start;
+	const struct bpf_insn *jmp_insn, *true_insn, *false_insn;
+
+	if (!shape || !bpf_jit_site_range_valid(idx, rule->site_len, insn_cnt, NULL))
+		return false;
+
+	switch (rule->site_len) {
+	case 2:
+		if (!bpf_jit_cmov_select_match_guarded_update(insns, insn_cnt, idx))
+			return false;
+
+		jmp_insn = &insns[idx];
+		false_insn = &insns[idx + 1];
+		shape->dst_reg = false_insn->dst_reg;
+		shape->cond_op = BPF_OP(jmp_insn->code);
+		shape->cond_a = jmp_insn->dst_reg;
+		shape->cond_b.type = BPF_SRC(jmp_insn->code) == BPF_X ?
+			BPF_JIT_BIND_VAL_REG : BPF_JIT_BIND_VAL_IMM;
+		shape->cond_b.value = BPF_SRC(jmp_insn->code) == BPF_X ?
+			jmp_insn->src_reg : jmp_insn->imm;
+		shape->true_val.type = BPF_JIT_BIND_VAL_REG;
+		shape->true_val.value = false_insn->dst_reg;
+		bpf_jit_cond_select_get_mov_value(false_insn, &shape->false_val);
+		shape->width = BPF_CLASS(false_insn->code) == BPF_ALU64 ? 64 : 32;
+		return true;
+
+	case 3:
+		/* Compact: mov_default, jcc+1, mov_override. */
+		if (!bpf_jit_cmov_select_match_compact(insns, insn_cnt, idx + 1))
+			return false;
+
+		true_insn = &insns[idx];
+		jmp_insn = &insns[idx + 1];
+		false_insn = &insns[idx + 2];
+		break;
+
+	case 4:
+		/* Diamond: jcc+2, mov_false, ja+1, mov_true. */
+		if (!bpf_jit_cmov_select_match_diamond(insns, insn_cnt, idx))
+			return false;
+
+		jmp_insn = &insns[idx];
+		false_insn = &insns[idx + 1];
+		true_insn = &insns[idx + 3];
+		break;
+
+	default:
+		return false;
+	}
+
+	shape->dst_reg = true_insn->dst_reg;
+	shape->cond_op = BPF_OP(jmp_insn->code);
+	shape->cond_a = jmp_insn->dst_reg;
+	shape->cond_b.type = BPF_SRC(jmp_insn->code) == BPF_X ?
+		BPF_JIT_BIND_VAL_REG : BPF_JIT_BIND_VAL_IMM;
+	shape->cond_b.value = BPF_SRC(jmp_insn->code) == BPF_X ?
+		jmp_insn->src_reg : jmp_insn->imm;
+	bpf_jit_cond_select_get_mov_value(true_insn, &shape->true_val);
+	bpf_jit_cond_select_get_mov_value(false_insn, &shape->false_val);
+	shape->width = BPF_CLASS(true_insn->code) == BPF_ALU64 ? 64 : 32;
+
+	return true;
+}
+
+static void bpf_jit_cond_select_fill_params(
+	struct bpf_jit_canonical_params *params,
+	const struct bpf_jit_cond_select_shape *shape)
+{
+	memset(params, 0, sizeof(*params));
+	bpf_jit_param_set_reg(params, BPF_JIT_SEL_PARAM_DST_REG,
+			      shape->dst_reg);
+	bpf_jit_param_set_imm(params, BPF_JIT_SEL_PARAM_COND_OP,
+			      shape->cond_op);
+	bpf_jit_param_set_reg(params, BPF_JIT_SEL_PARAM_COND_A,
+			      shape->cond_a);
+	bpf_jit_param_set_value(params, BPF_JIT_SEL_PARAM_COND_B,
+				&shape->cond_b);
+	bpf_jit_param_set_value(params, BPF_JIT_SEL_PARAM_TRUE_VAL,
+				&shape->true_val);
+	bpf_jit_param_set_value(params, BPF_JIT_SEL_PARAM_FALSE_VAL,
+				&shape->false_val);
+	bpf_jit_param_set_imm(params, BPF_JIT_SEL_PARAM_WIDTH,
+			      shape->width);
+}
+
+/**
+ * bpf_jit_validate_cond_select_rule - validate a COND_SELECT rule against prog
+ *
+ * Accept the exact BPF shapes that x86 can lower today:
+ *   - site_len=2: guarded update (jcc+1, mov dst, src/imm)
+ *   - site_len=3: compact select (mov_default, jcc+1, mov_override)
+ *   - site_len=4: diamond select (jcc+2, mov_false, ja+1, mov_true)
+ *
+ * On success, normalize rule params from the actual site so emitters can
+ * consume a complete canonical description without trusting user bindings.
+ */
 static bool
-bpf_jit_param_matches_reg(const struct bpf_jit_canonical_params *params,
-			  u8 param, u8 expected);
-static bool
-bpf_jit_param_matches_imm(const struct bpf_jit_canonical_params *params,
-			  u8 param, s64 expected);
+bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
+				      u32 insn_cnt,
+				      const struct bpf_jit_rule *rule,
+				      struct bpf_jit_canonical_params *params)
+{
+	struct bpf_jit_cond_select_shape shape;
+
+#if defined(CONFIG_X86_64)
+	if (rule->native_choice == BPF_JIT_SEL_CMOVCC &&
+	    !boot_cpu_has(X86_FEATURE_CMOV))
+		return false;
+#endif
+	if (!bpf_jit_parse_cond_select_shape(insns, insn_cnt, rule, &shape))
+		return false;
+
+	if (params)
+		bpf_jit_cond_select_fill_params(params, &shape);
+
+	return true;
+}
 
 static bool bpf_jit_parse_wide_mem_shape(const struct bpf_insn *insns,
 					 u32 insn_cnt, u32 idx,
@@ -964,13 +1080,11 @@ static bool
 bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 			       u32 insn_cnt,
 			       const struct bpf_jit_rule *rule,
-			       const struct bpf_jit_canonical_params *params)
+			       struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_wide_mem_shape shape;
 	s64 encoded_width;
 
-	if (!params)
-		return false;
 	if (!bpf_jit_parse_wide_mem_shape(insns, insn_cnt, rule->site_start,
 					  rule->site_len, &shape))
 		return false;
@@ -979,15 +1093,18 @@ bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 			(shape.big_endian ? BPF_JIT_WMEM_F_BIG_ENDIAN : 0);
 	if (rule->site_len != 3 * shape.width - 2)
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_WMEM_PARAM_DST_REG,
-				       shape.dst_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG,
-				       shape.base_reg) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_WMEM_PARAM_BASE_OFF,
-				       shape.base_off) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_WMEM_PARAM_WIDTH,
-				       encoded_width))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_WMEM_PARAM_DST_REG,
+				      shape.dst_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG,
+				      shape.base_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_WMEM_PARAM_BASE_OFF,
+				      shape.base_off);
+		bpf_jit_param_set_imm(params, BPF_JIT_WMEM_PARAM_WIDTH,
+				      encoded_width);
+	}
 
 	return true;
 }
@@ -1485,14 +1602,16 @@ static bool
 bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 			     u32 insn_cnt,
 			     const struct bpf_jit_rule *rule,
-			     const struct bpf_jit_canonical_params *params)
+			     struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_rotate_shape shape;
 	bool shape_ok;
 
-	if (!params)
+#if defined(CONFIG_X86_64)
+	if (rule->native_choice == BPF_JIT_ROT_RORX &&
+	    !boot_cpu_has(X86_FEATURE_BMI2))
 		return false;
-
+#endif
 	if (rule->site_len == 4)
 		shape_ok = bpf_jit_parse_rotate_4insn(insns, insn_cnt,
 						      rule->site_start, &shape);
@@ -1511,15 +1630,18 @@ bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 
 	if (!shape_ok)
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_ROT_PARAM_DST_REG,
-				       shape.dst_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_ROT_PARAM_SRC_REG,
-				       shape.src_reg) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ROT_PARAM_AMOUNT,
-				       shape.amount) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ROT_PARAM_WIDTH,
-				       shape.width))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_ROT_PARAM_DST_REG,
+				      shape.dst_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_ROT_PARAM_SRC_REG,
+				      shape.src_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_ROT_PARAM_AMOUNT,
+				      shape.amount);
+		bpf_jit_param_set_imm(params, BPF_JIT_ROT_PARAM_WIDTH,
+				      shape.width);
+	}
 
 	return true;
 }
@@ -1629,29 +1751,29 @@ static bool
 bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
 				       u32 insn_cnt,
 				       const struct bpf_jit_rule *rule,
-				       const struct bpf_jit_canonical_params *params)
+				       struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_bitfield_extract_desc desc;
 
-	if (!params)
-		return false;
 	if (!bpf_jit_parse_bitfield_extract_site(insns, insn_cnt, rule, &desc))
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_BFX_PARAM_DST_REG,
-				       desc.dst_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_BFX_PARAM_SRC_REG,
-				       desc.src_reg) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_BFX_PARAM_SHIFT,
-				       desc.shift) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_BFX_PARAM_MASK,
-				       desc.mask) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_BFX_PARAM_WIDTH,
-				       desc.width) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_BFX_PARAM_ORDER,
-				       desc.mask_first ?
-				       BPF_JIT_BFX_ORDER_MASK_SHIFT :
-				       BPF_JIT_BFX_ORDER_SHIFT_MASK))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_BFX_PARAM_DST_REG,
+				      desc.dst_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_BFX_PARAM_SRC_REG,
+				      desc.src_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_SHIFT,
+				      desc.shift);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_MASK, desc.mask);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_WIDTH,
+				      desc.width);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_ORDER,
+				      desc.mask_first ?
+				      BPF_JIT_BFX_ORDER_MASK_SHIFT :
+				      BPF_JIT_BFX_ORDER_SHIFT_MASK);
+	}
 
 	return true;
 }
@@ -1727,23 +1849,24 @@ static bool
 bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
 				u32 insn_cnt,
 				const struct bpf_jit_rule *rule,
-				const struct bpf_jit_canonical_params *params)
+				struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_addr_calc_shape shape;
 
-	if (!params)
-		return false;
 	if (!bpf_jit_parse_addr_calc_shape(insns, insn_cnt, rule, &shape))
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_ACALC_PARAM_DST_REG,
-				       shape.dst_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_ACALC_PARAM_BASE_REG,
-				       shape.base_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_ACALC_PARAM_INDEX_REG,
-				       shape.index_reg) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ACALC_PARAM_SCALE,
-				       shape.scale))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_ACALC_PARAM_DST_REG,
+				      shape.dst_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_ACALC_PARAM_BASE_REG,
+				      shape.base_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_ACALC_PARAM_INDEX_REG,
+				      shape.index_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_ACALC_PARAM_SCALE,
+				      shape.scale);
+	}
 
 	return true;
 }
@@ -1776,32 +1899,57 @@ static bool bpf_jit_zero_ext_elide_is_tail(const struct bpf_insn *insn, u8 dst_r
 	return false;
 }
 
-static bool
-bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
-				     u32 insn_cnt,
-				     const struct bpf_jit_rule *rule,
-				     const struct bpf_jit_canonical_params *params)
+struct bpf_jit_zero_ext_elide_shape {
+	u8 dst_reg;
+	const struct bpf_insn *alu32_insn;
+};
+
+static bool bpf_jit_parse_zero_ext_elide_shape(
+	const struct bpf_insn *insns,
+	u32 insn_cnt,
+	const struct bpf_jit_rule *rule,
+	struct bpf_jit_zero_ext_elide_shape *shape)
 {
 	const struct bpf_insn *alu32_insn;
 	const struct bpf_insn *zext_insn;
 	u32 idx = rule->site_start;
 
-	if (!params)
-		return false;
 	if (rule->site_len != 2 || idx + 2 > insn_cnt)
 		return false;
 
 	alu32_insn = &insns[idx];
 	zext_insn = &insns[idx + 1];
-
-	if (!bpf_jit_zero_ext_elide_is_alu32(alu32_insn))
+	if (!bpf_jit_zero_ext_elide_is_alu32(alu32_insn) ||
+	    !bpf_jit_zero_ext_elide_is_tail(zext_insn, alu32_insn->dst_reg))
 		return false;
 
-	if (!bpf_jit_zero_ext_elide_is_tail(zext_insn, alu32_insn->dst_reg))
+	if (shape) {
+		shape->dst_reg = alu32_insn->dst_reg;
+		shape->alu32_insn = alu32_insn;
+	}
+
+	return true;
+}
+
+static bool
+bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
+				     u32 insn_cnt,
+				     const struct bpf_jit_rule *rule,
+				     struct bpf_jit_canonical_params *params)
+{
+	struct bpf_jit_zero_ext_elide_shape shape;
+
+	if (!bpf_jit_parse_zero_ext_elide_shape(insns, insn_cnt, rule, &shape))
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG,
-				       alu32_insn->dst_reg))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG,
+				      shape.dst_reg);
+		bpf_jit_param_set_ptr(params, BPF_JIT_ZEXT_PARAM_ALU32_PTR,
+				      shape.alu32_insn);
+	}
+
 	return true;
 }
 
@@ -1901,25 +2049,32 @@ static bool
 bpf_jit_validate_endian_fusion_rule(const struct bpf_insn *insns,
 				    u32 insn_cnt,
 				    const struct bpf_jit_rule *rule,
-				    const struct bpf_jit_canonical_params *params)
+				    struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_endian_fusion_shape shape;
 
-	if (!params)
+#if defined(CONFIG_X86_64)
+	if (rule->native_choice == BPF_JIT_ENDIAN_MOVBE &&
+	    !boot_cpu_has(X86_FEATURE_MOVBE))
 		return false;
+#endif
 	if (!bpf_jit_parse_endian_fusion_shape(insns, insn_cnt, rule, &shape))
 		return false;
-	if (!bpf_jit_param_matches_reg(params, BPF_JIT_ENDIAN_PARAM_DATA_REG,
-				       shape.data_reg) ||
-	    !bpf_jit_param_matches_reg(params, BPF_JIT_ENDIAN_PARAM_BASE_REG,
-				       shape.base_reg) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ENDIAN_PARAM_OFFSET,
-				       shape.offset) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ENDIAN_PARAM_WIDTH,
-				       shape.width) ||
-	    !bpf_jit_param_matches_imm(params, BPF_JIT_ENDIAN_PARAM_DIRECTION,
-				       shape.direction))
-		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_reg(params, BPF_JIT_ENDIAN_PARAM_DATA_REG,
+				      shape.data_reg);
+		bpf_jit_param_set_reg(params, BPF_JIT_ENDIAN_PARAM_BASE_REG,
+				      shape.base_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_ENDIAN_PARAM_OFFSET,
+				      shape.offset);
+		bpf_jit_param_set_imm(params, BPF_JIT_ENDIAN_PARAM_WIDTH,
+				      shape.width);
+		bpf_jit_param_set_imm(params, BPF_JIT_ENDIAN_PARAM_DIRECTION,
+				      shape.direction);
+	}
+
 	return true;
 }
 
@@ -1947,90 +2102,109 @@ static bool bpf_jit_branch_flip_body_linear(const struct bpf_insn *insns,
 	return true;
 }
 
-static bool
-bpf_jit_validate_branch_flip_rule(const struct bpf_insn *insns,
-				  u32 insn_cnt,
-				  const struct bpf_jit_rule *rule,
-				  const struct bpf_jit_canonical_params *params)
+static bool bpf_jit_branch_flip_cond_op_valid(u8 op);
+
+struct bpf_jit_branch_flip_shape {
+	u8 cond_op;
+	u32 body_a_start;
+	u32 body_a_len;
+	u32 body_b_start;
+	u32 body_b_len;
+	u32 join_target;
+	const struct bpf_insn *site_insns;
+};
+
+static bool bpf_jit_parse_branch_flip_shape(
+	const struct bpf_insn *insns,
+	u32 insn_cnt,
+	const struct bpf_jit_rule *rule,
+	struct bpf_jit_branch_flip_shape *shape)
 {
 	const struct bpf_insn *jcc;
 	const struct bpf_insn *ja_insn;
-	s64 cond_op, body_a_start, body_a_len, body_b_start, body_b_len, join_target;
 	u32 idx = rule->site_start;
+	u32 body_a_start, body_b_start, body_a_len, body_b_len, join_target;
 	u32 ja_idx;
-	s32 expected_body_b_start;
-	s32 expected_join;
-	const u32 required_mask =
-		(1U << BPF_JIT_BFLIP_PARAM_COND_OP) |
-		(1U << BPF_JIT_BFLIP_PARAM_BODY_A_START) |
-		(1U << BPF_JIT_BFLIP_PARAM_BODY_A_LEN) |
-		(1U << BPF_JIT_BFLIP_PARAM_BODY_B_START) |
-		(1U << BPF_JIT_BFLIP_PARAM_BODY_B_LEN) |
-		(1U << BPF_JIT_BFLIP_PARAM_JOIN_TARGET);
-
-	if (!params || (params->present_mask & required_mask) != required_mask)
-		return false;
-	if (params->params[BPF_JIT_BFLIP_PARAM_COND_OP].type != BPF_JIT_BIND_VAL_IMM ||
-	    params->params[BPF_JIT_BFLIP_PARAM_BODY_A_START].type != BPF_JIT_BIND_VAL_IMM ||
-	    params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].type != BPF_JIT_BIND_VAL_IMM ||
-	    params->params[BPF_JIT_BFLIP_PARAM_BODY_B_START].type != BPF_JIT_BIND_VAL_IMM ||
-	    params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].type != BPF_JIT_BIND_VAL_IMM ||
-	    params->params[BPF_JIT_BFLIP_PARAM_JOIN_TARGET].type != BPF_JIT_BIND_VAL_IMM)
-		return false;
-
-	cond_op = params->params[BPF_JIT_BFLIP_PARAM_COND_OP].value;
-	body_a_start = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_START].value;
-	body_a_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
-	body_b_start = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_START].value;
-	body_b_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
-	join_target = params->params[BPF_JIT_BFLIP_PARAM_JOIN_TARGET].value;
 
 	if (rule->site_len < 4 || idx + rule->site_len > insn_cnt)
-		return false;
-	if (body_a_len < 1 || body_a_len > 16 || body_b_len < 1 || body_b_len > 16)
 		return false;
 
 	jcc = &insns[idx];
 	if ((BPF_CLASS(jcc->code) != BPF_JMP && BPF_CLASS(jcc->code) != BPF_JMP32) ||
-	    (BPF_OP(jcc->code) != BPF_JEQ &&
-	     BPF_OP(jcc->code) != BPF_JNE &&
-	     BPF_OP(jcc->code) != BPF_JGT &&
-	     BPF_OP(jcc->code) != BPF_JLT &&
-	     BPF_OP(jcc->code) != BPF_JGE &&
-	     BPF_OP(jcc->code) != BPF_JLE &&
-	     BPF_OP(jcc->code) != BPF_JSGT &&
-	     BPF_OP(jcc->code) != BPF_JSLT &&
-	     BPF_OP(jcc->code) != BPF_JSGE &&
-	     BPF_OP(jcc->code) != BPF_JSLE &&
-	     BPF_OP(jcc->code) != BPF_JSET))
-		return false;
-	if (cond_op != BPF_OP(jcc->code))
+	    !bpf_jit_branch_flip_cond_op_valid(BPF_OP(jcc->code)))
 		return false;
 
-	expected_body_b_start = (s32)idx + 1 + jcc->off;
-	ja_idx = idx + 1 + (u32)body_a_len;
-	if (ja_idx >= insn_cnt)
+	body_a_start = idx + 1;
+	body_b_start = body_a_start + jcc->off;
+	if (body_b_start <= body_a_start || body_b_start > insn_cnt)
+		return false;
+
+	ja_idx = body_b_start - 1;
+	if (ja_idx <= idx || ja_idx >= insn_cnt)
 		return false;
 	ja_insn = &insns[ja_idx];
 	if (ja_insn->code != (BPF_JMP | BPF_JA))
 		return false;
 
-	expected_join = (s32)ja_idx + 1 + ja_insn->off;
-	if (body_a_start != (s64)(idx + 1) ||
-	    body_b_start != expected_body_b_start ||
-	    join_target != expected_join ||
-	    join_target != (s64)(idx + rule->site_len))
-		return false;
-	if (body_a_start + body_a_len + 1 != body_b_start)
-		return false;
-	if (body_b_start + body_b_len != join_target)
+	body_a_len = ja_idx - body_a_start;
+	if (!body_a_len || body_a_len > 16)
 		return false;
 
-	if (!bpf_jit_branch_flip_body_linear(insns, (u32)body_a_start,
-					     (u32)body_a_len) ||
-	    !bpf_jit_branch_flip_body_linear(insns, (u32)body_b_start,
-					     (u32)body_b_len))
+	join_target = ja_idx + 1 + ja_insn->off;
+	if (join_target <= body_b_start || join_target > insn_cnt)
 		return false;
+	body_b_len = join_target - body_b_start;
+	if (!body_b_len || body_b_len > 16)
+		return false;
+
+	if (join_target != idx + rule->site_len)
+		return false;
+	if (!bpf_jit_branch_flip_body_linear(insns, body_a_start, body_a_len) ||
+	    !bpf_jit_branch_flip_body_linear(insns, body_b_start, body_b_len))
+		return false;
+
+	if (shape) {
+		shape->cond_op = BPF_OP(jcc->code);
+		shape->body_a_start = body_a_start;
+		shape->body_a_len = body_a_len;
+		shape->body_b_start = body_b_start;
+		shape->body_b_len = body_b_len;
+		shape->join_target = join_target;
+		shape->site_insns = &insns[idx];
+	}
+
+	return true;
+}
+
+static bool
+bpf_jit_validate_branch_flip_rule(const struct bpf_insn *insns,
+				  u32 insn_cnt,
+				  const struct bpf_jit_rule *rule,
+				  struct bpf_jit_canonical_params *params)
+{
+	struct bpf_jit_branch_flip_shape shape;
+
+	if (!bpf_jit_parse_branch_flip_shape(insns, insn_cnt, rule, &shape))
+		return false;
+
+	if (params) {
+		memset(params, 0, sizeof(*params));
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_COND_OP,
+				      shape.cond_op);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_START,
+				      shape.body_a_start);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_LEN,
+				      shape.body_a_len);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_START,
+				      shape.body_b_start);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_LEN,
+				      shape.body_b_len);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_JOIN_TARGET,
+				      shape.join_target);
+		bpf_jit_param_set_ptr(params, BPF_JIT_BFLIP_PARAM_SITE_PTR,
+				      shape.site_insns);
+	}
+
 	return true;
 }
 
@@ -2066,28 +2240,6 @@ static bool bpf_jit_site_has_side_effects(const struct bpf_insn *insns,
 	return false;
 }
 
-/* CPU feature gating */
-#if defined(CONFIG_X86_64)
-static bool bpf_jit_check_cpu_features(u32 required)
-{
-	u32 available = 0;
-
-	if (boot_cpu_has(X86_FEATURE_CMOV))
-		available |= BPF_JIT_X86_CMOV;
-	if (boot_cpu_has(X86_FEATURE_BMI2))
-		available |= BPF_JIT_X86_BMI2;
-	if (boot_cpu_has(X86_FEATURE_MOVBE))
-		available |= BPF_JIT_X86_MOVBE;
-
-	return (required & available) == required;
-}
-#else
-static bool bpf_jit_check_cpu_features(u32 required)
-{
-	return required == 0;
-}
-#endif
-
 static bool bpf_jit_cond_op_valid(u8 op)
 {
 	switch (op) {
@@ -2112,519 +2264,6 @@ static bool bpf_jit_branch_flip_cond_op_valid(u8 op)
 	return op == BPF_JSET || bpf_jit_cond_op_valid(op);
 }
 
-static bool bpf_jit_bind_pattern_var(struct bpf_jit_var *vars, u8 var_id,
-				      u8 type, s64 value)
-{
-	struct bpf_jit_var *var;
-
-	if (!var_id)
-		return true;
-	if (var_id > BPF_JIT_MAX_PATTERN_VARS)
-		return false;
-
-	var = &vars[var_id];
-	if (!var->bound) {
-		var->bound = true;
-		var->type = type;
-		var->value = value;
-		return true;
-	}
-
-	return var->type == type && var->value == value;
-}
-
-static bool bpf_jit_match_pattern(const struct bpf_prog *prog,
-				  const struct bpf_insn *insns, u32 insn_cnt,
-				  const struct bpf_jit_rule *rule,
-				  struct bpf_jit_var *vars)
-{
-	u32 i;
-
-	if (!rule->pattern || !rule->pattern_count ||
-	    rule->pattern_count != rule->site_len) {
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "pattern metadata is inconsistent");
-		return false;
-	}
-	if (!bpf_jit_site_range_valid(rule->site_start, rule->site_len,
-				      insn_cnt, NULL)) {
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "site range is out of bounds");
-		return false;
-	}
-
-	for (i = 0; i < rule->pattern_count; i++) {
-		const struct bpf_jit_pattern_insn *pattern = &rule->pattern[i];
-		const struct bpf_insn *insn = &insns[rule->site_start + i];
-
-		if (insn->code != pattern->opcode ||
-		    ((pattern->flags & BPF_JIT_PATTERN_F_EXPECT_IMM) &&
-		     insn->imm != pattern->expected_imm) ||
-		    ((pattern->flags & BPF_JIT_PATTERN_F_EXPECT_DST_REG) &&
-		     insn->dst_reg != pattern->expected_dst_reg) ||
-		    ((pattern->flags & BPF_JIT_PATTERN_F_EXPECT_SRC_REG) &&
-		     insn->src_reg != pattern->expected_src_reg) ||
-		    ((pattern->flags & BPF_JIT_PATTERN_F_EXPECT_OFF) &&
-		     insn->off != pattern->expected_off)) {
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "pattern match failed at insn %u",
-						   rule->site_start + i);
-			return false;
-		}
-		if (!bpf_jit_bind_pattern_var(vars, pattern->dst_binding,
-					      BPF_JIT_VAR_REG, insn->dst_reg) ||
-		    !bpf_jit_bind_pattern_var(vars, pattern->src_binding,
-					      BPF_JIT_VAR_REG, insn->src_reg) ||
-		    !bpf_jit_bind_pattern_var(vars, pattern->imm_binding,
-					      BPF_JIT_VAR_IMM, insn->imm) ||
-		    !bpf_jit_bind_pattern_var(vars, pattern->off_binding,
-					      BPF_JIT_VAR_OFF, insn->off)) {
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "pattern match failed at insn %u",
-						   rule->site_start + i);
-			return false;
-		}
-	}
-
-	return true;
-}
-
-static bool bpf_jit_check_constraints(
-	const struct bpf_prog *prog,
-	const struct bpf_jit_rule *rule,
-	const struct bpf_jit_pattern_constraint *constraints,
-	u16 constraint_count,
-	const struct bpf_jit_var *vars)
-{
-	u16 i;
-
-	for (i = 0; i < constraint_count; i++) {
-		const struct bpf_jit_pattern_constraint *constraint = &constraints[i];
-		s64 var_a, var_b;
-
-		if (!constraint->var_a ||
-		    constraint->var_a > BPF_JIT_MAX_PATTERN_VARS ||
-		    !vars[constraint->var_a].bound) {
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "constraint %u failed", i);
-			return false;
-		}
-
-		var_a = vars[constraint->var_a].value;
-		switch (constraint->type) {
-		case BPF_JIT_CSTR_EQUAL:
-			if (!constraint->var_b ||
-			    constraint->var_b > BPF_JIT_MAX_PATTERN_VARS ||
-			    !vars[constraint->var_b].bound) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			var_b = vars[constraint->var_b].value;
-			if (var_a != var_b) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_SUM_CONST:
-			if (!constraint->var_b ||
-			    constraint->var_b > BPF_JIT_MAX_PATTERN_VARS ||
-			    !vars[constraint->var_b].bound) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			var_b = vars[constraint->var_b].value;
-			if (var_a + var_b != constraint->constant) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_IMM_RANGE:
-			if (var_a < constraint->constant ||
-			    var_a > constraint->constant_hi) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_NOT_ZERO:
-			if (!var_a) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_MASK_BITS:
-			if (!(var_a & constraint->constant)) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_DIFF_CONST:
-			if (!constraint->var_b ||
-			    constraint->var_b > BPF_JIT_MAX_PATTERN_VARS ||
-			    !vars[constraint->var_b].bound) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			var_b = vars[constraint->var_b].value;
-			if (var_a - var_b != constraint->constant) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		case BPF_JIT_CSTR_NOT_EQUAL:
-			if (!constraint->var_b ||
-			    constraint->var_b > BPF_JIT_MAX_PATTERN_VARS ||
-			    !vars[constraint->var_b].bound) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			var_b = vars[constraint->var_b].value;
-			if (var_a == var_b) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "constraint %u failed", i);
-				return false;
-			}
-			break;
-		default:
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "constraint %u failed", i);
-			return false;
-		}
-	}
-
-	return true;
-}
-
-static bool bpf_jit_binding_param_valid(u16 form, u8 param)
-{
-	switch (form) {
-	case BPF_JIT_CF_ROTATE:
-		return param <= BPF_JIT_ROT_PARAM_WIDTH;
-	case BPF_JIT_CF_WIDE_MEM:
-		return param <= BPF_JIT_WMEM_PARAM_WIDTH;
-	case BPF_JIT_CF_ADDR_CALC:
-		return param <= BPF_JIT_ACALC_PARAM_SCALE;
-	case BPF_JIT_CF_COND_SELECT:
-		return param <= BPF_JIT_SEL_PARAM_WIDTH;
-	case BPF_JIT_CF_BITFIELD_EXTRACT:
-		return param <= BPF_JIT_BFX_PARAM_ORDER;
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-		return param <= BPF_JIT_ZEXT_PARAM_DST_REG;
-	case BPF_JIT_CF_ENDIAN_FUSION:
-		return param <= BPF_JIT_ENDIAN_PARAM_DIRECTION;
-	case BPF_JIT_CF_BRANCH_FLIP:
-		return param <= BPF_JIT_BFLIP_PARAM_JOIN_TARGET;
-	default:
-		return false;
-	}
-}
-
-static bool bpf_jit_validate_binding_desc(
-	const struct bpf_jit_binding *bindings,
-	u16 binding_count,
-	u16 canonical_form)
-{
-	u32 seen_params = 0;
-	u16 i;
-
-	if (binding_count > BPF_JIT_MAX_BINDINGS)
-		return false;
-
-	for (i = 0; i < binding_count; i++) {
-		const struct bpf_jit_binding *binding = &bindings[i];
-		u32 param_bit;
-
-		if (binding->reserved)
-			return false;
-		if (!bpf_jit_binding_param_valid(canonical_form,
-						 binding->canonical_param))
-			return false;
-
-		param_bit = 1U << binding->canonical_param;
-		if (seen_params & param_bit)
-			return false;
-		seen_params |= param_bit;
-
-		switch (binding->source_type) {
-		case BPF_JIT_BIND_SOURCE_REG:
-		case BPF_JIT_BIND_SOURCE_IMM:
-			if (!binding->source_var ||
-			    binding->source_var > BPF_JIT_MAX_PATTERN_VARS ||
-			    binding->inline_const)
-				return false;
-			break;
-		case BPF_JIT_BIND_SOURCE_CONST:
-			if (binding->source_var)
-				return false;
-			break;
-		default:
-			return false;
-		}
-	}
-
-	return true;
-}
-
-static bool bpf_jit_param_present(const struct bpf_jit_canonical_params *params,
-				  u8 param)
-{
-	return param < BPF_JIT_MAX_CANONICAL_PARAMS &&
-	       !!(params->present_mask & (1U << param));
-}
-
-static bool bpf_jit_param_is_reg(const struct bpf_jit_canonical_params *params,
-				 u8 param)
-{
-	return bpf_jit_param_present(params, param) &&
-	       params->params[param].type == BPF_JIT_BIND_VAL_REG;
-}
-
-static bool bpf_jit_param_is_imm(const struct bpf_jit_canonical_params *params,
-				 u8 param)
-{
-	return bpf_jit_param_present(params, param) &&
-	       params->params[param].type == BPF_JIT_BIND_VAL_IMM;
-}
-
-static bool bpf_jit_param_is_numeric(const struct bpf_jit_canonical_params *params,
-				      u8 param)
-{
-	return bpf_jit_param_present(params, param) &&
-	       (params->params[param].type == BPF_JIT_BIND_VAL_REG ||
-		params->params[param].type == BPF_JIT_BIND_VAL_IMM);
-}
-
-static bool bpf_jit_bpf_reg_valid(s64 reg)
-{
-	return reg >= BPF_REG_0 && reg <= BPF_REG_FP;
-}
-
-static bool
-bpf_jit_param_matches_reg(const struct bpf_jit_canonical_params *params,
-			  u8 param, u8 expected)
-{
-	return bpf_jit_param_is_reg(params, param) &&
-	       bpf_jit_bpf_reg_valid(params->params[param].value) &&
-	       params->params[param].value == expected;
-}
-
-static bool
-bpf_jit_param_matches_imm(const struct bpf_jit_canonical_params *params,
-			  u8 param, s64 expected)
-{
-	return bpf_jit_param_is_imm(params, param) &&
-	       params->params[param].value == expected;
-}
-
-static bool bpf_jit_extract_bindings(const struct bpf_jit_binding *bindings,
-				     u16 binding_count,
-				     const struct bpf_jit_var *vars,
-				     struct bpf_jit_canonical_params *params,
-				     const struct bpf_prog *prog,
-				     const struct bpf_jit_rule *rule)
-{
-	u16 i;
-
-	memset(params, 0, sizeof(*params));
-
-	for (i = 0; i < binding_count; i++) {
-		const struct bpf_jit_binding *binding = &bindings[i];
-		struct bpf_jit_binding_value *value;
-		const struct bpf_jit_var *var;
-
-		if (binding->canonical_param >= BPF_JIT_MAX_CANONICAL_PARAMS) {
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "binding %u failed", i);
-			return false;
-		}
-
-		value = &params->params[binding->canonical_param];
-		switch (binding->source_type) {
-		case BPF_JIT_BIND_SOURCE_CONST:
-			value->value = binding->inline_const;
-			value->type = BPF_JIT_BIND_VAL_IMM;
-			break;
-		case BPF_JIT_BIND_SOURCE_REG:
-		case BPF_JIT_BIND_SOURCE_IMM:
-			if (!binding->source_var ||
-			    binding->source_var > BPF_JIT_MAX_PATTERN_VARS) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "binding %u failed", i);
-				return false;
-			}
-			var = &vars[binding->source_var];
-			if (!var->bound) {
-				bpf_jit_recompile_rule_log(prog, rule,
-							   "binding %u failed", i);
-				return false;
-			}
-			if (binding->source_type == BPF_JIT_BIND_SOURCE_REG) {
-				if (var->type != BPF_JIT_VAR_REG) {
-					bpf_jit_recompile_rule_log(prog, rule,
-								   "binding %u failed", i);
-					return false;
-				}
-				value->type = BPF_JIT_BIND_VAL_REG;
-			} else {
-				if (var->type != BPF_JIT_VAR_IMM &&
-				    var->type != BPF_JIT_VAR_OFF) {
-					bpf_jit_recompile_rule_log(prog, rule,
-								   "binding %u failed", i);
-					return false;
-				}
-				value->type = BPF_JIT_BIND_VAL_IMM;
-			}
-			value->value = var->value;
-			break;
-		default:
-			bpf_jit_recompile_rule_log(prog, rule,
-						   "binding %u failed", i);
-			return false;
-		}
-
-		params->present_mask |= 1U << binding->canonical_param;
-		if (params->param_count <= binding->canonical_param)
-			params->param_count = binding->canonical_param + 1;
-	}
-
-	return true;
-}
-
-static bool bpf_jit_validate_canonical_params(
-	const struct bpf_jit_rule *rule,
-	const struct bpf_jit_canonical_params *params,
-	const struct bpf_prog *prog)
-{
-	switch (rule->canonical_form) {
-	case BPF_JIT_CF_ROTATE: {
-		s64 width, amount;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_ROT_PARAM_DST_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_ROT_PARAM_SRC_REG) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_ROT_PARAM_AMOUNT) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_ROT_PARAM_WIDTH))
-			return false;
-
-		width = params->params[BPF_JIT_ROT_PARAM_WIDTH].value;
-		amount = params->params[BPF_JIT_ROT_PARAM_AMOUNT].value;
-		return (width == 32 || width == 64) &&
-		       amount > 0 && amount < width;
-	}
-	case BPF_JIT_CF_WIDE_MEM: {
-		s64 encoded_width, width, flags;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_WMEM_PARAM_DST_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_WMEM_PARAM_BASE_OFF) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_WMEM_PARAM_WIDTH))
-			return false;
-
-		encoded_width = params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
-		width = encoded_width & BPF_JIT_WMEM_WIDTH_MASK;
-		flags = encoded_width & ~BPF_JIT_WMEM_WIDTH_MASK;
-		return width >= 2 && width <= 8 &&
-		       (flags == 0 || flags == BPF_JIT_WMEM_F_BIG_ENDIAN);
-	}
-	case BPF_JIT_CF_ADDR_CALC: {
-		s64 scale;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_ACALC_PARAM_DST_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_ACALC_PARAM_BASE_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_ACALC_PARAM_INDEX_REG) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_ACALC_PARAM_SCALE))
-			return false;
-
-		scale = params->params[BPF_JIT_ACALC_PARAM_SCALE].value;
-		return scale >= 1 && scale <= 3;
-	}
-	case BPF_JIT_CF_COND_SELECT: {
-		s64 width, cond_op;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_SEL_PARAM_DST_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_SEL_PARAM_COND_A) ||
-		    !bpf_jit_param_is_numeric(params, BPF_JIT_SEL_PARAM_COND_B) ||
-		    !bpf_jit_param_is_numeric(params, BPF_JIT_SEL_PARAM_TRUE_VAL) ||
-		    !bpf_jit_param_is_numeric(params, BPF_JIT_SEL_PARAM_FALSE_VAL) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_SEL_PARAM_COND_OP) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_SEL_PARAM_WIDTH))
-			return false;
-
-		width = params->params[BPF_JIT_SEL_PARAM_WIDTH].value;
-		cond_op = params->params[BPF_JIT_SEL_PARAM_COND_OP].value;
-		return (width == 32 || width == 64) && bpf_jit_cond_op_valid(cond_op);
-	}
-	case BPF_JIT_CF_BITFIELD_EXTRACT: {
-		s64 width, shift, order;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_BFX_PARAM_DST_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_BFX_PARAM_SRC_REG) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_SHIFT) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_MASK) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_WIDTH) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFX_PARAM_ORDER))
-			return false;
-
-		width = params->params[BPF_JIT_BFX_PARAM_WIDTH].value;
-		shift = params->params[BPF_JIT_BFX_PARAM_SHIFT].value;
-		order = params->params[BPF_JIT_BFX_PARAM_ORDER].value;
-		return (width == 32 || width == 64) &&
-		       shift >= 0 && shift < width &&
-		       (order == BPF_JIT_BFX_ORDER_SHIFT_MASK ||
-			order == BPF_JIT_BFX_ORDER_MASK_SHIFT);
-	}
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-		return bpf_jit_param_is_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG);
-	case BPF_JIT_CF_ENDIAN_FUSION: {
-		s64 width, direction;
-
-		if (!bpf_jit_param_is_reg(params, BPF_JIT_ENDIAN_PARAM_DATA_REG) ||
-		    !bpf_jit_param_is_reg(params, BPF_JIT_ENDIAN_PARAM_BASE_REG) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_ENDIAN_PARAM_OFFSET) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_ENDIAN_PARAM_WIDTH) ||
-		    !bpf_jit_param_is_imm(params,
-					  BPF_JIT_ENDIAN_PARAM_DIRECTION))
-			return false;
-
-		width = params->params[BPF_JIT_ENDIAN_PARAM_WIDTH].value;
-		direction = params->params[BPF_JIT_ENDIAN_PARAM_DIRECTION].value;
-		return (width == 16 || width == 32 || width == 64) &&
-		       (direction == BPF_JIT_ENDIAN_LOAD_SWAP ||
-			direction == BPF_JIT_ENDIAN_SWAP_STORE);
-	}
-	case BPF_JIT_CF_BRANCH_FLIP: {
-		s64 cond_op, body_a_len, body_b_len;
-
-		if (!bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_COND_OP) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_START) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_LEN) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_START) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_LEN) ||
-		    !bpf_jit_param_is_imm(params, BPF_JIT_BFLIP_PARAM_JOIN_TARGET))
-			return false;
-
-		cond_op = params->params[BPF_JIT_BFLIP_PARAM_COND_OP].value;
-		body_a_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_A_LEN].value;
-		body_b_len = params->params[BPF_JIT_BFLIP_PARAM_BODY_B_LEN].value;
-		return bpf_jit_branch_flip_cond_op_valid((u8)cond_op) &&
-		       body_a_len >= 1 && body_a_len <= 16 &&
-		       body_b_len >= 1 && body_b_len <= 16;
-	}
-	default:
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "canonical parameter validation failed");
-		return false;
-	}
-}
-
 static bool bpf_jit_canonical_site_fail(const struct bpf_prog *prog,
 					const struct bpf_jit_rule *rule,
 					const char *msg)
@@ -2640,7 +2279,7 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 					    const struct bpf_insn *insns,
 					    u32 insn_cnt,
 					    const struct bpf_jit_rule *rule,
-					    const struct bpf_jit_canonical_params *params)
+					    struct bpf_jit_canonical_params *params)
 {
 	switch (rule->canonical_form) {
 	case BPF_JIT_CF_WIDE_MEM:
@@ -2665,7 +2304,8 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 				"addr_calc canonical site validation failed");
 		break;
 	case BPF_JIT_CF_COND_SELECT:
-		if (!bpf_jit_validate_cond_select_rule(insns, insn_cnt, rule))
+		if (!bpf_jit_validate_cond_select_rule(insns, insn_cnt, rule,
+						       params))
 			return bpf_jit_canonical_site_fail(
 				prog, rule,
 				"cond_select canonical site validation failed");
@@ -2705,48 +2345,6 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 	return true;
 }
 
-static bool bpf_jit_validate_pattern_rule(const struct bpf_prog *prog,
-					  const struct bpf_insn *insns,
-					  u32 insn_cnt,
-					  const struct bpf_jit_rule *rule,
-					  struct bpf_jit_canonical_params *params)
-{
-	struct bpf_jit_var vars[BPF_JIT_MAX_PATTERN_VARS + 1] = {};
-	struct bpf_jit_canonical_params tmp_params;
-
-	if (rule->rule_kind != BPF_JIT_RK_PATTERN || !rule->pattern ||
-	    !bpf_jit_pattern_rule_shape_valid(rule)) {
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "pattern validator precondition failed");
-		return false;
-	}
-	if (!bpf_jit_match_pattern(prog, insns, insn_cnt, rule, vars))
-		return false;
-	if (rule->constraint_count &&
-	    (!rule->constraints ||
-	     !bpf_jit_check_constraints(prog, rule, rule->constraints,
-					rule->constraint_count, vars)))
-		return false;
-	if (!rule->bindings || !rule->binding_count ||
-	    !bpf_jit_extract_bindings(rule->bindings, rule->binding_count,
-				      vars, &tmp_params, prog, rule) ||
-	    !bpf_jit_validate_canonical_params(rule, &tmp_params, prog))
-		return false;
-	if (!bpf_jit_validate_canonical_site(prog, insns, insn_cnt, rule,
-					     &tmp_params))
-		return false;
-	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start,
-				      rule->site_len)) {
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "interior control-flow edge detected");
-		return false;
-	}
-	if (params)
-		*params = tmp_params;
-
-	return true;
-}
-
 static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 				  const struct bpf_insn *insns,
 				  u32 insn_cnt,
@@ -2754,12 +2352,15 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 				  struct bpf_jit_canonical_params *params)
 {
 	u16 form = bpf_jit_rule_form(rule);
-	u32 required_cpu_features;
 
 	if (params)
 		memset(params, 0, sizeof(*params));
 
-	/* Bounds check */
+	if (!bpf_jit_pattern_rule_shape_valid(rule)) {
+		bpf_jit_recompile_rule_log(prog, rule,
+					   "invalid rule header");
+		return false;
+	}
 	if (!bpf_jit_site_range_valid(rule->site_start, rule->site_len,
 				      insn_cnt, NULL)) {
 		bpf_jit_recompile_rule_log(prog, rule,
@@ -2772,19 +2373,6 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 					   rule->native_choice);
 		return false;
 	}
-
-	/* Check CPU features before kind-specific validation */
-	required_cpu_features = rule->cpu_features_required |
-		bpf_jit_cpu_features_for_native_choice(form, rule->native_choice);
-	if (required_cpu_features &&
-	    !bpf_jit_check_cpu_features(required_cpu_features)) {
-		bpf_jit_recompile_rule_log(prog, rule,
-					   "required cpu features 0x%x unavailable",
-					   required_cpu_features);
-		return false;
-	}
-
-	/* Layer-2 generic check: reject sites with side effects */
 	if (form != BPF_JIT_CF_ENDIAN_FUSION &&
 	    bpf_jit_site_has_side_effects(insns, rule->site_start,
 					  rule->site_len)) {
@@ -2792,22 +2380,24 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 					   "site has side effects");
 		return false;
 	}
-
-	if (rule->rule_kind != BPF_JIT_RK_PATTERN) {
+	if (!bpf_jit_validate_canonical_site(prog, insns, insn_cnt, rule,
+					     params))
+		return false;
+	if (bpf_jit_has_interior_edge(insns, insn_cnt, rule->site_start,
+				      rule->site_len)) {
 		bpf_jit_recompile_rule_log(prog, rule,
-					   "unsupported rule kind %u",
-					   rule->rule_kind);
+					   "interior control-flow edge detected");
 		return false;
 	}
 
-	return bpf_jit_validate_pattern_rule(prog, insns, insn_cnt, rule,
-					      params);
+	return true;
 }
 
 static bool bpf_jit_rule_within_single_subprog(const struct bpf_prog *prog,
 					       const struct bpf_jit_rule *rule)
 {
 	const struct bpf_prog_aux *main_aux;
+	u32 real_func_cnt;
 	u32 site_end;
 	u32 i;
 
@@ -2815,10 +2405,11 @@ static bool bpf_jit_rule_within_single_subprog(const struct bpf_prog *prog,
 		return false;
 
 	main_aux = prog->aux->main_prog_aux ? prog->aux->main_prog_aux : prog->aux;
-	if (!main_aux->func || main_aux->func_cnt <= 1)
+	real_func_cnt = bpf_jit_recompile_real_func_cnt(main_aux);
+	if (!main_aux->func || real_func_cnt <= 1)
 		return true;
 
-	for (i = 0; i < main_aux->func_cnt; i++) {
+	for (i = 0; i < real_func_cnt; i++) {
 		const struct bpf_prog *func = main_aux->func[i];
 		u32 subprog_start;
 		u32 subprog_end;
@@ -2827,7 +2418,7 @@ static bool bpf_jit_rule_within_single_subprog(const struct bpf_prog *prog,
 			continue;
 
 		subprog_start = func->aux->subprog_start;
-		if (i + 1 < main_aux->func_cnt &&
+		if (i + 1 < real_func_cnt &&
 		    main_aux->func[i + 1] && main_aux->func[i + 1]->aux)
 			subprog_end = main_aux->func[i + 1]->aux->subprog_start;
 		else
@@ -2857,78 +2448,6 @@ static struct bpf_jit_policy *bpf_jit_alloc_policy(u32 rule_cnt)
 	return policy;
 }
 
-static bool bpf_jit_validate_pattern_desc(
-	const struct bpf_jit_pattern_insn *pattern,
-	u16 pattern_count)
-{
-	u16 i;
-
-	if (!pattern_count || pattern_count > BPF_JIT_MAX_PATTERN_LEN)
-		return false;
-
-	for (i = 0; i < pattern_count; i++) {
-		const struct bpf_jit_pattern_insn *entry = &pattern[i];
-
-		if (!bpf_opcode_in_insntable(entry->opcode))
-			return false;
-		if (entry->dst_binding > BPF_JIT_MAX_PATTERN_VARS ||
-		    entry->src_binding > BPF_JIT_MAX_PATTERN_VARS ||
-		    entry->imm_binding > BPF_JIT_MAX_PATTERN_VARS ||
-		    entry->off_binding > BPF_JIT_MAX_PATTERN_VARS)
-			return false;
-		if (entry->flags & ~(BPF_JIT_PATTERN_F_EXPECT_IMM |
-				     BPF_JIT_PATTERN_F_EXPECT_DST_REG |
-				     BPF_JIT_PATTERN_F_EXPECT_SRC_REG |
-				     BPF_JIT_PATTERN_F_EXPECT_OFF))
-			return false;
-		if (entry->expected_dst_reg > 0xf || entry->expected_src_reg > 0xf)
-			return false;
-	}
-
-	return true;
-}
-
-static bool bpf_jit_validate_constraint_desc(
-	const struct bpf_jit_pattern_constraint *constraints,
-	u16 constraint_count)
-{
-	u16 i;
-
-	if (constraint_count > BPF_JIT_MAX_CONSTRAINTS)
-		return false;
-
-	for (i = 0; i < constraint_count; i++) {
-		const struct bpf_jit_pattern_constraint *constraint = &constraints[i];
-
-		if (constraint->reserved || constraint->reserved2)
-			return false;
-
-		switch (constraint->type) {
-		case BPF_JIT_CSTR_EQUAL:
-		case BPF_JIT_CSTR_SUM_CONST:
-		case BPF_JIT_CSTR_DIFF_CONST:
-		case BPF_JIT_CSTR_NOT_EQUAL:
-			if (!constraint->var_a || !constraint->var_b)
-				return false;
-			break;
-		case BPF_JIT_CSTR_IMM_RANGE:
-		case BPF_JIT_CSTR_NOT_ZERO:
-		case BPF_JIT_CSTR_MASK_BITS:
-			if (!constraint->var_a)
-				return false;
-			break;
-		default:
-			return false;
-		}
-
-		if (constraint->var_a > BPF_JIT_MAX_PATTERN_VARS ||
-		    constraint->var_b > BPF_JIT_MAX_PATTERN_VARS)
-			return false;
-	}
-
-	return true;
-}
-
 static struct bpf_jit_policy *
 bpf_jit_parse_policy_format_v2(struct bpf_prog *prog,
 			       const struct bpf_jit_policy_hdr *hdr,
@@ -2946,16 +2465,8 @@ bpf_jit_parse_policy_format_v2(struct bpf_prog *prog,
 
 	for (i = 0; i < hdr->rule_cnt; i++) {
 		const struct bpf_jit_rewrite_rule_v2 *urule;
-		const struct bpf_jit_pattern_insn *pattern;
-		const struct bpf_jit_pattern_constraint *constraints;
-		const struct bpf_jit_binding *bindings;
 		struct bpf_jit_rule *rule = &policy->rules[i];
-		struct bpf_jit_rule tmp_rule = {};
-		size_t pattern_bytes, constraint_bytes, binding_bytes;
-		size_t expected_rule_len;
 		bool within_subprog;
-		bool validated;
-		bool active;
 
 		if ((size_t)(end - cursor) < sizeof(*urule)) {
 			bpf_jit_recompile_prog_log(
@@ -2967,101 +2478,36 @@ bpf_jit_parse_policy_format_v2(struct bpf_prog *prog,
 		}
 
 		urule = (const struct bpf_jit_rewrite_rule_v2 *)cursor;
-		tmp_rule.rule_kind = urule->rule_kind;
-		tmp_rule.canonical_form = urule->canonical_form;
-		tmp_rule.site_len = urule->site_len;
-
-		if (urule->rule_kind != BPF_JIT_RK_PATTERN ||
-		    !urule->pattern_count ||
-		    urule->pattern_count != urule->site_len ||
-		    !bpf_jit_pattern_rule_shape_valid(&tmp_rule)) {
-			bpf_jit_recompile_prog_log(
-				prog,
-				"rule %u: invalid rule header (kind=%u form=%u site_len=%u pattern_count=%u)\n",
-				i, urule->rule_kind, urule->canonical_form,
-				urule->site_len, urule->pattern_count);
-			bpf_jit_free_policy(policy);
-			return ERR_PTR(-EINVAL);
-		}
-
-		if (check_mul_overflow((size_t)urule->pattern_count,
-				       sizeof(struct bpf_jit_pattern_insn),
-				       &pattern_bytes) ||
-		    check_mul_overflow((size_t)urule->constraint_count,
-				       sizeof(struct bpf_jit_pattern_constraint),
-				       &constraint_bytes) ||
-		    check_mul_overflow((size_t)urule->binding_count,
-				       sizeof(struct bpf_jit_binding),
-				       &binding_bytes) ||
-		    check_add_overflow(sizeof(*urule), pattern_bytes,
-				       &expected_rule_len) ||
-		    check_add_overflow(expected_rule_len, constraint_bytes,
-				       &expected_rule_len) ||
-		    check_add_overflow(expected_rule_len, binding_bytes,
-				       &expected_rule_len) ||
-		    urule->rule_len != expected_rule_len ||
-		    (size_t)(end - cursor) < urule->rule_len) {
-			bpf_jit_recompile_prog_log(
-				prog,
-				"rule %u: invalid rule length (rule_len=%u expected=%zu remaining=%zu)\n",
-				i, urule->rule_len, expected_rule_len,
-				(size_t)(end - cursor));
-			bpf_jit_free_policy(policy);
-			return ERR_PTR(-EINVAL);
-		}
-
-		pattern = (const struct bpf_jit_pattern_insn *)(urule + 1);
-		constraints = (const struct bpf_jit_pattern_constraint *)
-			((const u8 *)pattern + pattern_bytes);
-		bindings = (const struct bpf_jit_binding *)
-			((const u8 *)constraints + constraint_bytes);
-
-		if (!bpf_jit_validate_pattern_desc(pattern, urule->pattern_count) ||
-		    !bpf_jit_validate_constraint_desc(constraints,
-						    urule->constraint_count) ||
-		    !bpf_jit_validate_binding_desc(bindings, urule->binding_count,
-						  urule->canonical_form)) {
-			bpf_jit_recompile_prog_log(
-				prog,
-				"rule %u: descriptor validation failed\n",
-				i);
-			bpf_jit_free_policy(policy);
-			return ERR_PTR(-EINVAL);
-		}
-
-		rule->rule_kind = urule->rule_kind;
 		rule->canonical_form = urule->canonical_form;
 		rule->native_choice = urule->native_choice;
-		rule->pattern_count = urule->pattern_count;
-		rule->constraint_count = urule->constraint_count;
-		rule->binding_count = urule->binding_count;
-		rule->reserved = urule->reserved;
-		rule->pattern = pattern;
-		rule->constraints = constraints;
-		rule->bindings = bindings;
 		memset(&rule->params, 0, sizeof(rule->params));
 		rule->site_start = urule->site_start;
 		rule->site_len = urule->site_len;
-		rule->priority = urule->priority;
+		rule->flags = 0;
 		rule->user_index = i;
-		rule->cpu_features_required = urule->cpu_features_required;
+
+		if (!bpf_jit_pattern_rule_shape_valid(rule)) {
+			bpf_jit_recompile_prog_log(
+				prog,
+				"rule %u: invalid rule header (form=%u site_len=%u choice=%u)\n",
+				i, urule->canonical_form, urule->site_len,
+				urule->native_choice);
+			bpf_jit_free_policy(policy);
+			return ERR_PTR(-EINVAL);
+		}
 
 		within_subprog = bpf_jit_rule_within_single_subprog(prog, rule);
 		if (!within_subprog)
 			bpf_jit_recompile_rule_log(
 				prog, rule, "crosses subprog boundary");
-		validated = within_subprog &&
-			bpf_jit_validate_rule(prog, prog->insnsi, prog->len, rule,
-					      &rule->params);
-		active = validated;
-		if (active) {
+		if (within_subprog &&
+		    bpf_jit_validate_rule(prog, prog->insnsi, prog->len, rule,
+					  &rule->params)) {
 			rule->flags = BPF_JIT_REWRITE_F_ACTIVE;
 			policy->active_cnt++;
-		} else {
-			rule->flags = 0;
 		}
 
-		cursor += urule->rule_len;
+		cursor += sizeof(*urule);
 	}
 
 	if (cursor != end) {
@@ -3222,9 +2668,9 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	for (i = 0; i < policy->rule_cnt; i++) {
 		struct bpf_jit_rule *rule = &policy->rules[i];
 
-		pr_debug("bpf_jit_recompile: rule[%u] kind=%u site=%u+%u choice=%u cpu_feat=0x%x -> %s\n",
-			 i, rule->rule_kind, rule->site_start, rule->site_len,
-			 rule->native_choice, rule->cpu_features_required,
+		pr_debug("bpf_jit_recompile: rule[%u] form=%u site=%u+%u choice=%u -> %s\n",
+			 i, rule->canonical_form, rule->site_start,
+			 rule->site_len, rule->native_choice,
 			 (rule->flags & BPF_JIT_REWRITE_F_ACTIVE) ? "active" : "rejected");
 	}
 
@@ -3237,7 +2683,7 @@ out:
  * bpf_jit_rule_lookup - find the active rule whose site_start matches insn_idx
  *
  * Binary search on the sorted rules array.
- * Returns the highest-priority active rule that starts at @insn_idx, or NULL.
+ * Returns the first active rule that starts at @insn_idx, or NULL.
  */
 const struct bpf_jit_rule *
 bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx)
@@ -3284,7 +2730,7 @@ bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx)
  */
 static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 {
-	struct bpf_prog_aux *main_aux = bpf_jit_main_aux(prog);
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 	struct bpf_binary_header **old_headers = NULL;
 	void __percpu **old_priv_stacks = NULL;
 	u64 (*new_exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
@@ -3519,19 +2965,18 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	struct bpf_jit_policy *old_policy = NULL;
 	struct bpf_jit_recompile_log *log = NULL;
 	struct bpf_jit_recompile_rollback_state rollback = {};
-	u64 start_ns = 0;
-	u32 num_rules = 0;
-	u32 num_applied = 0;
 	bool rollback_requested;
 	bool log_installed = false;
 	bool locked = false;
-	bool trace_started = false;
 	bool stock_rejit;
 	int log_err = 0;
 	int err = 0;
 
 	if (attr->jit_recompile.flags & ~BPF_F_RECOMPILE_ROLLBACK)
 		return -EINVAL;
+
+	if (!bpf_jit_supports_recompile())
+		return -EOPNOTSUPP;
 
 	rollback_requested = attr->jit_recompile.flags & BPF_F_RECOMPILE_ROLLBACK;
 	stock_rejit = attr->jit_recompile.policy_fd == 0;
@@ -3543,7 +2988,7 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
 
-	main_aux = bpf_jit_main_aux(prog);
+	main_aux = bpf_prog_main_aux(prog);
 	if (!mutex_trylock(&main_aux->jit_recompile_mutex)) {
 		err = -EBUSY;
 		goto out_put;
@@ -3581,6 +3026,33 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 		goto out_put;
 	}
 
+	/* Don't support blinded programs in POC */
+	if (prog->blinded) {
+		bpf_jit_recompile_prog_log(prog,
+					   "blinded programs are not supported\n");
+		err = -EOPNOTSUPP;
+		goto out_put;
+	}
+
+	if (!stock_rejit) {
+		/* Parse and validate policy blob */
+		policy = bpf_jit_parse_policy(prog, attr->jit_recompile.policy_fd);
+		if (IS_ERR(policy)) {
+			err = PTR_ERR(policy);
+			policy = NULL;
+			goto out_put;
+		}
+
+		if (policy->active_cnt == 0) {
+			bpf_jit_recompile_prog_log(prog,
+						   "policy has no active rules\n");
+			bpf_jit_free_policy(policy);
+			policy = NULL;
+			err = -EINVAL;
+			goto out_put;
+		}
+	}
+
 	err = bpf_jit_recompile_snapshot(prog, &rollback);
 	if (err) {
 		bpf_jit_recompile_prog_log(prog,
@@ -3596,42 +3068,13 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 		goto do_recompile;
 	}
 
-	/* Don't support blinded programs in POC */
-	if (prog->blinded) {
-		bpf_jit_recompile_prog_log(prog,
-					   "blinded programs are not supported\n");
-		err = -EOPNOTSUPP;
-		goto out_put;
-	}
-
-	/* Parse and validate policy blob */
-	policy = bpf_jit_parse_policy(prog, attr->jit_recompile.policy_fd);
-	if (IS_ERR(policy)) {
-		err = PTR_ERR(policy);
-		policy = NULL;
-		goto out_put;
-	}
-
-	if (policy->active_cnt == 0) {
-		bpf_jit_recompile_prog_log(prog,
-					   "policy has no active rules\n");
-		bpf_jit_free_policy(policy);
-		policy = NULL;
-		err = -EINVAL;
-		goto out_put;
-	}
-
 	/* Swap policy on prog */
 	old_policy = main_aux->jit_policy;
 	main_aux->jit_policy = policy;
 	policy = NULL;
 
 do_recompile:
-	num_rules = main_aux->jit_policy ? main_aux->jit_policy->active_cnt : 0;
 	main_aux->jit_recompile_num_applied = 0;
-	start_ns = ktime_get_ns();
-	trace_bpf_jit_recompile_start(main_aux->id, num_rules);
-	trace_started = true;
 
 	/* Trigger re-JIT for the active func[] images. */
 	err = bpf_jit_recompile_prog_images(prog);
@@ -3686,12 +3129,7 @@ do_recompile:
 		main_aux->recompile_count++;
 
 out_put:
-	if (trace_started) {
-		num_applied = main_aux->jit_recompile_num_applied;
-		trace_bpf_jit_recompile_end(main_aux->id, num_applied,
-					    ktime_get_ns() - start_ns, !err);
-		main_aux->jit_recompile_num_applied = 0;
-	}
+	main_aux->jit_recompile_num_applied = 0;
 	if (log_installed)
 		main_aux->jit_recompile_log = NULL;
 	if (locked)

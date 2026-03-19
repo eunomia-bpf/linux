@@ -1841,7 +1841,33 @@ struct bpf_prog {
 /* Shared recompile state is owned by the main program's aux. */
 static inline struct bpf_prog_aux *bpf_prog_main_aux(const struct bpf_prog *prog)
 {
+	if (!prog || !prog->aux)
+		return NULL;
+
 	return prog->aux->main_prog_aux ?: prog->aux;
+}
+
+/*
+ * Recompile backends clear staged outputs between passes without dropping the
+ * active recompile state on the live program.
+ */
+static inline void bpf_jit_recompile_clear_stage(struct bpf_prog *prog)
+{
+	prog->aux->jit_recompile_staged = false;
+	prog->aux->jit_recompile_exception_boundary = false;
+	prog->aux->jit_recompile_fp_start = 0;
+	prog->aux->jit_recompile_fp_end = 0;
+	prog->aux->jit_recompile_jited_len = 0;
+	prog->aux->jit_recompile_num_exentries = 0;
+	prog->aux->jit_recompile_bpf_func = NULL;
+	prog->aux->jit_recompile_priv_stack_ptr = NULL;
+	prog->aux->jit_recompile_extable = NULL;
+}
+
+static inline void bpf_jit_recompile_reset_prog_aux(struct bpf_prog *prog)
+{
+	prog->aux->jit_recompile_active = false;
+	bpf_jit_recompile_clear_stage(prog);
 }
 
 struct bpf_array_aux {
