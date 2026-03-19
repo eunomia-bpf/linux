@@ -993,6 +993,7 @@ enum bpf_cmd {
 	BPF_TOKEN_CREATE,
 	BPF_PROG_STREAM_READ_BY_FD,
 	BPF_PROG_ASSOC_STRUCT_OPS,
+	BPF_PROG_JIT_RECOMPILE,
 	__MAX_BPF_CMD,
 };
 
@@ -1456,6 +1457,90 @@ enum {
 
 /* Enable BPF ringbuf overwrite mode */
 	BPF_F_RB_OVERWRITE	= (1U << 19),
+
+};
+
+/* ---- BPF JIT policy blob format (v5 only) ---- */
+
+#define BPF_JIT_POLICY_MAGIC		0x4A495450U	/* "JITP" */
+/* The simplified v5 rewrite rules use on-wire policy format version 2. */
+#define BPF_JIT_POLICY_FORMAT_VERSION	2
+#define BPF_JIT_POLICY_VERSION_2	BPF_JIT_POLICY_FORMAT_VERSION
+#define BPF_JIT_POLICY_VERSION		BPF_JIT_POLICY_FORMAT_VERSION
+
+/* Architecture IDs for policy blob */
+#define BPF_JIT_ARCH_X86_64		1
+#define BPF_JIT_ARCH_ARM64		2
+
+struct bpf_jit_policy_hdr {
+	__u32 magic;
+	__u16 version;
+	__u16 hdr_len;		/* sizeof(this struct) */
+	__u32 total_len;	/* entire blob size */
+	__u32 rule_cnt;		/* number of rules */
+	__u32 insn_cnt;		/* bound program insn_cnt */
+	__u8  prog_tag[8];	/* BPF_TAG_SIZE, digest binding */
+	__u16 arch_id;		/* BPF_JIT_ARCH_X86_64 etc */
+	__u16 flags;		/* reserved */
+};
+
+enum bpf_jit_canonical_form {
+	BPF_JIT_CF_ROTATE	= 1,	/* maps to ROTATE emitter */
+	BPF_JIT_CF_WIDE_MEM	= 2,	/* maps to WIDE_MEM emitter */
+	BPF_JIT_CF_ADDR_CALC	= 3,	/* maps to ADDR_CALC emitter */
+	BPF_JIT_CF_COND_SELECT	= 4,	/* maps to COND_SELECT emitter */
+	BPF_JIT_CF_BITFIELD_EXTRACT = 5, /* maps to BITFIELD_EXTRACT emitter */
+	BPF_JIT_CF_ZERO_EXT_ELIDE = 6, /* maps to ZERO_EXT_ELIDE emitter */
+	BPF_JIT_CF_ENDIAN_FUSION = 7, /* maps to ENDIAN_FUSION emitter */
+	BPF_JIT_CF_BRANCH_FLIP = 8, /* maps to BRANCH_FLIP emitter */
+};
+
+/* COND_SELECT native_choice values */
+enum bpf_jit_select_native {
+	BPF_JIT_SEL_CMOVCC	= 1,	/* x86: cmp + cmovcc */
+};
+
+/* WIDE_MEM native_choice values */
+enum bpf_jit_wide_mem_native {
+	BPF_JIT_WMEM_WIDE_LOAD	= 1,	/* x86: wide mov + extract */
+};
+
+/* ROTATE native_choice values */
+enum bpf_jit_rotate_native {
+	BPF_JIT_ROT_ROR		= 1,	/* x86: ror reg, imm */
+	BPF_JIT_ROT_RORX	= 2,	/* x86: rorx reg, reg, imm (BMI2) */
+};
+
+/* ADDR_CALC native_choice values */
+enum bpf_jit_addr_calc_native {
+	BPF_JIT_ACALC_LEA		= 1,	/* x86: lea dst, [base + idx*scale] */
+};
+
+/* BITFIELD_EXTRACT native_choice values */
+enum bpf_jit_bitfield_extract_native {
+	BPF_JIT_BFX_EXTRACT	= 1,	/* x86: bextr or compact shift/mask */
+};
+
+/* ZERO_EXT_ELIDE native_choice values */
+enum bpf_jit_zero_ext_native {
+	BPF_JIT_ZEXT_ELIDE	= 1,	/* x86: drop redundant zero-extend */
+};
+
+/* ENDIAN_FUSION native_choice values */
+enum bpf_jit_endian_fusion_native {
+	BPF_JIT_ENDIAN_MOVBE	= 1,	/* x86: movbe load/store fusion */
+};
+
+/* BRANCH_FLIP native_choice values */
+enum bpf_jit_branch_flip_native {
+	BPF_JIT_BFLIP_FLIPPED	= 2,	/* inverted jcc, swapped bodies */
+};
+
+struct bpf_jit_rewrite_rule_v2 {
+	__u32 site_start;		/* BPF instruction offset */
+	__u16 site_len;			/* span length in BPF insns */
+	__u16 canonical_form;		/* enum bpf_jit_canonical_form */
+	__u16 native_choice;		/* which native instruction to use */
 };
 
 /* Flags for BPF_PROG_QUERY. */
@@ -1921,6 +2006,15 @@ union bpf_attr {
 		__u32		prog_fd;
 		__u32		flags;
 	} prog_assoc_struct_ops;
+
+	struct { /* struct used by BPF_PROG_JIT_RECOMPILE command */
+		__u32		prog_fd;
+		__s32		policy_fd;	/* sealed memfd policy; 0 = stock re-JIT */
+		__u32		flags;		/* must be zero */
+		__u32		log_level;	/* 0 disables, non-zero enables log */
+		__u32		log_size;
+		__aligned_u64	log_buf;
+	} jit_recompile;
 
 } __attribute__((aligned(8)));
 
@@ -7234,6 +7328,7 @@ enum {
 	TCP_BPF_SOCK_OPS_CB_FLAGS = 1008, /* Get or Set TCP sock ops flags */
 	SK_BPF_CB_FLAGS		= 1009, /* Get or set sock ops flags in socket */
 	SK_BPF_BYPASS_PROT_MEM	= 1010, /* Get or Set sk->sk_bypass_prot_mem */
+
 };
 
 enum {
