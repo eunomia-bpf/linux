@@ -3581,19 +3581,6 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 		goto out_put;
 	}
 
-	/*
-	 * Tracing and LSM programs routed through BPF trampolines also hardcode
-	 * the current prog->bpf_func in the generated image. Replacing the JITed
-	 * body alone would leave the live trampoline calling stale text.
-	 */
-	if (bpf_prog_has_trampoline(prog)) {
-		bpf_jit_recompile_prog_log(
-			prog,
-			"programs attached through BPF trampolines are not supported: associated trampoline must be regenerated\n");
-		err = -EOPNOTSUPP;
-		goto out_put;
-	}
-
 	err = bpf_jit_recompile_snapshot(prog, &rollback);
 	if (err) {
 		bpf_jit_recompile_prog_log(prog,
