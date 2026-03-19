@@ -21,19 +21,6 @@ struct exception_table_entry;
 
 #define BPF_JIT_REWRITE_F_ACTIVE  (1U << 0)
 
-enum bpf_jit_var_type {
-	BPF_JIT_VAR_NONE = 0,
-	BPF_JIT_VAR_REG,
-	BPF_JIT_VAR_IMM,
-	BPF_JIT_VAR_OFF,
-};
-
-struct bpf_jit_var {
-	s64 value;
-	u8 type;
-	bool bound;
-};
-
 enum bpf_jit_binding_value_type {
 	BPF_JIT_BIND_VAL_REG = 0,
 	BPF_JIT_BIND_VAL_IMM = 1,
@@ -42,13 +29,10 @@ enum bpf_jit_binding_value_type {
 struct bpf_jit_binding_value {
 	s64 value;
 	u8 type;
-	u8 reserved[7];
 };
 
 struct bpf_jit_canonical_params {
 	struct bpf_jit_binding_value params[BPF_JIT_MAX_CANONICAL_PARAMS];
-	u32 present_mask;
-	u8 param_count;
 };
 
 enum bpf_jit_rotate_param {

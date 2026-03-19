@@ -3532,9 +3532,11 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		  struct exception_table_entry *extable, u32 num_exentries)
 {
 	bool tail_call_reachable = bpf_prog->aux->tail_call_reachable;
+	const struct bpf_prog_aux *main_aux = bpf_prog_main_aux(bpf_prog);
 	struct bpf_insn *insn = bpf_prog->insnsi;
 	bool callee_regs_used[4] = {};
 	int insn_cnt = bpf_prog->len;
+	bool has_active_rules = main_aux->jit_policy && main_aux->jit_policy->active_cnt;
 	bool seen_exit = false;
 	u8 temp[BPF_MAX_INSN_SIZE + BPF_INSN_SAFETY];
 	void __percpu *priv_frame_ptr = NULL;
@@ -3613,16 +3615,18 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 				dst_reg = X86_REG_R9;
 		}
 
-		err = bpf_jit_apply_prog_rule(temp, &prog, bpf_prog, addrs,
-					      image, rw_image, oldproglen,
-					      &proglen, i,
-					      priv_frame_ptr != NULL);
-		if (err < 0)
-			return err;
-		if (err > 0) {
-			insn += err - 1;
-			i += err - 1;
-			continue;
+		if (has_active_rules) {
+			err = bpf_jit_apply_prog_rule(temp, &prog, bpf_prog, addrs,
+						      image, rw_image, oldproglen,
+						      &proglen, i,
+						      priv_frame_ptr != NULL);
+			if (err < 0)
+				return err;
+			if (err > 0) {
+				insn += err - 1;
+				i += err - 1;
+				continue;
+			}
 		}
 
 		switch (insn->code) {

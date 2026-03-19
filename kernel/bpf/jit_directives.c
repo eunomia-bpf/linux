@@ -759,9 +759,6 @@ static void bpf_jit_param_set_reg(
 {
 	params->params[param].type = BPF_JIT_BIND_VAL_REG;
 	params->params[param].value = reg;
-	params->present_mask |= 1U << param;
-	if (params->param_count <= param)
-		params->param_count = param + 1;
 }
 
 static void bpf_jit_param_set_imm(
@@ -769,9 +766,6 @@ static void bpf_jit_param_set_imm(
 {
 	params->params[param].type = BPF_JIT_BIND_VAL_IMM;
 	params->params[param].value = imm;
-	params->present_mask |= 1U << param;
-	if (params->param_count <= param)
-		params->param_count = param + 1;
 }
 
 static void bpf_jit_param_set_ptr(struct bpf_jit_canonical_params *params,
