@@ -5049,7 +5049,6 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	info.recursion_misses = stats.misses;
 
 	info.verified_insns = prog->aux->verified_insns;
-	info.recompile_count = bpf_prog_main_aux(prog)->recompile_count;
 	if (prog->aux->btf)
 		info.btf_id = btf_obj_id(prog->aux->btf);
 

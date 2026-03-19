@@ -1731,7 +1731,6 @@ struct bpf_prog_aux {
 	struct mutex jit_recompile_mutex; /* serializes BPF_PROG_JIT_RECOMPILE */
 	struct bpf_jit_policy *jit_policy; /* active JIT rewrite policy */
 	struct bpf_jit_recompile_log *jit_recompile_log;
-	u32 recompile_count; /* successful recompiles, saturated at U32_MAX */
 	u32 jit_recompile_num_applied; /* rules applied in current recompile */
 	struct bpf_jit_poke_descriptor *poke_tab;
 	struct bpf_kfunc_desc_tab *kfunc_tab;

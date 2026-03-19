@@ -28,7 +28,6 @@ struct bpf_jit_recompile_log {
 	u32 user_size;
 	u32 kernel_size;
 	u32 len;
-	u32 level;
 };
 
 struct bpf_jit_recompile_prog_state {
@@ -70,7 +69,7 @@ static void bpf_jit_recompile_log_appendv(struct bpf_jit_recompile_log *log,
 	size_t avail;
 	int written;
 
-	if (!log || !log->kbuf || !log->kernel_size || !log->level)
+	if (!log || !log->kbuf || !log->kernel_size)
 		return;
 	if (log->len >= log->kernel_size - 1)
 		return;
@@ -156,7 +155,6 @@ bpf_jit_recompile_log_alloc(const union bpf_attr *attr)
 	log->ubuf = u64_to_user_ptr(attr->jit_recompile.log_buf);
 	log->user_size = attr->jit_recompile.log_size;
 	log->kernel_size = kernel_size;
-	log->level = attr->jit_recompile.log_level;
 	return log;
 }
 
@@ -2959,20 +2957,18 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	struct bpf_jit_policy *old_policy = NULL;
 	struct bpf_jit_recompile_log *log = NULL;
 	struct bpf_jit_recompile_rollback_state rollback = {};
-	bool rollback_requested;
 	bool log_installed = false;
 	bool locked = false;
 	bool stock_rejit;
 	int log_err = 0;
 	int err = 0;
 
-	if (attr->jit_recompile.flags & ~BPF_F_RECOMPILE_ROLLBACK)
+	if (attr->jit_recompile.flags)
 		return -EINVAL;
 
 	if (!bpf_jit_supports_recompile())
 		return -EOPNOTSUPP;
 
-	rollback_requested = attr->jit_recompile.flags & BPF_F_RECOMPILE_ROLLBACK;
 	stock_rejit = attr->jit_recompile.policy_fd == 0;
 
 	if (!capable(CAP_BPF) && !capable(CAP_SYS_ADMIN))
@@ -3078,34 +3074,14 @@ do_recompile:
 		bpf_jit_recompile_prog_log(prog,
 					   "re-JIT failed with err=%d\n", err);
 		bpf_jit_recompile_restore(&rollback);
-		if (rollback_requested) {
-			if (stock_rejit) {
-				main_aux->jit_policy = old_policy;
-				old_policy = NULL;
-			} else {
-				failed_policy = main_aux->jit_policy;
-				main_aux->jit_policy = old_policy;
-				old_policy = NULL;
-				bpf_jit_free_policy(failed_policy);
-			}
-			bpf_jit_recompile_prog_log(
-				prog,
-				"rollback restored the pre-recompile image\n");
-		} else if (stock_rejit) {
-			bpf_jit_free_policy(old_policy);
-			old_policy = NULL;
-			bpf_jit_recompile_prog_log(
-				prog,
-				"restored the pre-recompile image\n");
-		} else {
-			bpf_jit_free_policy(old_policy);
-			old_policy = NULL;
-			bpf_jit_free_policy(main_aux->jit_policy);
-			main_aux->jit_policy = NULL;
-			bpf_jit_recompile_prog_log(
-				prog,
-				"restored the pre-recompile image\n");
-		}
+		failed_policy = main_aux->jit_policy;
+		main_aux->jit_policy = old_policy;
+		old_policy = NULL;
+		if (failed_policy != main_aux->jit_policy)
+			bpf_jit_free_policy(failed_policy);
+		bpf_jit_recompile_prog_log(
+			prog,
+			"restored the pre-recompile image and policy\n");
 		goto out_put;
 	}
 
@@ -3119,8 +3095,6 @@ do_recompile:
 			prog,
 			"no rules applied; kept the pre-recompile image\n");
 	}
-	if (main_aux->recompile_count != U32_MAX)
-		main_aux->recompile_count++;
 
 out_put:
 	main_aux->jit_recompile_num_applied = 0;
