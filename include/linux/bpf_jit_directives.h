@@ -2,6 +2,7 @@
 #ifndef _LINUX_BPF_JIT_DIRECTIVES_H
 #define _LINUX_BPF_JIT_DIRECTIVES_H
 
+#include <linux/bpf.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 
@@ -155,9 +156,6 @@ void __printf(2, 3) bpf_jit_recompile_prog_log(const struct bpf_prog *prog,
 void __printf(3, 4) bpf_jit_recompile_rule_log(const struct bpf_prog *prog,
 					       const struct bpf_jit_rule *rule,
 					       const char *fmt, ...);
-void bpf_jit_recompile_note_rule(const struct bpf_prog *prog,
-				 const struct bpf_jit_rule *rule,
-				 bool applied);
 
 /* Policy blob parsing & validation */
 struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd);
@@ -168,14 +166,46 @@ const struct bpf_jit_rule *
 bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx);
 
 #if defined(CONFIG_X86_64)
-bool bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog);
-void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog);
-u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog);
-u32 bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog);
-u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog);
-struct exception_table_entry *
-bpf_jit_recompile_staged_extable(const struct bpf_prog *prog);
-u32 bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog);
+static inline bool
+bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_staged &&
+	       prog->aux->jit_recompile_bpf_func;
+}
+
+static inline void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_bpf_func;
+}
+
+static inline u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_jited_len;
+}
+
+static inline u32
+bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_fp_start;
+}
+
+static inline u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_fp_end;
+}
+
+static inline struct exception_table_entry *
+bpf_jit_recompile_staged_extable(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_extable;
+}
+
+static inline u32
+bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog)
+{
+	return prog->aux->jit_recompile_num_exentries;
+}
+
 int bpf_jit_recompile_commit(struct bpf_prog *prog);
 void bpf_jit_recompile_abort(struct bpf_prog *prog);
 #else

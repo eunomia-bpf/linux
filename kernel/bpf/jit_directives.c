@@ -20,15 +20,6 @@
 #define BPF_JIT_DIRECTIVES_MAX_BLOB_SIZE SZ_512K
 #define BPF_JIT_RECOMPILE_LOG_MAX_SIZE SZ_64K
 #define BPF_JIT_MAX_RULES		1024
-#define BPF_JIT_RULE_LOG_MSG_LEN	192
-
-struct bpf_jit_recompile_log {
-	char __user *ubuf;
-	char *kbuf;
-	u32 user_size;
-	u32 kernel_size;
-	u32 len;
-};
 
 struct bpf_jit_recompile_prog_state {
 	struct bpf_prog *prog;
@@ -51,47 +42,20 @@ struct bpf_jit_recompile_rollback_state {
 	u32 prog_state_cnt;
 };
 
-static struct bpf_jit_recompile_log *
-bpf_jit_recompile_log_ctx(const struct bpf_prog *prog)
-{
-	const struct bpf_prog_aux *main_aux;
-
-	if (!prog || !prog->aux)
-		return NULL;
-
-	main_aux = bpf_prog_main_aux(prog);
-	return main_aux->jit_recompile_log;
-}
-
-static void bpf_jit_recompile_log_appendv(struct bpf_jit_recompile_log *log,
-					  const char *fmt, va_list args)
-{
-	size_t avail;
-	int written;
-
-	if (!log || !log->kbuf || !log->kernel_size)
-		return;
-	if (log->len >= log->kernel_size - 1)
-		return;
-
-	avail = log->kernel_size - log->len;
-	written = vsnprintf(log->kbuf + log->len, avail, fmt, args);
-	if (written < 0)
-		return;
-
-	if ((size_t)written >= avail)
-		log->len = log->kernel_size - 1;
-	else
-		log->len += written;
-}
-
 void bpf_jit_recompile_prog_log(const struct bpf_prog *prog, const char *fmt, ...)
 {
-	struct bpf_jit_recompile_log *log = bpf_jit_recompile_log_ctx(prog);
+	struct bpf_verifier_log *log;
 	va_list args;
 
+	if (!prog || !prog->aux)
+		return;
+
+	log = bpf_prog_main_aux(prog)->jit_recompile_log;
+	if (!bpf_verifier_log_needed(log))
+		return;
+
 	va_start(args, fmt);
-	bpf_jit_recompile_log_appendv(log, fmt, args);
+	bpf_verifier_vlog(log, fmt, args);
 	va_end(args);
 }
 
@@ -99,103 +63,33 @@ void bpf_jit_recompile_rule_log(const struct bpf_prog *prog,
 				const struct bpf_jit_rule *rule,
 				const char *fmt, ...)
 {
-	struct bpf_jit_recompile_log *log = bpf_jit_recompile_log_ctx(prog);
-	char msg[BPF_JIT_RULE_LOG_MSG_LEN];
+	struct bpf_verifier_log *log;
 	u32 site_end = 0;
 	va_list args;
 
-	if (!log || !rule)
+	if (!prog || !prog->aux || !rule)
 		return;
 
-	va_start(args, fmt);
-	vsnprintf(msg, sizeof(msg), fmt, args);
-	va_end(args);
+	log = bpf_prog_main_aux(prog)->jit_recompile_log;
+	if (!bpf_verifier_log_needed(log))
+		return;
 
 	if (!check_add_overflow(rule->site_start,
 				rule->site_len ? rule->site_len - 1 : 0,
 				&site_end)) {
-		bpf_jit_recompile_prog_log(
-			prog,
-			"rule %u: form %u site %u-%u: %s\n",
+		bpf_log(log, "rule %u: form %u site %u-%u: ",
 			rule->user_index, rule->canonical_form,
-			rule->site_start, site_end, msg);
-		return;
+			rule->site_start, site_end);
+	} else {
+		bpf_log(log, "rule %u: form %u site %u: ",
+			rule->user_index, rule->canonical_form,
+			rule->site_start);
 	}
 
-	bpf_jit_recompile_prog_log(
-		prog,
-		"rule %u: form %u site %u: %s\n",
-		rule->user_index, rule->canonical_form,
-		rule->site_start, msg);
-}
-
-static struct bpf_jit_recompile_log *
-bpf_jit_recompile_log_alloc(const union bpf_attr *attr)
-{
-	struct bpf_jit_recompile_log *log;
-	u32 kernel_size;
-
-	if (!attr->jit_recompile.log_level ||
-	    !attr->jit_recompile.log_buf ||
-	    !attr->jit_recompile.log_size)
-		return NULL;
-
-	kernel_size = min_t(u32, attr->jit_recompile.log_size,
-			    BPF_JIT_RECOMPILE_LOG_MAX_SIZE);
-	log = kzalloc(sizeof(*log), GFP_KERNEL_ACCOUNT);
-	if (!log)
-		return ERR_PTR(-ENOMEM);
-
-	log->kbuf = kzalloc(kernel_size, GFP_KERNEL_ACCOUNT);
-	if (!log->kbuf) {
-		kfree(log);
-		return ERR_PTR(-ENOMEM);
-	}
-
-	log->ubuf = u64_to_user_ptr(attr->jit_recompile.log_buf);
-	log->user_size = attr->jit_recompile.log_size;
-	log->kernel_size = kernel_size;
-	return log;
-}
-
-static int bpf_jit_recompile_log_copy_to_user(struct bpf_jit_recompile_log *log)
-{
-	u32 copy_len;
-
-	if (!log || !log->ubuf || !log->user_size || !log->kbuf)
-		return 0;
-
-	copy_len = min(log->user_size, log->kernel_size);
-	if (!copy_len)
-		return 0;
-
-	log->kbuf[min(log->len, copy_len - 1)] = '\0';
-	if (copy_to_user(log->ubuf, log->kbuf, copy_len))
-		return -EFAULT;
-
-	return 0;
-}
-
-static void bpf_jit_recompile_log_free(struct bpf_jit_recompile_log *log)
-{
-	if (!log)
-		return;
-
-	kfree(log->kbuf);
-	kfree(log);
-}
-
-void bpf_jit_recompile_note_rule(const struct bpf_prog *prog,
-				 const struct bpf_jit_rule *rule,
-				 bool applied)
-{
-	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
-
-	if (!main_aux || !rule)
-		return;
-
-	if (applied)
-		main_aux->jit_recompile_num_applied++;
+	va_start(args, fmt);
+	bpf_verifier_vlog(log, fmt, args);
+	va_end(args);
+	bpf_log(log, "\n");
 }
 
 static void
@@ -317,22 +211,6 @@ bpf_jit_recompile_restore(struct bpf_jit_recompile_rollback_state *state)
 		state->main_aux->bpf_exception_cb = state->bpf_exception_cb;
 }
 
-static u32 bpf_jit_recompile_real_func_cnt(const struct bpf_prog_aux *main_aux)
-{
-	return main_aux->real_func_cnt ? : main_aux->func_cnt;
-}
-
-static void bpf_jit_recompile_stage_begin(struct bpf_prog *prog)
-{
-	bpf_jit_recompile_reset_prog_aux(prog);
-	prog->aux->jit_recompile_active = true;
-}
-
-static void bpf_jit_recompile_stage_end(struct bpf_prog *prog)
-{
-	prog->aux->jit_recompile_active = false;
-}
-
 static bool
 bpf_jit_recompile_stage_ok(const struct bpf_prog *prog,
 			   bpf_func_t old_bpf_func,
@@ -353,32 +231,6 @@ bpf_jit_recompile_stage_ok(const struct bpf_prog *prog,
 	return true;
 }
 
-static bpf_func_t bpf_jit_recompile_next_func(const struct bpf_prog *prog)
-{
-	return bpf_jit_recompile_staged_func(prog) ?: READ_ONCE(prog->bpf_func);
-}
-
-static void
-bpf_jit_recompile_shadow_ksym_prepare(struct bpf_prog *prog,
-				      struct bpf_ksym *shadow,
-				      unsigned long start, unsigned long end,
-				      struct exception_table_entry *extable,
-				      u32 num_exentries,
-				      u32 fp_start, u32 fp_end)
-{
-	memset(shadow, 0, sizeof(*shadow));
-	INIT_LIST_HEAD_RCU(&shadow->lnode);
-	shadow->start = start;
-	shadow->end = end;
-	strscpy(shadow->name, prog->aux->ksym.name, KSYM_NAME_LEN);
-	shadow->prog = prog->aux->ksym.prog;
-	shadow->owner = prog;
-	shadow->extable = extable;
-	shadow->num_exentries = num_exentries;
-	shadow->fp_start = fp_start;
-	shadow->fp_end = fp_end;
-}
-
 static void
 bpf_jit_recompile_shadow_ksym_add(struct bpf_prog *prog,
 				  bpf_func_t new_bpf_func, u32 new_len,
@@ -386,48 +238,29 @@ bpf_jit_recompile_shadow_ksym_add(struct bpf_prog *prog,
 				  u32 num_exentries,
 				  u32 fp_start, u32 fp_end)
 {
+	struct bpf_ksym *shadow = &prog->aux->jit_recompile_ksym;
+
 	if (!prog->aux->ksym.prog || !new_bpf_func || !new_len)
 		return;
 
-	bpf_jit_recompile_shadow_ksym_prepare(prog, &prog->aux->jit_recompile_ksym,
-					      (unsigned long)new_bpf_func,
-					      (unsigned long)new_bpf_func + new_len,
-					      extable, num_exentries,
-					      fp_start, fp_end);
-	bpf_ksym_add(&prog->aux->jit_recompile_ksym);
+	memset(shadow, 0, sizeof(*shadow));
+	INIT_LIST_HEAD_RCU(&shadow->lnode);
+	shadow->start = (unsigned long)new_bpf_func;
+	shadow->end = (unsigned long)new_bpf_func + new_len;
+	strscpy(shadow->name, prog->aux->ksym.name, KSYM_NAME_LEN);
+	shadow->prog = prog->aux->ksym.prog;
+	shadow->owner = prog;
+	shadow->extable = extable;
+	shadow->num_exentries = num_exentries;
+	shadow->fp_start = fp_start;
+	shadow->fp_end = fp_end;
+	bpf_ksym_add(shadow);
 }
 
 static void bpf_jit_recompile_shadow_ksym_del(struct bpf_prog *prog)
 {
 	if (!list_empty(&prog->aux->jit_recompile_ksym.lnode))
 		bpf_ksym_del(&prog->aux->jit_recompile_ksym);
-}
-
-static struct bpf_prog *
-bpf_jit_recompile_image_prog(struct bpf_prog *prog, u32 idx)
-{
-	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
-
-	if (main_aux->func_cnt && main_aux->func)
-		return main_aux->func[idx];
-
-	return prog;
-}
-
-static struct bpf_prog *
-bpf_jit_recompile_ksym_prog(struct bpf_prog *prog, u32 idx)
-{
-	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
-	u32 real_func_cnt = bpf_jit_recompile_real_func_cnt(main_aux);
-
-	if (!(main_aux->func_cnt && main_aux->func))
-		return prog;
-	if (!idx)
-		return prog;
-	if (idx < real_func_cnt)
-		return main_aux->func[idx];
-
-	return NULL;
 }
 
 /* ================================================================
@@ -612,71 +445,12 @@ static int rule_cmp(const void *a, const void *b)
 	return 0;
 }
 
-static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
-{
-	return rule->canonical_form;
-}
-
-static bool bpf_jit_native_choice_valid(u16 form, u16 native_choice)
-{
-	switch (form) {
-	case BPF_JIT_CF_COND_SELECT:
-		return native_choice == BPF_JIT_SEL_CMOVCC;
-	case BPF_JIT_CF_WIDE_MEM:
-		return native_choice == BPF_JIT_WMEM_WIDE_LOAD;
-	case BPF_JIT_CF_ROTATE:
-		return native_choice == BPF_JIT_ROT_ROR ||
-		       native_choice == BPF_JIT_ROT_RORX;
-	case BPF_JIT_CF_ADDR_CALC:
-		return native_choice == BPF_JIT_ACALC_LEA;
-	case BPF_JIT_CF_BITFIELD_EXTRACT:
-		return native_choice == BPF_JIT_BFX_EXTRACT;
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-		return native_choice == BPF_JIT_ZEXT_ELIDE;
-	case BPF_JIT_CF_ENDIAN_FUSION:
-		return native_choice == BPF_JIT_ENDIAN_MOVBE;
-	case BPF_JIT_CF_BRANCH_FLIP:
-		return native_choice == BPF_JIT_BFLIP_FLIPPED;
-	default:
-		return false;
-	}
-}
-
-static bool bpf_jit_canonical_form_valid(u16 form)
-{
-	switch (form) {
-	case BPF_JIT_CF_COND_SELECT:
-	case BPF_JIT_CF_WIDE_MEM:
-	case BPF_JIT_CF_ROTATE:
-	case BPF_JIT_CF_ADDR_CALC:
-	case BPF_JIT_CF_BITFIELD_EXTRACT:
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-	case BPF_JIT_CF_ENDIAN_FUSION:
-	case BPF_JIT_CF_BRANCH_FLIP:
-		return true;
-	default:
-		return false;
-	}
-}
-
-static bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule)
-{
-	return rule->site_len > 0 &&
-	       rule->site_len <= BPF_JIT_MAX_PATTERN_LEN &&
-	       bpf_jit_canonical_form_valid(rule->canonical_form);
-}
-
-static bool bpf_jit_compute_site_end(u32 site_start, u32 site_len, u32 *site_end)
-{
-	return !check_add_overflow(site_start, site_len, site_end);
-}
-
 static bool bpf_jit_site_range_valid(u32 site_start, u32 site_len,
 				     u32 insn_cnt, u32 *site_end)
 {
 	u32 end;
 
-	if (!bpf_jit_compute_site_end(site_start, site_len, &end))
+	if (check_add_overflow(site_start, site_len, &end))
 		return false;
 	if (end > insn_cnt)
 		return false;
@@ -949,11 +723,6 @@ bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
 {
 	struct bpf_jit_cond_select_shape shape;
 
-#if defined(CONFIG_X86_64)
-	if (rule->native_choice == BPF_JIT_SEL_CMOVCC &&
-	    !boot_cpu_has(X86_FEATURE_CMOV))
-		return false;
-#endif
 	if (!bpf_jit_parse_cond_select_shape(insns, insn_cnt, rule, &shape))
 		return false;
 
@@ -1127,230 +896,41 @@ struct bpf_jit_rotate_shape {
 	u8 amount;
 };
 
-/**
- * bpf_jit_validate_rotate_4insn - validate a 4-insn rotate idiom
- *
- * Classic pattern (mov+lsh+rsh+or):
- *   [0] mov   tmp, dst        (copy original)
- *   [1] lsh   dst, N          (left shift by rotation amount)
- *   [2] rsh   tmp, (W-N)      (right shift complement)
- *   [3] or    dst, tmp        (combine)
- *
- * Commuted pattern (mov+rsh+lsh+or) — clang often generates this:
- *   [0] mov   tmp, dst        (copy original)
- *   [1] rsh   tmp, (W-N)      (right shift complement on tmp)
- *   [2] lsh   dst, N          (left shift on original)
- *   [3] or    dst, tmp        (combine)
- *
- * Where W is 32 or 64 and N is the rotation amount (1..W-1).
- */
-static bool bpf_jit_parse_rotate_4insn(const struct bpf_insn *insns,
-				       u32 insn_cnt, u32 idx,
-				       struct bpf_jit_rotate_shape *shape)
+struct bpf_jit_rotate_spec {
+	u8 site_len;
+	u8 width;		/* 0 => infer from the first MOV class */
+	u8 insn_class;		/* 0 => infer from the first MOV class */
+	bool masked;
+	bool two_copy;
+	bool allow_shift_swap;
+};
+
+static bool bpf_jit_rotate_match_copy(const struct bpf_insn *insn,
+				      u8 insn_class)
 {
-	const struct bpf_insn *mov_insn, *insn1, *insn2, *or_insn;
-	const struct bpf_insn *lsh_insn, *rsh_insn;
-	u8 lsh_cls, rsh_cls, or_cls;
-	u32 width, rot_amount;
-	bool commuted;
-
-	if (idx + 4 > insn_cnt)
-		return false;
-
-	mov_insn = &insns[idx];
-	insn1    = &insns[idx + 1];
-	insn2    = &insns[idx + 2];
-	or_insn  = &insns[idx + 3];
-
-	/* [0] Must be MOV_X (reg-to-reg copy) */
-	if (BPF_OP(mov_insn->code) != BPF_MOV ||
-	    BPF_SRC(mov_insn->code) != BPF_X ||
-	    mov_insn->off != 0 || mov_insn->imm != 0)
-		return false;
-
-	/* Determine width from MOV class */
-	if (BPF_CLASS(mov_insn->code) == BPF_ALU64)
-		width = 64;
-	else if (BPF_CLASS(mov_insn->code) == BPF_ALU)
-		width = 32;
-	else
-		return false;
-
-	/* The temporary must stay distinct from the rotate destination. */
-	if (mov_insn->dst_reg == mov_insn->src_reg)
-		return false;
-
-	/*
-	 * Detect ordering: classic (lsh+rsh) or commuted (rsh+lsh).
-	 * Check insn1: if it's LSH, classic; if RSH, commuted.
-	 */
-	if (BPF_OP(insn1->code) == BPF_LSH && BPF_SRC(insn1->code) == BPF_K) {
-		commuted = false;
-		lsh_insn = insn1;
-		rsh_insn = insn2;
-	} else if (BPF_OP(insn1->code) == BPF_RSH && BPF_SRC(insn1->code) == BPF_K) {
-		commuted = true;
-		rsh_insn = insn1;
-		lsh_insn = insn2;
-	} else {
-		return false;
-	}
-
-	/* Validate LSH instruction */
-	lsh_cls = BPF_CLASS(lsh_insn->code);
-	if (BPF_OP(lsh_insn->code) != BPF_LSH || BPF_SRC(lsh_insn->code) != BPF_K)
-		return false;
-	if ((width == 64 && lsh_cls != BPF_ALU64) ||
-	    (width == 32 && lsh_cls != BPF_ALU))
-		return false;
-	if (lsh_insn->off != 0)
-		return false;
-	/* lsh dst must be the original src register */
-	if (lsh_insn->dst_reg != mov_insn->src_reg)
-		return false;
-
-	rot_amount = (u32)lsh_insn->imm;
-	if (rot_amount == 0 || rot_amount >= width)
-		return false;
-
-	/* Validate RSH instruction */
-	rsh_cls = BPF_CLASS(rsh_insn->code);
-	if (BPF_OP(rsh_insn->code) != BPF_RSH || BPF_SRC(rsh_insn->code) != BPF_K)
-		return false;
-	if ((width == 64 && rsh_cls != BPF_ALU64) ||
-	    (width == 32 && rsh_cls != BPF_ALU))
-		return false;
-	if (rsh_insn->off != 0)
-		return false;
-	/* rsh dst must be the tmp register */
-	if (rsh_insn->dst_reg != mov_insn->dst_reg)
-		return false;
-	if ((u32)rsh_insn->imm != width - rot_amount)
-		return false;
-
-	/* [3] or dst, tmp */
-	or_cls = BPF_CLASS(or_insn->code);
-	if (BPF_OP(or_insn->code) != BPF_OR || BPF_SRC(or_insn->code) != BPF_X)
-		return false;
-	if ((width == 64 && or_cls != BPF_ALU64) ||
-	    (width == 32 && or_cls != BPF_ALU))
-		return false;
-	if (or_insn->off != 0 || or_insn->imm != 0)
-		return false;
-	if (or_insn->dst_reg != mov_insn->src_reg)
-		return false;
-	if (or_insn->src_reg != mov_insn->dst_reg)
-		return false;
-
-	if (shape) {
-		shape->dst_reg = mov_insn->src_reg;
-		shape->src_reg = mov_insn->src_reg;
-		shape->width = (u8)width;
-		shape->amount = (u8)rot_amount;
-	}
-
-	(void)commuted; /* both orderings produce the same result */
-	return true;
+	return BPF_CLASS(insn->code) == insn_class &&
+	       BPF_OP(insn->code) == BPF_MOV &&
+	       BPF_SRC(insn->code) == BPF_X &&
+	       !insn->off &&
+	       !insn->imm;
 }
 
-/**
- * bpf_jit_validate_rotate_5insn - validate a 5-insn two-copy rotate
- *
- * clang often generates this pattern for 64-bit rotates:
- *   [0] mov64  tmp, src       (copy for right-shift path)
- *   [1] rsh64  tmp, (W-N)     (right shift complement)
- *   [2] mov64  dst, src       (copy for left-shift path, same src as [0])
- *   [3] lsh64  dst, N         (left shift)
- *   [4] or64   dst, tmp       (combine)
- *
- * Where W is 64 and N is the rotation amount (1..63).
- * Result register is dst (insns[idx+2].dst_reg).
- */
-static bool bpf_jit_parse_rotate_5insn(const struct bpf_insn *insns,
-				       u32 insn_cnt, u32 idx,
-				       struct bpf_jit_rotate_shape *shape)
+static bool bpf_jit_rotate_match_shift(const struct bpf_insn *insn,
+				       u8 insn_class, u8 op, u8 dst_reg,
+				       u32 width, u32 *amount)
 {
-	const struct bpf_insn *mov1, *rsh_insn, *mov2, *lsh_insn, *or_insn;
-	u32 rot_amount, rsh_amount;
+	u32 imm = (u32)insn->imm;
 
-	if (idx + 5 > insn_cnt)
+	if (BPF_CLASS(insn->code) != insn_class ||
+	    BPF_OP(insn->code) != op ||
+	    BPF_SRC(insn->code) != BPF_K)
 		return false;
-
-	mov1     = &insns[idx];
-	rsh_insn = &insns[idx + 1];
-	mov2     = &insns[idx + 2];
-	lsh_insn = &insns[idx + 3];
-	or_insn  = &insns[idx + 4];
-
-	/* [0] mov64 tmp, src */
-	if (BPF_CLASS(mov1->code) != BPF_ALU64 ||
-	    BPF_OP(mov1->code) != BPF_MOV ||
-	    BPF_SRC(mov1->code) != BPF_X)
+	if (insn->off != 0 || insn->dst_reg != dst_reg)
 		return false;
-	if (mov1->off != 0 || mov1->imm != 0)
+	if (!imm || imm >= width)
 		return false;
 
-	/* [1] rsh64 tmp, (W-N) */
-	if (BPF_CLASS(rsh_insn->code) != BPF_ALU64 ||
-	    BPF_OP(rsh_insn->code) != BPF_RSH ||
-	    BPF_SRC(rsh_insn->code) != BPF_K)
-		return false;
-	if (rsh_insn->off != 0)
-		return false;
-	if (rsh_insn->dst_reg != mov1->dst_reg)
-		return false;
-	rsh_amount = (u32)rsh_insn->imm;
-	if (rsh_amount == 0 || rsh_amount >= 64)
-		return false;
-
-	/* [2] mov64 dst, src — must have the same source as [0] */
-	if (BPF_CLASS(mov2->code) != BPF_ALU64 ||
-	    BPF_OP(mov2->code) != BPF_MOV ||
-	    BPF_SRC(mov2->code) != BPF_X)
-		return false;
-	if (mov2->off != 0 || mov2->imm != 0)
-		return false;
-	if (mov2->src_reg != mov1->src_reg)
-		return false;
-	if (mov1->dst_reg == mov1->src_reg || mov1->dst_reg == mov2->dst_reg)
-		return false;
-
-	/* [3] lsh64 dst, N */
-	if (BPF_CLASS(lsh_insn->code) != BPF_ALU64 ||
-	    BPF_OP(lsh_insn->code) != BPF_LSH ||
-	    BPF_SRC(lsh_insn->code) != BPF_K)
-		return false;
-	if (lsh_insn->off != 0)
-		return false;
-	if (lsh_insn->dst_reg != mov2->dst_reg)
-		return false;
-	rot_amount = (u32)lsh_insn->imm;
-	if (rot_amount == 0 || rot_amount >= 64)
-		return false;
-
-	/* Verify: N + rsh_amount == 64 */
-	if (rot_amount + rsh_amount != 64)
-		return false;
-
-	/* [4] or64 dst, tmp */
-	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
-	    BPF_OP(or_insn->code) != BPF_OR ||
-	    BPF_SRC(or_insn->code) != BPF_X)
-		return false;
-	if (or_insn->off != 0 || or_insn->imm != 0)
-		return false;
-	if (or_insn->dst_reg != mov2->dst_reg)
-		return false;
-	if (or_insn->src_reg != mov1->dst_reg)
-		return false;
-
-	if (shape) {
-		shape->dst_reg = mov2->dst_reg;
-		shape->src_reg = mov1->src_reg;
-		shape->width = 64;
-		shape->amount = (u8)rot_amount;
-	}
-
+	*amount = imm;
 	return true;
 }
 
@@ -1379,222 +959,110 @@ static bool bpf_jit_rotate_mask_matches(u32 rot_amount, s32 imm)
 
 	return mask == low_mask || mask == high_mask;
 }
-
-static bool bpf_jit_parse_rotate_5insn_masked(
-	const struct bpf_insn *insns,
-	u32 insn_cnt, u32 idx,
-	struct bpf_jit_rotate_shape *shape)
+static bool
+bpf_jit_rotate_validate_common(const struct bpf_insn *insns, u32 idx,
+			       const struct bpf_jit_rotate_spec *spec,
+			       struct bpf_jit_rotate_shape *shape)
 {
-	const struct bpf_insn *mov_insn, *and_insn, *insn2, *insn3, *or_insn;
-	const struct bpf_insn *lsh_insn, *rsh_insn;
-	u32 rot_amount, rsh_amount;
+	const struct bpf_insn *mov1 = &insns[idx];
+	const struct bpf_insn *and_insn = NULL;
+	const struct bpf_insn *mov2 = NULL;
+	const struct bpf_insn *or_insn = &insns[idx + spec->site_len - 1];
+	const struct bpf_insn *shift1;
+	const struct bpf_insn *shift2;
+	const struct bpf_insn *lsh_insn;
+	const struct bpf_insn *rsh_insn;
+	u8 insn_class, dst_reg;
+	u32 width, rot_amount, rsh_amount;
 
-	if (idx + 5 > insn_cnt)
-		return false;
+	if (spec->masked)
+		and_insn = &insns[idx + 1];
+	if (spec->two_copy)
+		mov2 = &insns[idx + (spec->masked ? 3 : 2)];
 
-	mov_insn = &insns[idx];
-	and_insn = &insns[idx + 1];
-	insn2    = &insns[idx + 2];
-	insn3    = &insns[idx + 3];
-	or_insn  = &insns[idx + 4];
-
-	/* [0] mov64 tmp, src */
-	if (BPF_CLASS(mov_insn->code) != BPF_ALU64 ||
-	    BPF_OP(mov_insn->code) != BPF_MOV ||
-	    BPF_SRC(mov_insn->code) != BPF_X)
+	if (!bpf_jit_rotate_match_copy(mov1,
+				       spec->insn_class ?: BPF_CLASS(mov1->code)))
 		return false;
-	if (mov_insn->off != 0 || mov_insn->imm != 0)
-		return false;
-	if (mov_insn->dst_reg == mov_insn->src_reg)
-		return false;
-
-	/* [1] and64 tmp, mask (AND_K only; the mask must prove rotate shape) */
-	if (BPF_CLASS(and_insn->code) != BPF_ALU64 ||
-	    BPF_OP(and_insn->code) != BPF_AND ||
-	    BPF_SRC(and_insn->code) != BPF_K)
-		return false;
-	if (and_insn->off != 0)
-		return false;
-	if (and_insn->dst_reg != mov_insn->dst_reg)
+	if (mov1->dst_reg == mov1->src_reg)
 		return false;
 
-	/* [2,3] rsh and lsh in either order */
-	if (BPF_OP(insn2->code) == BPF_RSH &&
-	    BPF_SRC(insn2->code) == BPF_K &&
-	    BPF_CLASS(insn2->code) == BPF_ALU64 &&
-	    BPF_OP(insn3->code) == BPF_LSH &&
-	    BPF_SRC(insn3->code) == BPF_K &&
-	    BPF_CLASS(insn3->code) == BPF_ALU64) {
-		rsh_insn = insn2;
-		lsh_insn = insn3;
-	} else if (BPF_OP(insn2->code) == BPF_LSH &&
-		   BPF_SRC(insn2->code) == BPF_K &&
-		   BPF_CLASS(insn2->code) == BPF_ALU64 &&
-		   BPF_OP(insn3->code) == BPF_RSH &&
-		   BPF_SRC(insn3->code) == BPF_K &&
-		   BPF_CLASS(insn3->code) == BPF_ALU64) {
-		lsh_insn = insn2;
-		rsh_insn = insn3;
+	if (spec->insn_class) {
+		insn_class = spec->insn_class;
+		width = spec->width;
+	} else if (BPF_CLASS(mov1->code) == BPF_ALU64) {
+		insn_class = BPF_ALU64;
+		width = 64;
+	} else if (BPF_CLASS(mov1->code) == BPF_ALU) {
+		insn_class = BPF_ALU;
+		width = 32;
 	} else {
 		return false;
 	}
 
-	/* rsh must operate on tmp */
-	if (rsh_insn->off != 0)
-		return false;
-	if (rsh_insn->dst_reg != mov_insn->dst_reg)
-		return false;
-	/* lsh must operate on original (src) */
-	if (lsh_insn->off != 0)
-		return false;
-	if (lsh_insn->dst_reg != mov_insn->src_reg)
-		return false;
-
-	rot_amount = (u32)lsh_insn->imm;
-	rsh_amount = (u32)rsh_insn->imm;
-	if (rot_amount == 0 || rot_amount >= 32)
-		return false;
-	if (rsh_amount == 0 || rsh_amount >= 32)
-		return false;
-	if (rot_amount + rsh_amount != 32)
-		return false;
-
-	/* [4] or64 src, tmp */
-	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
-	    BPF_OP(or_insn->code) != BPF_OR ||
-	    BPF_SRC(or_insn->code) != BPF_X)
-		return false;
-	if (or_insn->off != 0 || or_insn->imm != 0)
-		return false;
-	if (or_insn->dst_reg != mov_insn->src_reg)
-		return false;
-	if (or_insn->src_reg != mov_insn->dst_reg)
-		return false;
-
-	if (!bpf_jit_rotate_mask_matches(rot_amount, and_insn->imm))
-		return false;
-
-	if (shape) {
-		shape->dst_reg = mov_insn->src_reg;
-		shape->src_reg = mov_insn->src_reg;
-		shape->width = 32;
-		shape->amount = (u8)rot_amount;
+	if (spec->masked) {
+		if (BPF_CLASS(and_insn->code) != insn_class ||
+		    BPF_OP(and_insn->code) != BPF_AND ||
+		    BPF_SRC(and_insn->code) != BPF_K)
+			return false;
+		if (and_insn->off != 0 || and_insn->dst_reg != mov1->dst_reg)
+			return false;
 	}
 
-	return true;
-}
+	if (spec->two_copy) {
+		if (!bpf_jit_rotate_match_copy(mov2, insn_class))
+			return false;
+		if (mov2->src_reg != mov1->src_reg ||
+		    mov2->dst_reg == mov1->dst_reg)
+			return false;
+		dst_reg = mov2->dst_reg;
+	} else {
+		dst_reg = mov1->src_reg;
+	}
 
-/**
- * bpf_jit_validate_rotate_6insn - validate a 6-insn masked 32-bit rotate
- *
- * clang generates this pattern for 32-bit rotates in a 64-bit context:
- *   [0] mov64  tmp, src       (copy for right-shift path)
- *   [1] and64  tmp, mask      (BPF_ALU64|BPF_AND|BPF_K — mask bits)
- *   [2] rsh64  tmp, (32-N)    (right shift by complement)
- *   [3] mov64  dst, src       (copy for left-shift path, same src as [0])
- *   [4] lsh64  dst, N         (left shift)
- *   [5] or64   dst, tmp       (combine)
- *
- * This is always a 32-bit rotate (width=32), proven by the masking.
- * N + rsh_amount == 32.
- */
-static bool bpf_jit_parse_rotate_6insn(const struct bpf_insn *insns,
-				       u32 insn_cnt, u32 idx,
-				       struct bpf_jit_rotate_shape *shape)
-{
-	const struct bpf_insn *mov1, *and_insn, *rsh_insn;
-	const struct bpf_insn *mov2, *lsh_insn, *or_insn;
-	u32 rot_amount, rsh_amount;
+	if (spec->allow_shift_swap) {
+		shift1 = &insns[idx + (spec->masked ? 2 : 1)];
+		shift2 = &insns[idx + (spec->masked ? 3 : 2)];
 
-	if (idx + 6 > insn_cnt)
+		if (BPF_OP(shift1->code) == BPF_LSH && BPF_OP(shift2->code) == BPF_RSH) {
+			lsh_insn = shift1;
+			rsh_insn = shift2;
+		} else if (BPF_OP(shift1->code) == BPF_RSH &&
+			   BPF_OP(shift2->code) == BPF_LSH) {
+			rsh_insn = shift1;
+			lsh_insn = shift2;
+		} else {
+			return false;
+		}
+	} else {
+		rsh_insn = &insns[idx + (spec->masked ? 2 : 1)];
+		lsh_insn = &insns[idx + (spec->masked ? 4 : 3)];
+	}
+
+	if (!bpf_jit_rotate_match_shift(rsh_insn, insn_class, BPF_RSH,
+					mov1->dst_reg, width, &rsh_amount) ||
+	    !bpf_jit_rotate_match_shift(lsh_insn, insn_class, BPF_LSH,
+					dst_reg, width, &rot_amount))
 		return false;
-
-	mov1     = &insns[idx];
-	and_insn = &insns[idx + 1];
-	rsh_insn = &insns[idx + 2];
-	mov2     = &insns[idx + 3];
-	lsh_insn = &insns[idx + 4];
-	or_insn  = &insns[idx + 5];
-
-	/* [0] mov64 tmp, src — reg-to-reg copy, ALU64 */
-	if (BPF_CLASS(mov1->code) != BPF_ALU64 ||
-	    BPF_OP(mov1->code) != BPF_MOV ||
-	    BPF_SRC(mov1->code) != BPF_X)
-		return false;
-	if (mov1->off != 0 || mov1->imm != 0)
+	if (rot_amount + rsh_amount != width)
 		return false;
 
-	/* [1] and64 tmp, mask — immediate only; the mask must prove rotate shape. */
-	if (BPF_CLASS(and_insn->code) != BPF_ALU64 ||
-	    BPF_OP(and_insn->code) != BPF_AND ||
-	    BPF_SRC(and_insn->code) != BPF_K)
-		return false;
-	if (and_insn->off != 0)
-		return false;
-	if (and_insn->dst_reg != mov1->dst_reg)
-		return false;
-
-	/* [2] rsh64 tmp, (32-N) */
-	if (BPF_CLASS(rsh_insn->code) != BPF_ALU64 ||
-	    BPF_OP(rsh_insn->code) != BPF_RSH ||
-	    BPF_SRC(rsh_insn->code) != BPF_K)
-		return false;
-	if (rsh_insn->off != 0)
-		return false;
-	if (rsh_insn->dst_reg != mov1->dst_reg)
-		return false;
-	rsh_amount = (u32)rsh_insn->imm;
-	if (rsh_amount == 0 || rsh_amount >= 32)
-		return false;
-
-	/* [3] mov64 dst, src — must use the same source as [0] */
-	if (BPF_CLASS(mov2->code) != BPF_ALU64 ||
-	    BPF_OP(mov2->code) != BPF_MOV ||
-	    BPF_SRC(mov2->code) != BPF_X)
-		return false;
-	if (mov2->off != 0 || mov2->imm != 0)
-		return false;
-	if (mov2->src_reg != mov1->src_reg)
-		return false;
-	if (mov1->dst_reg == mov1->src_reg || mov1->dst_reg == mov2->dst_reg)
-		return false;
-
-	/* [4] lsh64 dst, N */
-	if (BPF_CLASS(lsh_insn->code) != BPF_ALU64 ||
-	    BPF_OP(lsh_insn->code) != BPF_LSH ||
-	    BPF_SRC(lsh_insn->code) != BPF_K)
-		return false;
-	if (lsh_insn->off != 0)
-		return false;
-	if (lsh_insn->dst_reg != mov2->dst_reg)
-		return false;
-	rot_amount = (u32)lsh_insn->imm;
-	if (rot_amount == 0 || rot_amount >= 32)
-		return false;
-
-	/* Verify: N + rsh_amount == 32 */
-	if (rot_amount + rsh_amount != 32)
-		return false;
-
-	/* [5] or64 dst, tmp */
-	if (BPF_CLASS(or_insn->code) != BPF_ALU64 ||
+	if (BPF_CLASS(or_insn->code) != insn_class ||
 	    BPF_OP(or_insn->code) != BPF_OR ||
 	    BPF_SRC(or_insn->code) != BPF_X)
 		return false;
 	if (or_insn->off != 0 || or_insn->imm != 0)
 		return false;
-	if (or_insn->dst_reg != mov2->dst_reg)
-		return false;
-	if (or_insn->src_reg != mov1->dst_reg)
+	if (or_insn->dst_reg != dst_reg || or_insn->src_reg != mov1->dst_reg)
 		return false;
 
-	if (!bpf_jit_rotate_mask_matches(rot_amount, and_insn->imm))
+	if (spec->masked &&
+	    !bpf_jit_rotate_mask_matches(rot_amount, and_insn->imm))
 		return false;
 
 	if (shape) {
-		shape->dst_reg = mov2->dst_reg;
+		shape->dst_reg = dst_reg;
 		shape->src_reg = mov1->src_reg;
-		shape->width = 32;
+		shape->width = (u8)width;
 		shape->amount = (u8)rot_amount;
 	}
 
@@ -1604,10 +1072,12 @@ static bool bpf_jit_parse_rotate_6insn(const struct bpf_insn *insns,
 /**
  * bpf_jit_validate_rotate_rule - validate a ROTATE rule against prog
  *
- * Supports three patterns:
- *   site_len==4: 4-insn rotate, classic (mov+lsh+rsh+or) or commuted (mov+rsh+lsh+or)
- *   site_len==5: 5-insn two-copy 64-bit rotate (mov+rsh+mov+lsh+or)
- *   site_len==6: clang's 6-insn masked 32-bit rotate (mov+and+rsh+mov+lsh+or)
+ * Supports four source shapes that all normalize to the same
+ * dst/src/amount/width canonical parameter set:
+ *   site_len==4: classic or commuted in-place rotate
+ *   site_len==5: 64-bit two-copy rotate
+ *   site_len==5: masked 32-bit in-place rotate
+ *   site_len==6: masked 32-bit two-copy rotate
  */
 static bool
 bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
@@ -1615,33 +1085,31 @@ bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 			     const struct bpf_jit_rule *rule,
 			     struct bpf_jit_canonical_params *params)
 {
+	static const struct bpf_jit_rotate_spec rotate_specs[] = {
+		{ .site_len = 4, .allow_shift_swap = true },
+		{ .site_len = 5, .width = 64, .insn_class = BPF_ALU64,
+		  .two_copy = true },
+		{ .site_len = 5, .width = 32, .insn_class = BPF_ALU64,
+		  .masked = true, .allow_shift_swap = true },
+		{ .site_len = 6, .width = 32, .insn_class = BPF_ALU64,
+		  .masked = true, .two_copy = true },
+	};
 	struct bpf_jit_rotate_shape shape;
-	bool shape_ok;
+	u32 i;
 
-#if defined(CONFIG_X86_64)
-	if (rule->native_choice == BPF_JIT_ROT_RORX &&
-	    !boot_cpu_has(X86_FEATURE_BMI2))
-		return false;
-#endif
-	if (rule->site_len == 4)
-		shape_ok = bpf_jit_parse_rotate_4insn(insns, insn_cnt,
-						      rule->site_start, &shape);
-	else if (rule->site_len == 5)
-		/* Try 64-bit two-copy first, then 32-bit masked */
-		shape_ok = bpf_jit_parse_rotate_5insn(insns, insn_cnt,
-						      rule->site_start, &shape) ||
-			   bpf_jit_parse_rotate_5insn_masked(insns, insn_cnt,
-							     rule->site_start,
-							     &shape);
-	else if (rule->site_len == 6)
-		shape_ok = bpf_jit_parse_rotate_6insn(insns, insn_cnt,
-						      rule->site_start, &shape);
-	else
-		return false;
+	(void)insn_cnt;
 
-	if (!shape_ok)
-		return false;
+	for (i = 0; i < ARRAY_SIZE(rotate_specs); i++) {
+		if (rotate_specs[i].site_len != rule->site_len)
+			continue;
+		if (bpf_jit_rotate_validate_common(insns, rule->site_start,
+						   &rotate_specs[i], &shape))
+			goto out_fill;
+	}
 
+	return false;
+
+out_fill:
 	if (params) {
 		memset(params, 0, sizeof(*params));
 		bpf_jit_param_set_reg(params, BPF_JIT_ROT_PARAM_DST_REG,
@@ -1668,7 +1136,6 @@ struct bpf_jit_bitfield_extract_desc {
 
 static bool bpf_jit_parse_bitfield_extract_site(
 	const struct bpf_insn *insns,
-	u32 insn_cnt,
 	const struct bpf_jit_rule *rule,
 	struct bpf_jit_bitfield_extract_desc *desc)
 {
@@ -1681,14 +1148,10 @@ static bool bpf_jit_parse_bitfield_extract_site(
 	bool mask_first;
 
 	if (rule->site_len == 3) {
-		if (idx + 3 > insn_cnt)
-			return false;
 		mov_insn = &insns[idx];
 		first = &insns[idx + 1];
 		second = &insns[idx + 2];
 	} else if (rule->site_len == 2) {
-		if (idx + 2 > insn_cnt)
-			return false;
 		first = &insns[idx];
 		second = &insns[idx + 1];
 	} else {
@@ -1766,7 +1229,7 @@ bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
 {
 	struct bpf_jit_bitfield_extract_desc desc;
 
-	if (!bpf_jit_parse_bitfield_extract_site(insns, insn_cnt, rule, &desc))
+	if (!bpf_jit_parse_bitfield_extract_site(insns, rule, &desc))
 		return false;
 
 	if (params) {
@@ -1808,7 +1271,6 @@ struct bpf_jit_addr_calc_shape {
 
 static bool bpf_jit_parse_addr_calc_shape(
 	const struct bpf_insn *insns,
-	u32 insn_cnt,
 	const struct bpf_jit_rule *rule,
 	struct bpf_jit_addr_calc_shape *shape)
 {
@@ -1816,9 +1278,6 @@ static bool bpf_jit_parse_addr_calc_shape(
 	const struct bpf_insn *mov_insn, *lsh_insn, *add_insn;
 
 	if (rule->site_len != 3)
-		return false;
-
-	if (idx + 3 > insn_cnt)
 		return false;
 
 	mov_insn = &insns[idx];
@@ -1864,7 +1323,7 @@ bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
 {
 	struct bpf_jit_addr_calc_shape shape;
 
-	if (!bpf_jit_parse_addr_calc_shape(insns, insn_cnt, rule, &shape))
+	if (!bpf_jit_parse_addr_calc_shape(insns, rule, &shape))
 		return false;
 
 	if (params) {
@@ -1920,7 +1379,6 @@ struct bpf_jit_zero_ext_elide_shape {
 
 static bool bpf_jit_parse_zero_ext_elide_shape(
 	const struct bpf_insn *insns,
-	u32 insn_cnt,
 	const struct bpf_jit_rule *rule,
 	struct bpf_jit_zero_ext_elide_shape *shape)
 {
@@ -1928,7 +1386,7 @@ static bool bpf_jit_parse_zero_ext_elide_shape(
 	const struct bpf_insn *zext_insn;
 	u32 idx = rule->site_start;
 
-	if (rule->site_len != 2 || idx + 2 > insn_cnt)
+	if (rule->site_len != 2)
 		return false;
 
 	alu32_insn = &insns[idx];
@@ -1956,7 +1414,7 @@ bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
 {
 	struct bpf_jit_zero_ext_elide_shape shape;
 
-	if (!bpf_jit_parse_zero_ext_elide_shape(insns, insn_cnt, rule, &shape))
+	if (!bpf_jit_parse_zero_ext_elide_shape(insns, rule, &shape))
 		return false;
 
 	if (params) {
@@ -2017,7 +1475,6 @@ struct bpf_jit_endian_fusion_shape {
 
 static bool bpf_jit_parse_endian_fusion_shape(
 	const struct bpf_insn *insns,
-	u32 insn_cnt,
 	const struct bpf_jit_rule *rule,
 	struct bpf_jit_endian_fusion_shape *shape)
 {
@@ -2026,7 +1483,7 @@ static bool bpf_jit_parse_endian_fusion_shape(
 	s32 width_bits;
 	u32 idx = rule->site_start;
 
-	if (rule->site_len != 2 || idx + 2 > insn_cnt)
+	if (rule->site_len != 2)
 		return false;
 
 	first = &insns[idx];
@@ -2076,12 +1533,7 @@ bpf_jit_validate_endian_fusion_rule(const struct bpf_insn *insns,
 {
 	struct bpf_jit_endian_fusion_shape shape;
 
-#if defined(CONFIG_X86_64)
-	if (rule->native_choice == BPF_JIT_ENDIAN_MOVBE &&
-	    !boot_cpu_has(X86_FEATURE_MOVBE))
-		return false;
-#endif
-	if (!bpf_jit_parse_endian_fusion_shape(insns, insn_cnt, rule, &shape))
+	if (!bpf_jit_parse_endian_fusion_shape(insns, rule, &shape))
 		return false;
 
 	if (params) {
@@ -2149,7 +1601,7 @@ static bool bpf_jit_parse_branch_flip_shape(
 	u32 body_a_start, body_b_start, body_a_len, body_b_len, join_target;
 	u32 ja_idx;
 
-	if (rule->site_len < 4 || idx + rule->site_len > insn_cnt)
+	if (rule->site_len < 4)
 		return false;
 
 	jcc = &insns[idx];
@@ -2266,7 +1718,7 @@ static bool bpf_jit_site_has_side_effects(const struct bpf_insn *insns,
 	u32 site_end;
 	u32 i;
 
-	if (!bpf_jit_compute_site_end(site_start, site_len, &site_end))
+	if (check_add_overflow(site_start, site_len, &site_end))
 		return true;
 
 	for (i = site_start; i < site_end; i++) {
@@ -2308,12 +1760,129 @@ static bool bpf_jit_branch_flip_cond_op_valid(u8 op)
 	return op == BPF_JSET || bpf_jit_cond_op_valid(op);
 }
 
+struct bpf_jit_form_meta {
+	const char *name;
+	unsigned long native_choice_mask;
+	bool allow_side_effects;
+	bool (*choice_supported)(u16 native_choice);
+	bool (*validate)(const struct bpf_insn *insns, u32 insn_cnt,
+			 const struct bpf_jit_rule *rule,
+			 struct bpf_jit_canonical_params *params);
+};
+
+static bool bpf_jit_choice_always_supported(u16 native_choice)
+{
+	return true;
+}
+
+static bool bpf_jit_cond_select_choice_supported(u16 native_choice)
+{
+#if defined(CONFIG_X86_64)
+	return native_choice != BPF_JIT_SEL_CMOVCC ||
+	       boot_cpu_has(X86_FEATURE_CMOV);
+#else
+	return true;
+#endif
+}
+
+static bool bpf_jit_rotate_choice_supported(u16 native_choice)
+{
+#if defined(CONFIG_X86_64)
+	return native_choice != BPF_JIT_ROT_RORX ||
+	       boot_cpu_has(X86_FEATURE_BMI2);
+#else
+	return true;
+#endif
+}
+
+static bool bpf_jit_endian_choice_supported(u16 native_choice)
+{
+#if defined(CONFIG_X86_64)
+	return native_choice != BPF_JIT_ENDIAN_MOVBE ||
+	       boot_cpu_has(X86_FEATURE_MOVBE);
+#else
+	return true;
+#endif
+}
+
+static const struct bpf_jit_form_meta bpf_jit_form_meta[] = {
+	[BPF_JIT_CF_ROTATE] = {
+		.name = "rotate",
+		.native_choice_mask = BIT(BPF_JIT_ROT_ROR) |
+				      BIT(BPF_JIT_ROT_RORX),
+		.choice_supported = bpf_jit_rotate_choice_supported,
+		.validate = bpf_jit_validate_rotate_rule,
+	},
+	[BPF_JIT_CF_WIDE_MEM] = {
+		.name = "wide_mem",
+		.native_choice_mask = BIT(BPF_JIT_WMEM_WIDE_LOAD),
+		.choice_supported = bpf_jit_choice_always_supported,
+		.validate = bpf_jit_validate_wide_mem_rule,
+	},
+	[BPF_JIT_CF_ADDR_CALC] = {
+		.name = "addr_calc",
+		.native_choice_mask = BIT(BPF_JIT_ACALC_LEA),
+		.choice_supported = bpf_jit_choice_always_supported,
+		.validate = bpf_jit_validate_addr_calc_rule,
+	},
+	[BPF_JIT_CF_COND_SELECT] = {
+		.name = "cond_select",
+		.native_choice_mask = BIT(BPF_JIT_SEL_CMOVCC),
+		.choice_supported = bpf_jit_cond_select_choice_supported,
+		.validate = bpf_jit_validate_cond_select_rule,
+	},
+	[BPF_JIT_CF_BITFIELD_EXTRACT] = {
+		.name = "bitfield_extract",
+		.native_choice_mask = BIT(BPF_JIT_BFX_EXTRACT),
+		.choice_supported = bpf_jit_choice_always_supported,
+		.validate = bpf_jit_validate_bitfield_extract_rule,
+	},
+	[BPF_JIT_CF_ZERO_EXT_ELIDE] = {
+		.name = "zero_ext_elide",
+		.native_choice_mask = BIT(BPF_JIT_ZEXT_ELIDE),
+		.choice_supported = bpf_jit_choice_always_supported,
+		.validate = bpf_jit_validate_zero_ext_elide_rule,
+	},
+	[BPF_JIT_CF_ENDIAN_FUSION] = {
+		.name = "endian_fusion",
+		.native_choice_mask = BIT(BPF_JIT_ENDIAN_MOVBE),
+		.allow_side_effects = true,
+		.choice_supported = bpf_jit_endian_choice_supported,
+		.validate = bpf_jit_validate_endian_fusion_rule,
+	},
+	[BPF_JIT_CF_BRANCH_FLIP] = {
+		.name = "branch_flip",
+		.native_choice_mask = BIT(BPF_JIT_BFLIP_FLIPPED),
+		.choice_supported = bpf_jit_choice_always_supported,
+		.validate = bpf_jit_validate_branch_flip_rule,
+	},
+};
+
+static const struct bpf_jit_form_meta *bpf_jit_get_form_meta(u16 form)
+{
+	if (form >= ARRAY_SIZE(bpf_jit_form_meta) ||
+	    !bpf_jit_form_meta[form].validate)
+		return NULL;
+
+	return &bpf_jit_form_meta[form];
+}
+
+static bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule)
+{
+	return rule->site_len > 0 &&
+	       rule->site_len <= BPF_JIT_MAX_PATTERN_LEN &&
+	       bpf_jit_get_form_meta(rule->canonical_form);
+}
+
 static bool bpf_jit_canonical_site_fail(const struct bpf_prog *prog,
 					const struct bpf_jit_rule *rule,
-					const char *msg)
+					const struct bpf_jit_form_meta *meta)
 {
-	bpf_jit_recompile_rule_log(prog, rule, msg);
-	pr_debug("bpf_jit: rule %u form %u site %u len %u: %s\n",
+	const char *msg = meta->name;
+
+	bpf_jit_recompile_rule_log(prog, rule,
+				   "%s canonical site validation failed", msg);
+	pr_debug("bpf_jit: rule %u form %u site %u len %u: %s canonical site validation failed\n",
 		 rule->user_index, rule->canonical_form,
 		 rule->site_start, rule->site_len, msg);
 	return false;
@@ -2325,66 +1894,11 @@ static bool bpf_jit_validate_canonical_site(const struct bpf_prog *prog,
 					    const struct bpf_jit_rule *rule,
 					    struct bpf_jit_canonical_params *params)
 {
-	switch (rule->canonical_form) {
-	case BPF_JIT_CF_WIDE_MEM:
-		if (!bpf_jit_validate_wide_mem_rule(insns, insn_cnt, rule,
-						    params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"wide_mem canonical site validation failed");
-		break;
-	case BPF_JIT_CF_ROTATE:
-		if (!bpf_jit_validate_rotate_rule(insns, insn_cnt, rule,
-						  params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"rotate canonical site validation failed");
-		break;
-	case BPF_JIT_CF_ADDR_CALC:
-		if (!bpf_jit_validate_addr_calc_rule(insns, insn_cnt, rule,
-						     params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"addr_calc canonical site validation failed");
-		break;
-	case BPF_JIT_CF_COND_SELECT:
-		if (!bpf_jit_validate_cond_select_rule(insns, insn_cnt, rule,
-						       params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"cond_select canonical site validation failed");
-		break;
-	case BPF_JIT_CF_BITFIELD_EXTRACT:
-		if (!bpf_jit_validate_bitfield_extract_rule(insns, insn_cnt,
-							    rule, params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"bitfield_extract canonical site validation failed");
-		break;
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-		if (!bpf_jit_validate_zero_ext_elide_rule(insns, insn_cnt, rule,
-							  params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"zero_ext_elide canonical site validation failed");
-		break;
-	case BPF_JIT_CF_ENDIAN_FUSION:
-		if (!bpf_jit_validate_endian_fusion_rule(insns, insn_cnt, rule,
-							 params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"endian_fusion canonical site validation failed");
-		break;
-	case BPF_JIT_CF_BRANCH_FLIP:
-		if (!bpf_jit_validate_branch_flip_rule(insns, insn_cnt, rule,
-						       params))
-			return bpf_jit_canonical_site_fail(
-				prog, rule,
-				"branch_flip canonical site validation failed");
-		break;
-	default:
-		break;
-	}
+	const struct bpf_jit_form_meta *meta;
+
+	meta = bpf_jit_get_form_meta(rule->canonical_form);
+	if (!meta || !meta->validate(insns, insn_cnt, rule, params))
+		return meta ? bpf_jit_canonical_site_fail(prog, rule, meta) : false;
 
 	return true;
 }
@@ -2395,7 +1909,7 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 				  const struct bpf_jit_rule *rule,
 				  struct bpf_jit_canonical_params *params)
 {
-	u16 form = bpf_jit_rule_form(rule);
+	const struct bpf_jit_form_meta *meta;
 
 	if (params)
 		memset(params, 0, sizeof(*params));
@@ -2411,13 +1925,22 @@ static bool bpf_jit_validate_rule(const struct bpf_prog *prog,
 					   "site range is out of bounds");
 		return false;
 	}
-	if (!form || !bpf_jit_native_choice_valid(form, rule->native_choice)) {
+	meta = bpf_jit_get_form_meta(rule->canonical_form);
+	if (!meta ||
+	    rule->native_choice >= BITS_PER_LONG ||
+	    !(meta->native_choice_mask & BIT(rule->native_choice))) {
 		bpf_jit_recompile_rule_log(prog, rule,
 					   "native choice %u is invalid",
 					   rule->native_choice);
 		return false;
 	}
-	if (form != BPF_JIT_CF_ENDIAN_FUSION &&
+	if (!meta->choice_supported(rule->native_choice)) {
+		bpf_jit_recompile_rule_log(prog, rule,
+					   "native choice %u is unsupported on this CPU",
+					   rule->native_choice);
+		return false;
+	}
+	if (!meta->allow_side_effects &&
 	    bpf_jit_site_has_side_effects(insns, rule->site_start,
 					  rule->site_len)) {
 		bpf_jit_recompile_rule_log(prog, rule,
@@ -2445,11 +1968,11 @@ static bool bpf_jit_rule_within_single_subprog(const struct bpf_prog *prog,
 	u32 site_end;
 	u32 i;
 
-	if (!bpf_jit_compute_site_end(rule->site_start, rule->site_len, &site_end))
+	if (check_add_overflow(rule->site_start, rule->site_len, &site_end))
 		return false;
 
 	main_aux = prog->aux->main_prog_aux ? prog->aux->main_prog_aux : prog->aux;
-	real_func_cnt = bpf_jit_recompile_real_func_cnt(main_aux);
+	real_func_cnt = main_aux->real_func_cnt ?: main_aux->func_cnt;
 	if (!main_aux->func || real_func_cnt <= 1)
 		return true;
 
@@ -2503,13 +2026,13 @@ static int bpf_jit_policy_validate_disjoint(const struct bpf_prog *prog,
 		return 0;
 
 	prev = &policy->rules[0];
-	if (!bpf_jit_compute_site_end(prev->site_start, prev->site_len, &prev_end))
+	if (check_add_overflow(prev->site_start, prev->site_len, &prev_end))
 		return -EINVAL;
 
 	for (i = 1; i < policy->rule_cnt; i++) {
 		rule = &policy->rules[i];
-		if (!bpf_jit_compute_site_end(rule->site_start, rule->site_len,
-					      &rule_end))
+		if (check_add_overflow(rule->site_start, rule->site_len,
+				       &rule_end))
 			return -EINVAL;
 		if (rule->site_start < prev_end) {
 			bpf_jit_recompile_prog_log(
@@ -2853,7 +2376,7 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 	int err = 0;
 
 	if (main_aux->func_cnt && main_aux->func) {
-		real_func_cnt = bpf_jit_recompile_real_func_cnt(main_aux);
+		real_func_cnt = main_aux->real_func_cnt ?: main_aux->func_cnt;
 		image_cnt = real_func_cnt;
 	}
 
@@ -2866,17 +2389,20 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
 
 		if (!image_prog) {
 			err = -EINVAL;
 			goto out_abort;
 		}
-		bpf_jit_recompile_stage_begin(image_prog);
+		bpf_jit_recompile_reset_prog_aux(image_prog);
+		image_prog->aux->jit_recompile_active = true;
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
 		bpf_func_t old_bpf_func = READ_ONCE(image_prog->bpf_func);
 		struct bpf_prog *recompiled;
 
@@ -2910,7 +2436,8 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 						err = -EINVAL;
 						goto out_abort;
 					}
-					target = bpf_jit_recompile_next_func(main_aux->func[subprog]);
+					target = bpf_jit_recompile_staged_func(main_aux->func[subprog]) ?:
+						READ_ONCE(main_aux->func[subprog]->bpf_func);
 					if (!target) {
 						err = -EIO;
 						goto out_abort;
@@ -2927,7 +2454,8 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 					err = -EINVAL;
 					goto out_abort;
 				}
-				target = bpf_jit_recompile_next_func(main_aux->func[subprog]);
+				target = bpf_jit_recompile_staged_func(main_aux->func[subprog]) ?:
+					READ_ONCE(main_aux->func[subprog]->bpf_func);
 				if (!target) {
 					err = -EIO;
 					goto out_abort;
@@ -2937,7 +2465,8 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 		}
 
 		for (i = 0; i < image_cnt; i++) {
-			struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
+			struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+				main_aux->func[i] : prog;
 			bpf_func_t old_bpf_func = READ_ONCE(image_prog->bpf_func);
 			struct bpf_prog *recompiled;
 
@@ -2965,17 +2494,27 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 			struct bpf_prog *func = main_aux->func[i];
 
 			if (func && func->aux->exception_cb) {
-				new_exception_cb = (void *)bpf_jit_recompile_next_func(func);
+				new_exception_cb = (void *)(bpf_jit_recompile_staged_func(func) ?:
+						READ_ONCE(func->bpf_func));
 				break;
 			}
 		}
 	} else if (prog->aux->exception_cb) {
-		new_exception_cb = (void *)bpf_jit_recompile_next_func(prog);
+		new_exception_cb = (void *)(bpf_jit_recompile_staged_func(prog) ?:
+				 READ_ONCE(prog->bpf_func));
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
-		struct bpf_prog *ksym_prog = bpf_jit_recompile_ksym_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
+		struct bpf_prog *ksym_prog;
+
+		if (!(main_aux->func_cnt && main_aux->func) || !i)
+			ksym_prog = prog;
+		else if (i < real_func_cnt)
+			ksym_prog = main_aux->func[i];
+		else
+			ksym_prog = NULL;
 
 		if (image_prog->jited && image_prog->bpf_func)
 			old_headers[i] = bpf_jit_binary_pack_hdr(image_prog);
@@ -2987,7 +2526,8 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 			continue;
 
 		bpf_jit_recompile_shadow_ksym_add(
-			ksym_prog, bpf_jit_recompile_next_func(image_prog),
+			ksym_prog, bpf_jit_recompile_staged_func(image_prog) ?:
+				READ_ONCE(image_prog->bpf_func),
 			bpf_jit_recompile_staged_len(image_prog),
 			bpf_jit_recompile_staged_extable(image_prog),
 			bpf_jit_recompile_staged_num_exentries(image_prog),
@@ -2996,7 +2536,10 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		err = bpf_jit_recompile_commit(bpf_jit_recompile_image_prog(prog, i));
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
+
+		err = bpf_jit_recompile_commit(image_prog);
 		if (err)
 			goto out_abort;
 	}
@@ -3018,8 +2561,16 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 	synchronize_rcu();
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
-		struct bpf_prog *ksym_prog = bpf_jit_recompile_ksym_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
+		struct bpf_prog *ksym_prog;
+
+		if (!(main_aux->func_cnt && main_aux->func) || !i)
+			ksym_prog = prog;
+		else if (i < real_func_cnt)
+			ksym_prog = main_aux->func[i];
+		else
+			ksym_prog = NULL;
 
 		if (ksym_prog)
 			bpf_prog_kallsyms_replace(
@@ -3036,18 +2587,19 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 		if (old_priv_stacks[i])
 			free_percpu(old_priv_stacks[i]);
 
-		bpf_jit_recompile_stage_end(image_prog);
+		image_prog->aux->jit_recompile_active = false;
 	}
 	goto out_free;
 
 out_no_commit:
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
 
 		if (!image_prog)
 			continue;
 		bpf_jit_recompile_abort(image_prog);
-		bpf_jit_recompile_stage_end(image_prog);
+		image_prog->aux->jit_recompile_active = false;
 	}
 
 out_free:
@@ -3057,14 +2609,22 @@ out_free:
 
 out_abort:
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = bpf_jit_recompile_image_prog(prog, i);
-		struct bpf_prog *ksym_prog = bpf_jit_recompile_ksym_prog(prog, i);
+		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
+			main_aux->func[i] : prog;
+		struct bpf_prog *ksym_prog;
+
+		if (!(main_aux->func_cnt && main_aux->func) || !i)
+			ksym_prog = prog;
+		else if (i < real_func_cnt)
+			ksym_prog = main_aux->func[i];
+		else
+			ksym_prog = NULL;
 
 		if (ksym_prog)
 			bpf_jit_recompile_shadow_ksym_del(ksym_prog);
 		if (image_prog) {
 			bpf_jit_recompile_abort(image_prog);
-			bpf_jit_recompile_stage_end(image_prog);
+			image_prog->aux->jit_recompile_active = false;
 		}
 	}
 	goto out_free;
@@ -3076,11 +2636,12 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	struct bpf_prog_aux *main_aux = NULL;
 	struct bpf_jit_policy *policy = NULL;
 	struct bpf_jit_policy *old_policy = NULL;
-	struct bpf_jit_recompile_log *log = NULL;
+	struct bpf_verifier_log log = {};
 	struct bpf_jit_recompile_rollback_state rollback = {};
-	bool log_installed = false;
 	bool locked = false;
 	bool stock_rejit;
+	u32 log_level = 0;
+	u32 log_size_actual = 0;
 	int log_err = 0;
 	int err = 0;
 
@@ -3106,14 +2667,21 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	}
 	locked = true;
 
-	log = bpf_jit_recompile_log_alloc(attr);
-	if (IS_ERR(log)) {
-		err = PTR_ERR(log);
-		log = NULL;
-		goto out_put;
+	if (attr->jit_recompile.log_level &&
+	    attr->jit_recompile.log_buf &&
+	    attr->jit_recompile.log_size) {
+		log_level = BPF_LOG_LEVEL1 | BPF_LOG_FIXED;
 	}
-	main_aux->jit_recompile_log = log;
-	log_installed = true;
+
+	err = bpf_vlog_init(&log, log_level,
+			    log_level ?
+			    u64_to_user_ptr(attr->jit_recompile.log_buf) : NULL,
+			    log_level ?
+			    min_t(u32, attr->jit_recompile.log_size,
+				  BPF_JIT_RECOMPILE_LOG_MAX_SIZE) : 0);
+	if (err)
+		goto out_put;
+	main_aux->jit_recompile_log = &log;
 
 	/* Must be a JITed program */
 	if (!prog->jited) {
@@ -3212,14 +2780,15 @@ do_recompile:
 
 out_put:
 	main_aux->jit_recompile_num_applied = 0;
-	if (log_installed)
+	if (main_aux)
 		main_aux->jit_recompile_log = NULL;
 	if (locked)
 		mutex_unlock(&main_aux->jit_recompile_mutex);
-	log_err = bpf_jit_recompile_log_copy_to_user(log);
+	log_err = bpf_vlog_finalize(&log, &log_size_actual);
+	if (log_err == -ENOSPC)
+		log_err = 0;
 	if (!err && log_err)
 		err = log_err;
-	bpf_jit_recompile_log_free(log);
 	bpf_jit_recompile_snapshot_free(&rollback);
 	bpf_jit_free_policy(policy);
 	bpf_jit_free_policy(old_policy);

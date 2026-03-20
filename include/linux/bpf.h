@@ -60,7 +60,6 @@ struct user_namespace;
 struct super_block;
 struct inode;
 struct bpf_jit_policy;
-struct bpf_jit_recompile_log;
 
 extern struct idr btf_idr;
 extern spinlock_t btf_idr_lock;
@@ -1736,7 +1735,7 @@ struct bpf_prog_aux {
 	struct exception_table_entry *jit_recompile_extable;
 	struct mutex jit_recompile_mutex; /* serializes BPF_PROG_JIT_RECOMPILE */
 	struct bpf_jit_policy *jit_policy; /* active JIT rewrite policy */
-	struct bpf_jit_recompile_log *jit_recompile_log;
+	struct bpf_verifier_log *jit_recompile_log;
 	u32 jit_recompile_num_applied; /* rules applied in current recompile */
 	struct bpf_jit_poke_descriptor *poke_tab;
 	struct bpf_kfunc_desc_tab *kfunc_tab;

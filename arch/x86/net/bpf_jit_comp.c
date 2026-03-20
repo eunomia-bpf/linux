@@ -3344,11 +3344,6 @@ static int emit_canonical_bitfield_extract(
 		order_value->value == BPF_JIT_BFX_ORDER_MASK_SHIFT);
 }
 
-static u16 bpf_jit_rule_form(const struct bpf_jit_rule *rule)
-{
-	return rule->canonical_form;
-}
-
 static const struct bpf_jit_rule *
 bpf_jit_rule_lookup_prog(const struct bpf_prog *bpf_prog, u32 insn_idx)
 {
@@ -3377,7 +3372,7 @@ static int bpf_jit_try_emit_rule(u8 **pprog,
 				 const struct bpf_jit_rule *rule,
 				 bool use_priv_fp)
 {
-	u16 form = bpf_jit_rule_form(rule);
+	u16 form = rule->canonical_form;
 	int err;
 
 	switch (form) {
@@ -3513,6 +3508,7 @@ static int bpf_jit_apply_prog_rule(u8 *temp, u8 **pprog,
 				   int *proglen, u32 addrs_idx,
 				   bool use_priv_fp)
 {
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(bpf_prog);
 	const struct bpf_jit_rule *rule = NULL;
 	int consumed;
 	int err;
@@ -3520,14 +3516,10 @@ static int bpf_jit_apply_prog_rule(u8 *temp, u8 **pprog,
 	consumed = bpf_jit_try_emit_prog_rule(pprog, bpf_prog, addrs_idx - 1,
 					      use_priv_fp, &rule);
 	if (consumed <= 0) {
-		if (rule && image) {
-			bpf_jit_recompile_note_rule(bpf_prog, rule, false);
-			if (consumed < 0)
-				bpf_jit_recompile_rule_log(
-					bpf_prog, rule,
-					"emitter fallback (err=%d)",
-					consumed);
-		}
+		if (rule && image && consumed < 0)
+			bpf_jit_recompile_rule_log(bpf_prog, rule,
+						   "emitter fallback (err=%d)",
+						   consumed);
 		return 0;
 	}
 
@@ -3538,7 +3530,7 @@ static int bpf_jit_apply_prog_rule(u8 *temp, u8 **pprog,
 		return err;
 
 	if (image) {
-		bpf_jit_recompile_note_rule(bpf_prog, rule, true);
+		main_aux->jit_recompile_num_applied++;
 		bpf_jit_recompile_rule_log(bpf_prog, rule,
 					   "applied successfully");
 	}
@@ -5583,43 +5575,6 @@ struct x64_jit_data {
 
 #define MAX_PASSES 20
 #define PADDING_PASSES (MAX_PASSES - 5)
-
-bool bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_staged &&
-	       prog->aux->jit_recompile_bpf_func;
-}
-
-void *bpf_jit_recompile_staged_func(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_bpf_func;
-}
-
-u32 bpf_jit_recompile_staged_len(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_jited_len;
-}
-
-u32 bpf_jit_recompile_staged_fp_start(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_fp_start;
-}
-
-u32 bpf_jit_recompile_staged_fp_end(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_fp_end;
-}
-
-struct exception_table_entry *
-bpf_jit_recompile_staged_extable(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_extable;
-}
-
-u32 bpf_jit_recompile_staged_num_exentries(const struct bpf_prog *prog)
-{
-	return prog->aux->jit_recompile_num_exentries;
-}
 
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
