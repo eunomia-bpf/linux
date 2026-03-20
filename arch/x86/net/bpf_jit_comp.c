@@ -1076,126 +1076,82 @@ static void emit_cmov_reg(u8 **pprog, u8 cmov_op, bool is64,
 	*pprog = prog;
 }
 
+static int bpf_jmp_opcode_lookup(const u8 *map, u32 map_size, u8 op,
+				 u8 *mapped_op)
+{
+	u8 idx = op >> 4;
+
+	if ((op & 0xf) || idx >= map_size || !map[idx])
+		return -EFAULT;
+
+	*mapped_op = map[idx];
+	return 0;
+}
+
+static const u8 bpf_jmp_invert_map[] = {
+	[BPF_JEQ >> 4] = BPF_JNE,
+	[BPF_JNE >> 4] = BPF_JEQ,
+	[BPF_JGT >> 4] = BPF_JLE,
+	[BPF_JLT >> 4] = BPF_JGE,
+	[BPF_JGE >> 4] = BPF_JLT,
+	[BPF_JLE >> 4] = BPF_JGT,
+	[BPF_JSGT >> 4] = BPF_JSLE,
+	[BPF_JSLT >> 4] = BPF_JSGE,
+	[BPF_JSGE >> 4] = BPF_JSLT,
+	[BPF_JSLE >> 4] = BPF_JSGT,
+	/*
+	 * emit_bpf_jmp_cmp() lowers JSET as test+jne, so the inverted
+	 * x86 condition is je.
+	 */
+	[BPF_JSET >> 4] = BPF_JEQ,
+};
+
 static int bpf_jmp_invert(u8 op, u8 *inv_op)
 {
-	switch (op) {
-	case BPF_JEQ:
-		*inv_op = BPF_JNE;
-		return 0;
-	case BPF_JNE:
-		*inv_op = BPF_JEQ;
-		return 0;
-	case BPF_JGT:
-		*inv_op = BPF_JLE;
-		return 0;
-	case BPF_JLT:
-		*inv_op = BPF_JGE;
-		return 0;
-	case BPF_JGE:
-		*inv_op = BPF_JLT;
-		return 0;
-	case BPF_JLE:
-		*inv_op = BPF_JGT;
-		return 0;
-	case BPF_JSGT:
-		*inv_op = BPF_JSLE;
-		return 0;
-	case BPF_JSLT:
-		*inv_op = BPF_JSGE;
-		return 0;
-	case BPF_JSGE:
-		*inv_op = BPF_JSLT;
-		return 0;
-	case BPF_JSLE:
-		*inv_op = BPF_JSGT;
-		return 0;
-	case BPF_JSET:
-		/*
-		 * emit_bpf_jmp_cmp() lowers JSET as test+jne, so the inverted
-		 * x86 condition is je.
-		 */
-		*inv_op = BPF_JEQ;
-		return 0;
-	default:
-		return -EFAULT;
-	}
+	return bpf_jmp_opcode_lookup(bpf_jmp_invert_map,
+				     ARRAY_SIZE(bpf_jmp_invert_map),
+				     op, inv_op);
 }
+
+static const u8 bpf_jmp_x86_cond_map[] = {
+	[BPF_JEQ >> 4] = X86_JE,
+	[BPF_JSET >> 4] = X86_JNE,
+	[BPF_JNE >> 4] = X86_JNE,
+	[BPF_JGT >> 4] = X86_JA,
+	[BPF_JLT >> 4] = X86_JB,
+	[BPF_JGE >> 4] = X86_JAE,
+	[BPF_JLE >> 4] = X86_JBE,
+	[BPF_JSGT >> 4] = X86_JG,
+	[BPF_JSLT >> 4] = X86_JL,
+	[BPF_JSGE >> 4] = X86_JGE,
+	[BPF_JSLE >> 4] = X86_JLE,
+};
 
 static int bpf_jmp_to_x86_cond(u8 op, u8 *jmp_cond)
 {
-	switch (op) {
-	case BPF_JEQ:
-		*jmp_cond = X86_JE;
-		return 0;
-	case BPF_JSET:
-	case BPF_JNE:
-		*jmp_cond = X86_JNE;
-		return 0;
-	case BPF_JGT:
-		*jmp_cond = X86_JA;
-		return 0;
-	case BPF_JLT:
-		*jmp_cond = X86_JB;
-		return 0;
-	case BPF_JGE:
-		*jmp_cond = X86_JAE;
-		return 0;
-	case BPF_JLE:
-		*jmp_cond = X86_JBE;
-		return 0;
-	case BPF_JSGT:
-		*jmp_cond = X86_JG;
-		return 0;
-	case BPF_JSLT:
-		*jmp_cond = X86_JL;
-		return 0;
-	case BPF_JSGE:
-		*jmp_cond = X86_JGE;
-		return 0;
-	case BPF_JSLE:
-		*jmp_cond = X86_JLE;
-		return 0;
-	default:
-		return -EFAULT;
-	}
+	return bpf_jmp_opcode_lookup(bpf_jmp_x86_cond_map,
+				     ARRAY_SIZE(bpf_jmp_x86_cond_map),
+				     op, jmp_cond);
 }
+
+static const u8 bpf_jmp_x86_cmov_map[] = {
+	[BPF_JEQ >> 4] = 0x44,
+	[BPF_JNE >> 4] = 0x45,
+	[BPF_JGT >> 4] = 0x47,
+	[BPF_JLT >> 4] = 0x42,
+	[BPF_JGE >> 4] = 0x43,
+	[BPF_JLE >> 4] = 0x46,
+	[BPF_JSGT >> 4] = 0x4F,
+	[BPF_JSLT >> 4] = 0x4C,
+	[BPF_JSGE >> 4] = 0x4D,
+	[BPF_JSLE >> 4] = 0x4E,
+};
 
 static int bpf_jmp_to_x86_cmov(u8 op, u8 *cmov_op)
 {
-	switch (op) {
-	case BPF_JEQ:
-		*cmov_op = 0x44;
-		return 0;
-	case BPF_JNE:
-		*cmov_op = 0x45;
-		return 0;
-	case BPF_JGT:
-		*cmov_op = 0x47;
-		return 0;
-	case BPF_JLT:
-		*cmov_op = 0x42;
-		return 0;
-	case BPF_JGE:
-		*cmov_op = 0x43;
-		return 0;
-	case BPF_JLE:
-		*cmov_op = 0x46;
-		return 0;
-	case BPF_JSGT:
-		*cmov_op = 0x4F;
-		return 0;
-	case BPF_JSLT:
-		*cmov_op = 0x4C;
-		return 0;
-	case BPF_JSGE:
-		*cmov_op = 0x4D;
-		return 0;
-	case BPF_JSLE:
-		*cmov_op = 0x4E;
-		return 0;
-	default:
-		return -EFAULT;
-	}
+	return bpf_jmp_opcode_lookup(bpf_jmp_x86_cmov_map,
+				     ARRAY_SIZE(bpf_jmp_x86_cmov_map),
+				     op, cmov_op);
 }
 
 static int emit_bpf_jmp_cmp(u8 **pprog, const struct bpf_insn *insn,
@@ -1281,13 +1237,6 @@ static int emit_bpf_jmp_cmp(u8 **pprog, const struct bpf_insn *insn,
 
 	*pprog = prog;
 	return 0;
-}
-
-static bool
-bpf_jit_binding_value_is_noop(const struct bpf_jit_binding_value *value,
-			      u8 dst_reg)
-{
-	return value->type == BPF_JIT_BIND_VAL_REG && value->value == dst_reg;
 }
 
 static int emit_bpf_binding_value(u8 **pprog,
@@ -2104,15 +2053,6 @@ static void emit_bswap_width(u8 **pprog, u32 dst_reg, u32 width)
 	*pprog = prog;
 }
 
-static u32 pick_wide_chunk(u32 remaining)
-{
-	if (remaining >= 4)
-		return 4;
-	if (remaining >= 2)
-		return 2;
-	return 1;
-}
-
 static u32 wide_chunk_bpf_size(u32 chunk)
 {
 	switch (chunk) {
@@ -2145,7 +2085,7 @@ static int emit_wide_load_sequence(u8 **pprog, u32 result_reg, u32 base_reg,
 	remaining = width;
 	consumed = 0;
 	while (remaining) {
-		u32 chunk = pick_wide_chunk(remaining);
+		u32 chunk = bpf_jit_pick_wide_chunk(remaining);
 		u32 chunk_reg = first_chunk ? result_reg : AUX_REG;
 		u32 shift = big_endian ? (remaining - chunk) * 8 : consumed * 8;
 
@@ -2196,6 +2136,13 @@ static void emit_lea_base_index(u8 **pprog, u32 dst_reg, u32 base_reg,
 	*pprog = prog;
 }
 
+static inline u32
+x86_jit_param_reg(const struct bpf_jit_canonical_params *params, u8 param,
+		  bool use_priv_fp)
+{
+	return jit_bpf_reg(bpf_jit_param_reg(params, param), use_priv_fp);
+}
+
 static int emit_canonical_wide_load(u8 **pprog,
 				    const struct bpf_jit_canonical_params *params,
 				    bool use_priv_fp)
@@ -2205,12 +2152,12 @@ static int emit_canonical_wide_load(u8 **pprog,
 	u32 encoded_width, width, flags;
 	bool big_endian;
 
-	result_reg = jit_bpf_reg((u8)params->params[BPF_JIT_WMEM_PARAM_DST_REG].value,
-				 use_priv_fp);
-	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_WMEM_PARAM_BASE_REG].value,
-			       use_priv_fp);
-	off = (s16)params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].value;
-	encoded_width = (u32)params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
+	result_reg = x86_jit_param_reg(params, BPF_JIT_WMEM_PARAM_DST_REG,
+				       use_priv_fp);
+	base_reg = x86_jit_param_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG,
+				     use_priv_fp);
+	off = (s16)bpf_jit_param_imm(params, BPF_JIT_WMEM_PARAM_BASE_OFF);
+	encoded_width = (u32)bpf_jit_param_imm(params, BPF_JIT_WMEM_PARAM_WIDTH);
 	width = encoded_width & BPF_JIT_WMEM_WIDTH_MASK;
 	flags = encoded_width & ~BPF_JIT_WMEM_WIDTH_MASK;
 	big_endian = !!(flags & BPF_JIT_WMEM_F_BIG_ENDIAN);
@@ -2224,24 +2171,17 @@ static int emit_canonical_rotate(u8 **pprog,
 				 u16 native_choice,
 				 bool use_priv_fp)
 {
-	const struct bpf_jit_binding_value *dst_value;
-	const struct bpf_jit_binding_value *src_value;
-	const struct bpf_jit_binding_value *amount_value;
-	const struct bpf_jit_binding_value *width_value;
 	u32 dst_reg, src_reg, width, rot_amount;
 	bool is64;
 	u8 ror_imm;
 	u8 *prog = *pprog;
 
-	dst_value = &params->params[BPF_JIT_ROT_PARAM_DST_REG];
-	src_value = &params->params[BPF_JIT_ROT_PARAM_SRC_REG];
-	amount_value = &params->params[BPF_JIT_ROT_PARAM_AMOUNT];
-	width_value = &params->params[BPF_JIT_ROT_PARAM_WIDTH];
-
-	width = (u32)width_value->value;
-	rot_amount = (u32)amount_value->value;
-	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
-	src_reg = jit_bpf_reg((u8)src_value->value, use_priv_fp);
+	width = (u32)bpf_jit_param_imm(params, BPF_JIT_ROT_PARAM_WIDTH);
+	rot_amount = (u32)bpf_jit_param_imm(params, BPF_JIT_ROT_PARAM_AMOUNT);
+	dst_reg = x86_jit_param_reg(params, BPF_JIT_ROT_PARAM_DST_REG,
+				    use_priv_fp);
+	src_reg = x86_jit_param_reg(params, BPF_JIT_ROT_PARAM_SRC_REG,
+				    use_priv_fp);
 	is64 = width == 64;
 	ror_imm = (u8)(width - rot_amount);
 
@@ -2294,13 +2234,13 @@ static int emit_canonical_lea_fusion(
 	u8 sib_scale;
 	u8 *prog = *pprog;
 
-	dst_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_DST_REG].value,
-			      use_priv_fp);
-	index_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_INDEX_REG].value,
-				use_priv_fp);
-	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ACALC_PARAM_BASE_REG].value,
-			       use_priv_fp);
-	scale = (u32)params->params[BPF_JIT_ACALC_PARAM_SCALE].value;
+	dst_reg = x86_jit_param_reg(params, BPF_JIT_ACALC_PARAM_DST_REG,
+				    use_priv_fp);
+	index_reg = x86_jit_param_reg(params, BPF_JIT_ACALC_PARAM_INDEX_REG,
+				      use_priv_fp);
+	base_reg = x86_jit_param_reg(params, BPF_JIT_ACALC_PARAM_BASE_REG,
+				     use_priv_fp);
+	scale = (u32)bpf_jit_param_imm(params, BPF_JIT_ACALC_PARAM_SCALE);
 
 	sib_scale = (u8)scale;
 	emit_lea_base_index(&prog, dst_reg, base_reg, index_reg, sib_scale);
@@ -2543,13 +2483,13 @@ static int emit_canonical_endian_fusion(
 	u32 data_reg, base_reg, width, direction;
 	s16 off;
 
-	width = (u32)params->params[BPF_JIT_ENDIAN_PARAM_WIDTH].value;
-	direction = (u32)params->params[BPF_JIT_ENDIAN_PARAM_DIRECTION].value;
-	data_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ENDIAN_PARAM_DATA_REG].value,
-			       use_priv_fp);
-	base_reg = jit_bpf_reg((u8)params->params[BPF_JIT_ENDIAN_PARAM_BASE_REG].value,
-			       use_priv_fp);
-	off = (s16)params->params[BPF_JIT_ENDIAN_PARAM_OFFSET].value;
+	width = (u32)bpf_jit_param_imm(params, BPF_JIT_ENDIAN_PARAM_WIDTH);
+	direction = (u32)bpf_jit_param_imm(params, BPF_JIT_ENDIAN_PARAM_DIRECTION);
+	data_reg = x86_jit_param_reg(params, BPF_JIT_ENDIAN_PARAM_DATA_REG,
+				     use_priv_fp);
+	base_reg = x86_jit_param_reg(params, BPF_JIT_ENDIAN_PARAM_BASE_REG,
+				     use_priv_fp);
+	off = (s16)bpf_jit_param_imm(params, BPF_JIT_ENDIAN_PARAM_OFFSET);
 
 	if (direction == BPF_JIT_ENDIAN_LOAD_SWAP)
 		emit_movbe_load(pprog, data_reg, base_reg, off, width);
@@ -3034,18 +2974,6 @@ static int emit_canonical_branch_flip(u8 **pprog,
 				     use_priv_fp);
 }
 
-static u32 bitfield_mask_width(u64 mask)
-{
-	u32 width = 0;
-
-	while (mask & 1) {
-		width++;
-		mask >>= 1;
-	}
-
-	return width;
-}
-
 static void emit_bextr(u8 **pprog, u32 dst_reg, u32 src_reg,
 		       u32 control_reg, bool is64)
 {
@@ -3063,28 +2991,20 @@ static int emit_canonical_bitfield_extract(
 	const struct bpf_jit_canonical_params *params,
 	bool use_priv_fp)
 {
-	const struct bpf_jit_binding_value *dst_value;
-	const struct bpf_jit_binding_value *src_value;
-	const struct bpf_jit_binding_value *shift_value;
-	const struct bpf_jit_binding_value *mask_value;
-	const struct bpf_jit_binding_value *width_value;
 	u32 dst_reg, src_reg, width, shift, field_width, control;
 	u64 mask, full_mask;
 	bool is64;
 	u8 *prog = *pprog;
 
-	dst_value = &params->params[BPF_JIT_BFX_PARAM_DST_REG];
-	src_value = &params->params[BPF_JIT_BFX_PARAM_SRC_REG];
-	shift_value = &params->params[BPF_JIT_BFX_PARAM_SHIFT];
-	mask_value = &params->params[BPF_JIT_BFX_PARAM_MASK];
-	width_value = &params->params[BPF_JIT_BFX_PARAM_WIDTH];
-
-	width = (u32)width_value->value;
-	shift = (u32)shift_value->value;
-	dst_reg = jit_bpf_reg((u8)dst_value->value, use_priv_fp);
-	src_reg = jit_bpf_reg((u8)src_value->value, use_priv_fp);
-	mask = width == 32 ? (u32)mask_value->value : (u64)mask_value->value;
-	field_width = bitfield_mask_width(mask);
+	width = (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_WIDTH);
+	shift = (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_SHIFT);
+	dst_reg = x86_jit_param_reg(params, BPF_JIT_BFX_PARAM_DST_REG,
+				    use_priv_fp);
+	src_reg = x86_jit_param_reg(params, BPF_JIT_BFX_PARAM_SRC_REG,
+				    use_priv_fp);
+	mask = width == 32 ? (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_MASK)
+			   : (u64)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_MASK);
+	field_width = bpf_jit_bitfield_mask_width(mask);
 	is64 = width == 64;
 	full_mask = is64 ? ~0ULL : 0xffffffffULL;
 

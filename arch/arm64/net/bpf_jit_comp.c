@@ -356,13 +356,6 @@ static bool is_lsi_offset(int offset, int scale)
 	return true;
 }
 
-static bool
-arm64_binding_value_is_noop(const struct bpf_jit_binding_value *value,
-			    u8 dst_reg)
-{
-	return value->type == BPF_JIT_BIND_VAL_REG && value->value == dst_reg;
-}
-
 static int emit_arm64_binding_value(struct jit_ctx *ctx,
 				    const struct bpf_jit_binding_value *value,
 				    bool is64, u8 dst_reg)
@@ -427,40 +420,11 @@ static int bpf_jmp_to_a64_cond(u8 op, enum aarch64_insn_condition *cond)
 static int a64_invert_cond(enum aarch64_insn_condition cond,
 			   enum aarch64_insn_condition *inv)
 {
-	switch (cond) {
-	case AARCH64_INSN_COND_EQ:
-		*inv = AARCH64_INSN_COND_NE;
-		return 0;
-	case AARCH64_INSN_COND_NE:
-		*inv = AARCH64_INSN_COND_EQ;
-		return 0;
-	case AARCH64_INSN_COND_CS:
-		*inv = AARCH64_INSN_COND_CC;
-		return 0;
-	case AARCH64_INSN_COND_CC:
-		*inv = AARCH64_INSN_COND_CS;
-		return 0;
-	case AARCH64_INSN_COND_HI:
-		*inv = AARCH64_INSN_COND_LS;
-		return 0;
-	case AARCH64_INSN_COND_LS:
-		*inv = AARCH64_INSN_COND_HI;
-		return 0;
-	case AARCH64_INSN_COND_GE:
-		*inv = AARCH64_INSN_COND_LT;
-		return 0;
-	case AARCH64_INSN_COND_LT:
-		*inv = AARCH64_INSN_COND_GE;
-		return 0;
-	case AARCH64_INSN_COND_GT:
-		*inv = AARCH64_INSN_COND_LE;
-		return 0;
-	case AARCH64_INSN_COND_LE:
-		*inv = AARCH64_INSN_COND_GT;
-		return 0;
-	default:
+	if ((unsigned int)cond >= AARCH64_INSN_COND_AL)
 		return -EINVAL;
-	}
+
+	*inv = cond ^ 1;
+	return 0;
 }
 
 static u32 a64_gen_cond_select(enum a64_cond_select_op op, bool is64,
@@ -590,15 +554,6 @@ static int emit_arm64_cmp_binding(struct jit_ctx *ctx, bool is64, u8 cond_op,
 	}
 }
 
-static u32 arm64_pick_wide_chunk(u32 remaining)
-{
-	if (remaining >= 4)
-		return 4;
-	if (remaining >= 2)
-		return 2;
-	return 1;
-}
-
 static int arm64_resolve_mem_base(const struct jit_ctx *ctx, u8 bpf_base_reg,
 				  s16 base_off, u8 *base_reg, int *off_adj)
 {
@@ -674,39 +629,25 @@ static void arm64_emit_bswap_width(struct jit_ctx *ctx, u8 reg, u32 width)
 	}
 }
 
-static u32 arm64_bitfield_mask_width(u64 mask)
+static inline u8
+arm64_jit_param_reg(const struct bpf_jit_canonical_params *params, u8 param)
 {
-	u32 width = 0;
-
-	while (mask & 1) {
-		width++;
-		mask >>= 1;
-	}
-
-	return width;
+	return bpf2a64[bpf_jit_param_reg(params, param)];
 }
 
 static int emit_canonical_rotate_arm64(struct jit_ctx *ctx,
 				       const struct bpf_jit_canonical_params *params)
 {
-	const struct bpf_jit_binding_value *dst_value;
-	const struct bpf_jit_binding_value *src_value;
-	const struct bpf_jit_binding_value *amount_value;
-	const struct bpf_jit_binding_value *width_value;
 	u32 width, rot_amount, ror_imm;
 	bool is64;
 
-	dst_value = &params->params[BPF_JIT_ROT_PARAM_DST_REG];
-	src_value = &params->params[BPF_JIT_ROT_PARAM_SRC_REG];
-	amount_value = &params->params[BPF_JIT_ROT_PARAM_AMOUNT];
-	width_value = &params->params[BPF_JIT_ROT_PARAM_WIDTH];
-
-	width = (u32)width_value->value;
-	rot_amount = (u32)amount_value->value;
+	width = (u32)bpf_jit_param_imm(params, BPF_JIT_ROT_PARAM_WIDTH);
+	rot_amount = (u32)bpf_jit_param_imm(params, BPF_JIT_ROT_PARAM_AMOUNT);
 	is64 = width == 64;
 	ror_imm = width - rot_amount;
-	emit(A64_ROR_I(is64, bpf2a64[(u8)dst_value->value],
-		       bpf2a64[(u8)src_value->value], ror_imm), ctx);
+	emit(A64_ROR_I(is64, arm64_jit_param_reg(params, BPF_JIT_ROT_PARAM_DST_REG),
+		       arm64_jit_param_reg(params, BPF_JIT_ROT_PARAM_SRC_REG),
+		       ror_imm), ctx);
 	return 0;
 }
 
@@ -719,9 +660,8 @@ static int emit_canonical_wide_load_arm64(
 	u8 result_reg, base_reg, chunk_reg;
 	int base_off, shift;
 
-	result_reg =
-		bpf2a64[(u8)params->params[BPF_JIT_WMEM_PARAM_DST_REG].value];
-	encoded_width = (u32)params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
+	result_reg = arm64_jit_param_reg(params, BPF_JIT_WMEM_PARAM_DST_REG);
+	encoded_width = (u32)bpf_jit_param_imm(params, BPF_JIT_WMEM_PARAM_WIDTH);
 	width = encoded_width & BPF_JIT_WMEM_WIDTH_MASK;
 	flags = encoded_width & ~BPF_JIT_WMEM_WIDTH_MASK;
 
@@ -729,8 +669,9 @@ static int emit_canonical_wide_load_arm64(
 	need_rev = big_endian ^ IS_ENABLED(CONFIG_CPU_BIG_ENDIAN);
 
 	if (arm64_resolve_mem_base(ctx,
-				   (u8)params->params[BPF_JIT_WMEM_PARAM_BASE_REG].value,
-				   (s16)params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].value,
+				   bpf_jit_param_reg(params, BPF_JIT_WMEM_PARAM_BASE_REG),
+				   (s16)bpf_jit_param_imm(params,
+							  BPF_JIT_WMEM_PARAM_BASE_OFF),
 				   &base_reg, &base_off))
 		return -EINVAL;
 
@@ -745,7 +686,7 @@ static int emit_canonical_wide_load_arm64(
 	remaining = width;
 	consumed = 0;
 	while (remaining) {
-		u32 chunk = arm64_pick_wide_chunk(remaining);
+		u32 chunk = bpf_jit_pick_wide_chunk(remaining);
 
 		chunk_reg = first_chunk ? result_reg : bpf2a64[TMP_REG_1];
 		shift = big_endian ? (remaining - chunk) * 8 : consumed * 8;
@@ -772,29 +713,19 @@ static int emit_canonical_bitfield_extract_arm64(
 	struct jit_ctx *ctx,
 	const struct bpf_jit_canonical_params *params)
 {
-	const struct bpf_jit_binding_value *dst_value;
-	const struct bpf_jit_binding_value *src_value;
-	const struct bpf_jit_binding_value *shift_value;
-	const struct bpf_jit_binding_value *mask_value;
-	const struct bpf_jit_binding_value *width_value;
 	u64 mask;
 	u32 width, shift, field_width;
 	bool is64;
 	u8 dst_reg, src_reg;
 
-	dst_value = &params->params[BPF_JIT_BFX_PARAM_DST_REG];
-	src_value = &params->params[BPF_JIT_BFX_PARAM_SRC_REG];
-	shift_value = &params->params[BPF_JIT_BFX_PARAM_SHIFT];
-	mask_value = &params->params[BPF_JIT_BFX_PARAM_MASK];
-	width_value = &params->params[BPF_JIT_BFX_PARAM_WIDTH];
-
-	width = (u32)width_value->value;
-	shift = (u32)shift_value->value;
+	width = (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_WIDTH);
+	shift = (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_SHIFT);
 	is64 = width == 64;
-	dst_reg = bpf2a64[(u8)dst_value->value];
-	src_reg = bpf2a64[(u8)src_value->value];
-	mask = width == 32 ? (u32)mask_value->value : (u64)mask_value->value;
-	field_width = arm64_bitfield_mask_width(mask);
+	dst_reg = arm64_jit_param_reg(params, BPF_JIT_BFX_PARAM_DST_REG);
+	src_reg = arm64_jit_param_reg(params, BPF_JIT_BFX_PARAM_SRC_REG);
+	mask = width == 32 ? (u32)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_MASK)
+			   : (u64)bpf_jit_param_imm(params, BPF_JIT_BFX_PARAM_MASK);
+	field_width = bpf_jit_bitfield_mask_width(mask);
 
 	emit(A64_UBFX(is64, dst_reg, src_reg, shift, field_width), ctx);
 	return 0;
@@ -826,8 +757,10 @@ static int emit_canonical_select_arm64(
 
 	is64 = width_value->value == 64;
 	dst_reg = bpf2a64[(u8)dst_value->value];
-	true_noop = arm64_binding_value_is_noop(true_value, (u8)dst_value->value);
-	false_noop = arm64_binding_value_is_noop(false_value, (u8)dst_value->value);
+	true_noop = bpf_jit_binding_value_is_noop(true_value,
+						      (u8)dst_value->value);
+	false_noop = bpf_jit_binding_value_is_noop(false_value,
+						       (u8)dst_value->value);
 	if (true_noop && false_noop)
 		return 0;
 

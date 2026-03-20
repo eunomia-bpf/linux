@@ -289,6 +289,25 @@ static bool bpf_jit_recompile_has_trampoline_dependency(
 	       rcu_access_pointer(prog->aux->st_ops_assoc);
 }
 
+static struct bpf_prog *
+bpf_jit_recompile_image_prog(struct bpf_prog_aux *main_aux,
+			     struct bpf_prog *prog, u32 image_idx)
+{
+	return main_aux->func_cnt && main_aux->func ?
+		main_aux->func[image_idx] : prog;
+}
+
+static struct bpf_prog *
+bpf_jit_recompile_ksym_prog(struct bpf_prog_aux *main_aux,
+			    struct bpf_prog *prog, u32 real_func_cnt,
+			    u32 image_idx)
+{
+	if (!(main_aux->func_cnt && main_aux->func) || !image_idx)
+		return prog;
+
+	return image_idx < real_func_cnt ? main_aux->func[image_idx] : NULL;
+}
+
 static int bpf_jit_recompile_prog_images(
 	struct bpf_prog *prog)
 {
@@ -317,8 +336,8 @@ static int bpf_jit_recompile_prog_images(
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
 
 		if (!image_prog) {
 			err = -EINVAL;
@@ -329,8 +348,8 @@ static int bpf_jit_recompile_prog_images(
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
 		bpf_func_t old_bpf_func = READ_ONCE(image_prog->bpf_func);
 		struct bpf_prog *recompiled;
 
@@ -393,8 +412,8 @@ static int bpf_jit_recompile_prog_images(
 		}
 
 		for (i = 0; i < image_cnt; i++) {
-			struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-				main_aux->func[i] : prog;
+			struct bpf_prog *image_prog =
+				bpf_jit_recompile_image_prog(main_aux, prog, i);
 			bpf_func_t old_bpf_func = READ_ONCE(image_prog->bpf_func);
 			struct bpf_prog *recompiled;
 
@@ -433,16 +452,11 @@ static int bpf_jit_recompile_prog_images(
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
-		struct bpf_prog *ksym_prog;
-
-		if (!(main_aux->func_cnt && main_aux->func) || !i)
-			ksym_prog = prog;
-		else if (i < real_func_cnt)
-			ksym_prog = main_aux->func[i];
-		else
-			ksym_prog = NULL;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
+		struct bpf_prog *ksym_prog =
+			bpf_jit_recompile_ksym_prog(main_aux, prog,
+						     real_func_cnt, i);
 
 		if (image_prog->jited && image_prog->bpf_func)
 			old_headers[i] = bpf_jit_binary_pack_hdr(image_prog);
@@ -464,8 +478,8 @@ static int bpf_jit_recompile_prog_images(
 	}
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
 
 		err = bpf_jit_recompile_commit(image_prog);
 		if (err)
@@ -508,16 +522,11 @@ static int bpf_jit_recompile_prog_images(
 			synchronize_rcu();
 
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
-		struct bpf_prog *ksym_prog;
-
-		if (!(main_aux->func_cnt && main_aux->func) || !i)
-			ksym_prog = prog;
-		else if (i < real_func_cnt)
-			ksym_prog = main_aux->func[i];
-		else
-			ksym_prog = NULL;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
+		struct bpf_prog *ksym_prog =
+			bpf_jit_recompile_ksym_prog(main_aux, prog,
+						     real_func_cnt, i);
 
 		if (ksym_prog)
 			bpf_prog_kallsyms_replace(
@@ -540,8 +549,8 @@ static int bpf_jit_recompile_prog_images(
 
 out_no_commit:
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
 
 		if (!image_prog)
 			continue;
@@ -556,16 +565,11 @@ out_free:
 
 out_abort:
 	for (i = 0; i < image_cnt; i++) {
-		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
-			main_aux->func[i] : prog;
-		struct bpf_prog *ksym_prog;
-
-		if (!(main_aux->func_cnt && main_aux->func) || !i)
-			ksym_prog = prog;
-		else if (i < real_func_cnt)
-			ksym_prog = main_aux->func[i];
-		else
-			ksym_prog = NULL;
+		struct bpf_prog *image_prog =
+			bpf_jit_recompile_image_prog(main_aux, prog, i);
+		struct bpf_prog *ksym_prog =
+			bpf_jit_recompile_ksym_prog(main_aux, prog,
+						     real_func_cnt, i);
 
 		if (ksym_prog)
 			bpf_jit_recompile_shadow_ksym_del(ksym_prog);

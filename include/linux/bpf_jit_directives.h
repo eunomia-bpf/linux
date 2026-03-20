@@ -36,6 +36,52 @@ struct bpf_jit_canonical_params {
 	struct bpf_jit_binding_value params[BPF_JIT_MAX_CANONICAL_PARAMS];
 };
 
+static inline const struct bpf_jit_binding_value *
+bpf_jit_param_value(const struct bpf_jit_canonical_params *params, u8 param)
+{
+	return &params->params[param];
+}
+
+static inline u8
+bpf_jit_param_reg(const struct bpf_jit_canonical_params *params, u8 param)
+{
+	return (u8)bpf_jit_param_value(params, param)->value;
+}
+
+static inline s64
+bpf_jit_param_imm(const struct bpf_jit_canonical_params *params, u8 param)
+{
+	return bpf_jit_param_value(params, param)->value;
+}
+
+static inline bool
+bpf_jit_binding_value_is_noop(const struct bpf_jit_binding_value *value,
+			      u8 dst_reg)
+{
+	return value->type == BPF_JIT_BIND_VAL_REG && value->value == dst_reg;
+}
+
+static inline u32 bpf_jit_pick_wide_chunk(u32 remaining)
+{
+	if (remaining >= 4)
+		return 4;
+	if (remaining >= 2)
+		return 2;
+	return 1;
+}
+
+static inline u32 bpf_jit_bitfield_mask_width(u64 mask)
+{
+	u32 width = 0;
+
+	while (mask & 1) {
+		width++;
+		mask >>= 1;
+	}
+
+	return width;
+}
+
 enum bpf_jit_rotate_param {
 	BPF_JIT_ROT_PARAM_DST_REG	= 0,
 	BPF_JIT_ROT_PARAM_SRC_REG	= 1,
