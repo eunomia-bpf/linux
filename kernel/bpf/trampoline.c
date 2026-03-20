@@ -152,6 +152,44 @@ bool bpf_prog_has_trampoline(const struct bpf_prog *prog)
 	}
 }
 
+bool bpf_prog_has_active_trampoline(const struct bpf_prog *prog)
+{
+	u32 prog_id, obj_id, btf_id;
+	struct bpf_trampoline *tr;
+	int bucket, kind;
+
+	if (!prog || !prog->aux)
+		return false;
+
+	prog_id = prog->aux->id;
+	if (!prog_id)
+		return false;
+
+	mutex_lock(&trampoline_mutex);
+	for (bucket = 0; bucket < TRAMPOLINE_TABLE_SIZE; bucket++) {
+		hlist_for_each_entry(tr, &trampoline_key_table[bucket], hlist_key) {
+			bpf_trampoline_unpack_key(tr->key, &obj_id, &btf_id);
+			if (obj_id != prog_id || (btf_id & 0x80000000))
+				continue;
+
+			if (READ_ONCE(tr->extension_prog)) {
+				mutex_unlock(&trampoline_mutex);
+				return true;
+			}
+
+			for (kind = 0; kind < BPF_TRAMP_MAX; kind++) {
+				if (READ_ONCE(tr->progs_cnt[kind]) > 0) {
+					mutex_unlock(&trampoline_mutex);
+					return true;
+				}
+			}
+		}
+	}
+	mutex_unlock(&trampoline_mutex);
+
+	return false;
+}
+
 void bpf_image_ksym_init(void *data, unsigned int size, struct bpf_ksym *ksym)
 {
 	ksym->start = (unsigned long) data;

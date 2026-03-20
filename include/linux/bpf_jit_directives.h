@@ -75,6 +75,20 @@ enum bpf_jit_bitfield_extract_param {
 
 enum bpf_jit_zero_ext_param {
 	BPF_JIT_ZEXT_PARAM_DST_REG	= 0,
+	BPF_JIT_ZEXT_PARAM_CODE		= 1,
+	BPF_JIT_ZEXT_PARAM_SRC_REG	= 2,
+	BPF_JIT_ZEXT_PARAM_OFF		= 3,
+	BPF_JIT_ZEXT_PARAM_IMM		= 4,
+};
+
+enum bpf_jit_cond_select_param {
+	BPF_JIT_SEL_PARAM_DST_REG	= 0,
+	BPF_JIT_SEL_PARAM_COND_OP	= 1,
+	BPF_JIT_SEL_PARAM_COND_A	= 2,
+	BPF_JIT_SEL_PARAM_COND_B	= 3,
+	BPF_JIT_SEL_PARAM_TRUE_VAL	= 4,
+	BPF_JIT_SEL_PARAM_FALSE_VAL	= 5,
+	BPF_JIT_SEL_PARAM_WIDTH		= 6,
 };
 
 enum bpf_jit_endian_fusion_direction {
@@ -91,35 +105,13 @@ enum bpf_jit_endian_fusion_param {
 };
 
 enum bpf_jit_branch_flip_param {
-	BPF_JIT_BFLIP_PARAM_COND_OP	= 0,
-	BPF_JIT_BFLIP_PARAM_BODY_A_START = 1,
-	BPF_JIT_BFLIP_PARAM_BODY_A_LEN	= 2,
-	BPF_JIT_BFLIP_PARAM_BODY_B_START = 3,
-	BPF_JIT_BFLIP_PARAM_BODY_B_LEN	= 4,
-	BPF_JIT_BFLIP_PARAM_JOIN_TARGET = 5,
-};
-
-enum bpf_jit_cond_select_param {
-	BPF_JIT_SEL_PARAM_DST_REG	= 0,
-	BPF_JIT_SEL_PARAM_COND_OP	= 1,
-	BPF_JIT_SEL_PARAM_COND_A	= 2,
-	BPF_JIT_SEL_PARAM_COND_B	= 3,
-	BPF_JIT_SEL_PARAM_TRUE_VAL	= 4,
-	BPF_JIT_SEL_PARAM_FALSE_VAL	= 5,
-	BPF_JIT_SEL_PARAM_WIDTH		= 6,
-};
-
-/*
- * Kernel-only normalized params populated by canonical-site validators.
- * These are not user-bindable policy params; they carry validated emitter
- * inputs that do not fit the public scalar binding model.
- */
-enum bpf_jit_zero_ext_internal_param {
-	BPF_JIT_ZEXT_PARAM_ALU32_PTR = 1,
-};
-
-enum bpf_jit_branch_flip_internal_param {
-	BPF_JIT_BFLIP_PARAM_SITE_PTR = 6,
+	BPF_JIT_BFLIP_PARAM_COND_CODE	= 0,
+	BPF_JIT_BFLIP_PARAM_COND_DST_REG = 1,
+	BPF_JIT_BFLIP_PARAM_COND_SRC	= 2,
+	BPF_JIT_BFLIP_PARAM_BODY_A_LEN	= 3,
+	BPF_JIT_BFLIP_PARAM_BODY_A_PTR	= 4,
+	BPF_JIT_BFLIP_PARAM_BODY_B_LEN	= 5,
+	BPF_JIT_BFLIP_PARAM_BODY_B_PTR	= 6,
 };
 
 /**

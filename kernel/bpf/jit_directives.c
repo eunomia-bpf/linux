@@ -568,11 +568,30 @@ static bool bpf_pseudo_call_insn(const struct bpf_insn *insn)
  * BPF_PROG_JIT_RECOMPILE policy framework (v5 only)
  * ================================================================ */
 
+static void bpf_jit_rule_release(struct bpf_jit_rule *rule)
+{
+	if (!rule)
+		return;
+
+	if (rule->canonical_form == BPF_JIT_CF_BRANCH_FLIP) {
+		kfree((void *)(long)
+		      rule->params.params[BPF_JIT_BFLIP_PARAM_BODY_A_PTR].value);
+		kfree((void *)(long)
+		      rule->params.params[BPF_JIT_BFLIP_PARAM_BODY_B_PTR].value);
+	}
+
+	memset(&rule->params, 0, sizeof(rule->params));
+}
+
 void bpf_jit_free_policy(struct bpf_jit_policy *policy)
 {
+	u32 i;
+
 	if (!policy)
 		return;
 
+	for (i = 0; i < policy->rule_cnt; i++)
+		bpf_jit_rule_release(&policy->rules[i]);
 	kvfree(policy->blob);
 	kvfree(policy);
 }
@@ -1892,8 +1911,11 @@ static bool bpf_jit_zero_ext_elide_is_tail(const struct bpf_insn *insn, u8 dst_r
 }
 
 struct bpf_jit_zero_ext_elide_shape {
+	u8 code;
 	u8 dst_reg;
-	const struct bpf_insn *alu32_insn;
+	u8 src_reg;
+	s16 off;
+	s32 imm;
 };
 
 static bool bpf_jit_parse_zero_ext_elide_shape(
@@ -1916,8 +1938,11 @@ static bool bpf_jit_parse_zero_ext_elide_shape(
 		return false;
 
 	if (shape) {
+		shape->code = alu32_insn->code;
 		shape->dst_reg = alu32_insn->dst_reg;
-		shape->alu32_insn = alu32_insn;
+		shape->src_reg = alu32_insn->src_reg;
+		shape->off = alu32_insn->off;
+		shape->imm = alu32_insn->imm;
 	}
 
 	return true;
@@ -1938,8 +1963,14 @@ bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
 		memset(params, 0, sizeof(*params));
 		bpf_jit_param_set_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG,
 				      shape.dst_reg);
-		bpf_jit_param_set_ptr(params, BPF_JIT_ZEXT_PARAM_ALU32_PTR,
-				      shape.alu32_insn);
+		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_CODE,
+				      shape.code);
+		bpf_jit_param_set_reg(params, BPF_JIT_ZEXT_PARAM_SRC_REG,
+				      shape.src_reg);
+		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_OFF,
+				      shape.off);
+		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_IMM,
+				      shape.imm);
 	}
 
 	return true;
@@ -2097,13 +2128,13 @@ static bool bpf_jit_branch_flip_body_linear(const struct bpf_insn *insns,
 static bool bpf_jit_branch_flip_cond_op_valid(u8 op);
 
 struct bpf_jit_branch_flip_shape {
-	u8 cond_op;
+	u8 cond_code;
+	u8 cond_dst_reg;
+	struct bpf_jit_binding_value cond_src;
 	u32 body_a_start;
 	u32 body_a_len;
 	u32 body_b_start;
 	u32 body_b_len;
-	u32 join_target;
-	const struct bpf_insn *site_insns;
 };
 
 static bool bpf_jit_parse_branch_flip_shape(
@@ -2156,13 +2187,16 @@ static bool bpf_jit_parse_branch_flip_shape(
 		return false;
 
 	if (shape) {
-		shape->cond_op = BPF_OP(jcc->code);
+		shape->cond_code = jcc->code;
+		shape->cond_dst_reg = jcc->dst_reg;
+		shape->cond_src.type = BPF_SRC(jcc->code) == BPF_X ?
+			BPF_JIT_BIND_VAL_REG : BPF_JIT_BIND_VAL_IMM;
+		shape->cond_src.value = BPF_SRC(jcc->code) == BPF_X ?
+			jcc->src_reg : jcc->imm;
 		shape->body_a_start = body_a_start;
 		shape->body_a_len = body_a_len;
 		shape->body_b_start = body_b_start;
 		shape->body_b_len = body_b_len;
-		shape->join_target = join_target;
-		shape->site_insns = &insns[idx];
 	}
 
 	return true;
@@ -2175,26 +2209,44 @@ bpf_jit_validate_branch_flip_rule(const struct bpf_insn *insns,
 				  struct bpf_jit_canonical_params *params)
 {
 	struct bpf_jit_branch_flip_shape shape;
+	struct bpf_insn *body_a_insns = NULL;
+	struct bpf_insn *body_b_insns = NULL;
 
 	if (!bpf_jit_parse_branch_flip_shape(insns, insn_cnt, rule, &shape))
 		return false;
 
 	if (params) {
+		body_a_insns = kmemdup(&insns[shape.body_a_start],
+				       array_size(shape.body_a_len,
+						  sizeof(*body_a_insns)),
+				       GFP_KERNEL_ACCOUNT);
+		if (!body_a_insns)
+			return false;
+
+		body_b_insns = kmemdup(&insns[shape.body_b_start],
+				       array_size(shape.body_b_len,
+						  sizeof(*body_b_insns)),
+				       GFP_KERNEL_ACCOUNT);
+		if (!body_b_insns) {
+			kfree(body_a_insns);
+			return false;
+		}
+
 		memset(params, 0, sizeof(*params));
-		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_COND_OP,
-				      shape.cond_op);
-		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_START,
-				      shape.body_a_start);
+		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_COND_CODE,
+				      shape.cond_code);
+		bpf_jit_param_set_reg(params, BPF_JIT_BFLIP_PARAM_COND_DST_REG,
+				      shape.cond_dst_reg);
+		bpf_jit_param_set_value(params, BPF_JIT_BFLIP_PARAM_COND_SRC,
+					&shape.cond_src);
 		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_A_LEN,
 				      shape.body_a_len);
-		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_START,
-				      shape.body_b_start);
+		bpf_jit_param_set_ptr(params, BPF_JIT_BFLIP_PARAM_BODY_A_PTR,
+				      body_a_insns);
 		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_BODY_B_LEN,
 				      shape.body_b_len);
-		bpf_jit_param_set_imm(params, BPF_JIT_BFLIP_PARAM_JOIN_TARGET,
-				      shape.join_target);
-		bpf_jit_param_set_ptr(params, BPF_JIT_BFLIP_PARAM_SITE_PTR,
-				      shape.site_insns);
+		bpf_jit_param_set_ptr(params, BPF_JIT_BFLIP_PARAM_BODY_B_PTR,
+				      body_b_insns);
 	}
 
 	return true;
@@ -2429,7 +2481,7 @@ static struct bpf_jit_policy *bpf_jit_alloc_policy(u32 rule_cnt)
 {
 	struct bpf_jit_policy *policy;
 
-	policy = kvmalloc(struct_size(policy, rules, rule_cnt),
+	policy = kvzalloc(struct_size(policy, rules, rule_cnt),
 			  GFP_KERNEL_ACCOUNT);
 	if (!policy)
 		return ERR_PTR(-ENOMEM);
@@ -2438,6 +2490,41 @@ static struct bpf_jit_policy *bpf_jit_alloc_policy(u32 rule_cnt)
 	policy->active_cnt = 0;
 	policy->blob = NULL;
 	return policy;
+}
+
+static int bpf_jit_policy_validate_disjoint(const struct bpf_prog *prog,
+					    const struct bpf_jit_policy *policy)
+{
+	const struct bpf_jit_rule *prev, *rule;
+	u32 prev_end, rule_end;
+	u32 i;
+
+	if (!policy || policy->rule_cnt < 2)
+		return 0;
+
+	prev = &policy->rules[0];
+	if (!bpf_jit_compute_site_end(prev->site_start, prev->site_len, &prev_end))
+		return -EINVAL;
+
+	for (i = 1; i < policy->rule_cnt; i++) {
+		rule = &policy->rules[i];
+		if (!bpf_jit_compute_site_end(rule->site_start, rule->site_len,
+					      &rule_end))
+			return -EINVAL;
+		if (rule->site_start < prev_end) {
+			bpf_jit_recompile_prog_log(
+				prog,
+				"policy has overlapping rules: rule %u site %u+%u overlaps rule %u site %u+%u\n",
+				prev->user_index, prev->site_start, prev->site_len,
+				rule->user_index, rule->site_start, rule->site_len);
+			return -EINVAL;
+		}
+
+		prev = rule;
+		prev_end = rule_end;
+	}
+
+	return 0;
 }
 
 static struct bpf_jit_policy *
@@ -2643,6 +2730,14 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 		policy = ERR_PTR(-EINVAL);
 		goto out;
 	}
+	if (hdr->flags) {
+		bpf_jit_recompile_prog_log(
+			prog,
+			"policy header has unsupported flags 0x%x\n",
+			hdr->flags);
+		policy = ERR_PTR(-EINVAL);
+		goto out;
+	}
 
 	policy = bpf_jit_parse_policy_format_v2(prog, hdr, blob, blob_len);
 	if (!IS_ERR(policy))
@@ -2653,6 +2748,11 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	/* Sort by site_start for efficient lookup */
 	sort(policy->rules, policy->rule_cnt,
 	     sizeof(struct bpf_jit_rule), rule_cmp, NULL);
+	if (bpf_jit_policy_validate_disjoint(prog, policy)) {
+		bpf_jit_free_policy(policy);
+		policy = ERR_PTR(-EINVAL);
+		goto out;
+	}
 
 	pr_debug("bpf_jit_recompile: prog insn_cnt=%u rule_cnt=%u active=%u\n",
 		 prog->len, policy->rule_cnt, policy->active_cnt);
@@ -2669,6 +2769,27 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 out:
 	kvfree(blob);
 	return policy;
+}
+
+static bool bpf_jit_recompile_has_trampoline_dependency(
+	const struct bpf_prog *prog)
+{
+	if (!prog || !prog->aux)
+		return false;
+
+	if (bpf_prog_has_active_trampoline(prog))
+		return true;
+	if (READ_ONCE(prog->aux->dst_trampoline))
+		return true;
+	if (bpf_prog_has_trampoline(prog))
+		return true;
+	if (prog->type == BPF_PROG_TYPE_EXT)
+		return true;
+	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS &&
+	    rcu_access_pointer(prog->aux->st_ops_assoc))
+		return true;
+
+	return false;
 }
 
 /**
@@ -3001,17 +3122,10 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 		goto out_put;
 	}
 
-	/*
-	 * Attached struct_ops callbacks are invoked through per-member
-	 * trampolines that hardcode the current prog->bpf_func. Re-JITing the
-	 * program body alone would leave the live trampoline calling the stale
-	 * image.
-	 */
-	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS &&
-	    rcu_access_pointer(prog->aux->st_ops_assoc)) {
+	if (bpf_jit_recompile_has_trampoline_dependency(prog)) {
 		bpf_jit_recompile_prog_log(
 			prog,
-			"attached struct_ops programs are not supported: associated trampoline must be regenerated\n");
+			"trampoline-linked programs are not supported: active trampoline users or trampoline-attached execution require trampoline regeneration\n");
 		err = -EOPNOTSUPP;
 		goto out_put;
 	}
