@@ -329,6 +329,15 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 		policy = ERR_PTR(-EINVAL);
 		goto out;
 	}
+#elif defined(CONFIG_ARM64)
+	if (hdr->arch_id != BPF_JIT_ARCH_ARM64) {
+		bpf_jit_recompile_prog_log(
+			prog,
+			"policy arch mismatch (blob=%u expected=%u)\n",
+			hdr->arch_id, BPF_JIT_ARCH_ARM64);
+		policy = ERR_PTR(-EINVAL);
+		goto out;
+	}
 #else
 	bpf_jit_recompile_prog_log(prog, "policy arch is unsupported\n");
 	policy = ERR_PTR(-EOPNOTSUPP);

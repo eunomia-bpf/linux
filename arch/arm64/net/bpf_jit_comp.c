@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_jit_directives.h>
 #include <linux/cfi.h>
 #include <linux/filter.h>
 #include <linux/memory.h>
@@ -92,6 +93,15 @@ struct jit_ctx {
 	bool fp_used;
 	bool priv_sp_used;
 	bool write;
+	struct exception_table_entry *extable;
+	u32 num_exentries;
+	void __percpu *priv_stack_ptr;
+};
+
+enum a64_cond_select_op {
+	A64_CONDSEL_CSEL,
+	A64_CONDSEL_CSINC,
+	A64_CONDSEL_CSINV,
 };
 
 struct bpf_plt {
@@ -344,6 +354,724 @@ static bool is_lsi_offset(int offset, int scale)
 		return false;
 
 	return true;
+}
+
+static bool
+arm64_binding_value_is_noop(const struct bpf_jit_binding_value *value,
+			    u8 dst_reg)
+{
+	return value->type == BPF_JIT_BIND_VAL_REG && value->value == dst_reg;
+}
+
+static int emit_arm64_binding_value(struct jit_ctx *ctx,
+				    const struct bpf_jit_binding_value *value,
+				    bool is64, u8 dst_reg)
+{
+	u8 src_reg;
+
+	switch (value->type) {
+	case BPF_JIT_BIND_VAL_REG:
+		src_reg = bpf2a64[(u8)value->value];
+		if (src_reg != dst_reg)
+			emit(A64_MOV(is64, dst_reg, src_reg), ctx);
+		return 0;
+	case BPF_JIT_BIND_VAL_IMM:
+		if ((s64)(s32)value->value != value->value)
+			return -EINVAL;
+		emit_a64_mov_i(is64, dst_reg, (s32)value->value, ctx);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int bpf_jmp_to_a64_cond(u8 op, enum aarch64_insn_condition *cond)
+{
+	switch (op) {
+	case BPF_JEQ:
+		*cond = A64_COND_EQ;
+		return 0;
+	case BPF_JNE:
+	case BPF_JSET:
+		*cond = A64_COND_NE;
+		return 0;
+	case BPF_JGT:
+		*cond = A64_COND_HI;
+		return 0;
+	case BPF_JLT:
+		*cond = A64_COND_CC;
+		return 0;
+	case BPF_JGE:
+		*cond = A64_COND_CS;
+		return 0;
+	case BPF_JLE:
+		*cond = A64_COND_LS;
+		return 0;
+	case BPF_JSGT:
+		*cond = A64_COND_GT;
+		return 0;
+	case BPF_JSLT:
+		*cond = A64_COND_LT;
+		return 0;
+	case BPF_JSGE:
+		*cond = A64_COND_GE;
+		return 0;
+	case BPF_JSLE:
+		*cond = A64_COND_LE;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int a64_invert_cond(enum aarch64_insn_condition cond,
+			   enum aarch64_insn_condition *inv)
+{
+	switch (cond) {
+	case AARCH64_INSN_COND_EQ:
+		*inv = AARCH64_INSN_COND_NE;
+		return 0;
+	case AARCH64_INSN_COND_NE:
+		*inv = AARCH64_INSN_COND_EQ;
+		return 0;
+	case AARCH64_INSN_COND_CS:
+		*inv = AARCH64_INSN_COND_CC;
+		return 0;
+	case AARCH64_INSN_COND_CC:
+		*inv = AARCH64_INSN_COND_CS;
+		return 0;
+	case AARCH64_INSN_COND_HI:
+		*inv = AARCH64_INSN_COND_LS;
+		return 0;
+	case AARCH64_INSN_COND_LS:
+		*inv = AARCH64_INSN_COND_HI;
+		return 0;
+	case AARCH64_INSN_COND_GE:
+		*inv = AARCH64_INSN_COND_LT;
+		return 0;
+	case AARCH64_INSN_COND_LT:
+		*inv = AARCH64_INSN_COND_GE;
+		return 0;
+	case AARCH64_INSN_COND_GT:
+		*inv = AARCH64_INSN_COND_LE;
+		return 0;
+	case AARCH64_INSN_COND_LE:
+		*inv = AARCH64_INSN_COND_GT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static u32 a64_gen_cond_select(enum a64_cond_select_op op, bool is64,
+			       u8 dst_reg, u8 true_reg, u8 false_reg,
+			       enum aarch64_insn_condition cond)
+{
+	u32 insn;
+
+	switch (op) {
+	case A64_CONDSEL_CSEL:
+		insn = is64 ? 0x9a800000 : 0x1a800000;
+		break;
+	case A64_CONDSEL_CSINC:
+		insn = is64 ? 0x9a800400 : 0x1a800400;
+		break;
+	case A64_CONDSEL_CSINV:
+		insn = is64 ? 0xda800000 : 0x5a800000;
+		break;
+	default:
+		return AARCH64_BREAK_FAULT;
+	}
+
+	if (cond < AARCH64_INSN_COND_EQ || cond > AARCH64_INSN_COND_AL)
+		return AARCH64_BREAK_FAULT;
+
+	insn |= dst_reg;
+	insn |= true_reg << 5;
+	insn |= cond << 12;
+	insn |= false_reg << 16;
+
+	return insn;
+}
+
+static int emit_a64_cond_select(struct jit_ctx *ctx,
+				enum a64_cond_select_op op, bool is64,
+				u8 dst_reg, u8 true_reg, u8 false_reg,
+				enum aarch64_insn_condition cond)
+{
+	u32 insn;
+
+	insn = a64_gen_cond_select(op, is64, dst_reg, true_reg, false_reg,
+				   cond);
+	if (insn == AARCH64_BREAK_FAULT)
+		return -EINVAL;
+
+	emit(insn, ctx);
+	return 0;
+}
+
+static int emit_a64_cset(struct jit_ctx *ctx, bool is64, u8 dst_reg,
+			 enum aarch64_insn_condition cond)
+{
+	enum aarch64_insn_condition inv_cond;
+	int err;
+
+	err = a64_invert_cond(cond, &inv_cond);
+	if (err)
+		return err;
+
+	return emit_a64_cond_select(ctx, A64_CONDSEL_CSINC, is64, dst_reg,
+				    A64_ZR, A64_ZR, inv_cond);
+}
+
+static int emit_a64_csetm(struct jit_ctx *ctx, bool is64, u8 dst_reg,
+			  enum aarch64_insn_condition cond)
+{
+	enum aarch64_insn_condition inv_cond;
+	int err;
+
+	err = a64_invert_cond(cond, &inv_cond);
+	if (err)
+		return err;
+
+	return emit_a64_cond_select(ctx, A64_CONDSEL_CSINV, is64, dst_reg,
+				    A64_ZR, A64_ZR, inv_cond);
+}
+
+static bool arm64_select_binding_is_imm(const struct bpf_jit_binding_value *value,
+					s64 imm)
+{
+	return value->type == BPF_JIT_BIND_VAL_IMM && value->value == imm;
+}
+
+static int emit_arm64_cmp_binding(struct jit_ctx *ctx, bool is64, u8 cond_op,
+				  u8 cond_a_reg,
+				  const struct bpf_jit_binding_value *cond_b)
+{
+	u8 tmp_reg = bpf2a64[TMP_REG_1];
+	u32 insn;
+	s32 imm;
+
+	switch (cond_b->type) {
+	case BPF_JIT_BIND_VAL_REG:
+		if (cond_op == BPF_JSET)
+			emit(A64_TST(is64, cond_a_reg, bpf2a64[(u8)cond_b->value]),
+			     ctx);
+		else
+			emit(A64_CMP(is64, cond_a_reg, bpf2a64[(u8)cond_b->value]),
+			     ctx);
+		return 0;
+	case BPF_JIT_BIND_VAL_IMM:
+		if ((s64)(s32)cond_b->value != cond_b->value)
+			return -EINVAL;
+		imm = (s32)cond_b->value;
+		if (cond_op == BPF_JSET) {
+			insn = A64_TST_I(is64, cond_a_reg, imm);
+			if (insn != AARCH64_BREAK_FAULT) {
+				emit(insn, ctx);
+				return 0;
+			}
+			emit_a64_mov_i(is64, tmp_reg, imm, ctx);
+			emit(A64_TST(is64, cond_a_reg, tmp_reg), ctx);
+			return 0;
+		}
+
+		if (is_addsub_imm(imm))
+			emit(A64_CMP_I(is64, cond_a_reg, imm), ctx);
+		else if (is_addsub_imm(-(u32)imm))
+			emit(A64_CMN_I(is64, cond_a_reg, -imm), ctx);
+		else {
+			emit_a64_mov_i(is64, tmp_reg, imm, ctx);
+			emit(A64_CMP(is64, cond_a_reg, tmp_reg), ctx);
+		}
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static u32 arm64_pick_wide_chunk(u32 remaining)
+{
+	if (remaining >= 4)
+		return 4;
+	if (remaining >= 2)
+		return 2;
+	return 1;
+}
+
+static int arm64_resolve_mem_base(const struct jit_ctx *ctx, u8 bpf_base_reg,
+				  s16 base_off, u8 *base_reg, int *off_adj)
+{
+	if (bpf_base_reg == BPF_REG_FP) {
+		*base_reg = ctx->priv_sp_used ? bpf2a64[PRIVATE_SP] : A64_SP;
+		*off_adj = base_off + ctx->stack_size;
+		return 0;
+	}
+
+	if (bpf_base_reg >= ARRAY_SIZE(bpf2a64))
+		return -EINVAL;
+
+	*base_reg = bpf2a64[bpf_base_reg];
+	*off_adj = base_off;
+	return 0;
+}
+
+static int arm64_emit_ldr_chunk(struct jit_ctx *ctx, u8 dst_reg, u8 base_reg,
+				int off, u32 chunk)
+{
+	u8 tmp_reg = bpf2a64[TMP_REG_2];
+
+	switch (chunk) {
+	case 1:
+		if (is_lsi_offset(off, 0))
+			emit(A64_LDRBI(dst_reg, base_reg, off), ctx);
+		else {
+			emit_a64_mov_i(1, tmp_reg, off, ctx);
+			emit(A64_LDRB(dst_reg, base_reg, tmp_reg), ctx);
+		}
+		return 0;
+	case 2:
+		if (is_lsi_offset(off, 1))
+			emit(A64_LDRHI(dst_reg, base_reg, off), ctx);
+		else {
+			emit_a64_mov_i(1, tmp_reg, off, ctx);
+			emit(A64_LDRH(dst_reg, base_reg, tmp_reg), ctx);
+		}
+		return 0;
+	case 4:
+		if (is_lsi_offset(off, 2))
+			emit(A64_LDR32I(dst_reg, base_reg, off), ctx);
+		else {
+			emit_a64_mov_i(1, tmp_reg, off, ctx);
+			emit(A64_LDR32(dst_reg, base_reg, tmp_reg), ctx);
+		}
+		return 0;
+	case 8:
+		if (is_lsi_offset(off, 3))
+			emit(A64_LDR64I(dst_reg, base_reg, off), ctx);
+		else {
+			emit_a64_mov_i(1, tmp_reg, off, ctx);
+			emit(A64_LDR64(dst_reg, base_reg, tmp_reg), ctx);
+		}
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static void arm64_emit_bswap_width(struct jit_ctx *ctx, u8 reg, u32 width)
+{
+	switch (width) {
+	case 2:
+		emit(A64_REV16(0, reg, reg), ctx);
+		break;
+	case 4:
+		emit(A64_REV32(0, reg, reg), ctx);
+		break;
+	case 8:
+		emit(A64_REV64(reg, reg), ctx);
+		break;
+	}
+}
+
+static u64 arm64_bitfield_mask_from_imm(s32 mask, u32 width)
+{
+	if (width == 32)
+		return (u32)mask;
+
+	return (u64)(s64)mask;
+}
+
+static bool arm64_bitfield_low_mask_width(u64 mask, u32 *field_width)
+{
+	u32 width = 0;
+
+	if (!mask)
+		return false;
+
+	while (mask & 1) {
+		width++;
+		mask >>= 1;
+	}
+
+	if (mask)
+		return false;
+
+	if (field_width)
+		*field_width = width;
+
+	return true;
+}
+
+static int emit_canonical_rotate_arm64(struct jit_ctx *ctx,
+				       const struct bpf_jit_canonical_params *params,
+				       u16 native_choice)
+{
+	const struct bpf_jit_binding_value *dst_value;
+	const struct bpf_jit_binding_value *src_value;
+	const struct bpf_jit_binding_value *amount_value;
+	const struct bpf_jit_binding_value *width_value;
+	u32 width, rot_amount, ror_imm;
+	bool is64;
+
+	dst_value = &params->params[BPF_JIT_ROT_PARAM_DST_REG];
+	src_value = &params->params[BPF_JIT_ROT_PARAM_SRC_REG];
+	amount_value = &params->params[BPF_JIT_ROT_PARAM_AMOUNT];
+	width_value = &params->params[BPF_JIT_ROT_PARAM_WIDTH];
+
+	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
+	    src_value->type != BPF_JIT_BIND_VAL_REG ||
+	    amount_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    width_value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	if (native_choice != BPF_JIT_ROT_ROR &&
+	    native_choice != BPF_JIT_ROT_RORX)
+		return -EINVAL;
+
+	width = (u32)width_value->value;
+	rot_amount = (u32)amount_value->value;
+	if ((width != 32 && width != 64) || !rot_amount || rot_amount >= width)
+		return -EINVAL;
+
+	is64 = width == 64;
+	ror_imm = width - rot_amount;
+	emit(A64_ROR_I(is64, bpf2a64[(u8)dst_value->value],
+		       bpf2a64[(u8)src_value->value], ror_imm), ctx);
+	return 0;
+}
+
+static int emit_canonical_wide_load_arm64(
+	struct jit_ctx *ctx,
+	const struct bpf_jit_canonical_params *params)
+{
+	u32 encoded_width, width, flags, remaining, consumed;
+	bool big_endian, need_rev, first_chunk = true;
+	u8 result_reg, base_reg, chunk_reg;
+	int base_off, shift;
+
+	if (params->params[BPF_JIT_WMEM_PARAM_DST_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_WMEM_PARAM_BASE_REG].type != BPF_JIT_BIND_VAL_REG ||
+	    params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].type != BPF_JIT_BIND_VAL_IMM ||
+	    params->params[BPF_JIT_WMEM_PARAM_WIDTH].type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	result_reg =
+		bpf2a64[(u8)params->params[BPF_JIT_WMEM_PARAM_DST_REG].value];
+	encoded_width = (u32)params->params[BPF_JIT_WMEM_PARAM_WIDTH].value;
+	width = encoded_width & BPF_JIT_WMEM_WIDTH_MASK;
+	flags = encoded_width & ~BPF_JIT_WMEM_WIDTH_MASK;
+	if (flags & ~BPF_JIT_WMEM_F_BIG_ENDIAN)
+		return -EINVAL;
+	if (width < 2 || width > 8)
+		return -EINVAL;
+
+	big_endian = !!(flags & BPF_JIT_WMEM_F_BIG_ENDIAN);
+	need_rev = big_endian ^ IS_ENABLED(CONFIG_CPU_BIG_ENDIAN);
+
+	if (arm64_resolve_mem_base(ctx,
+				   (u8)params->params[BPF_JIT_WMEM_PARAM_BASE_REG].value,
+				   (s16)params->params[BPF_JIT_WMEM_PARAM_BASE_OFF].value,
+				   &base_reg, &base_off))
+		return -EINVAL;
+
+	if (width == 2 || width == 4 || width == 8) {
+		if (arm64_emit_ldr_chunk(ctx, result_reg, base_reg, base_off, width))
+			return -EINVAL;
+		if (need_rev)
+			arm64_emit_bswap_width(ctx, result_reg, width);
+		return 0;
+	}
+
+	remaining = width;
+	consumed = 0;
+	while (remaining) {
+		u32 chunk = arm64_pick_wide_chunk(remaining);
+
+		chunk_reg = first_chunk ? result_reg : bpf2a64[TMP_REG_1];
+		shift = big_endian ? (remaining - chunk) * 8 : consumed * 8;
+
+		if (arm64_emit_ldr_chunk(ctx, chunk_reg, base_reg,
+					 base_off + consumed, chunk))
+			return -EINVAL;
+		if (need_rev && chunk > 1)
+			arm64_emit_bswap_width(ctx, chunk_reg, chunk);
+		if (shift)
+			emit(A64_LSL(1, chunk_reg, chunk_reg, shift), ctx);
+		if (!first_chunk)
+			emit(A64_ORR(1, result_reg, result_reg, chunk_reg), ctx);
+
+		first_chunk = false;
+		consumed += chunk;
+		remaining -= chunk;
+	}
+
+	return 0;
+}
+
+static int emit_canonical_bitfield_extract_arm64(
+	struct jit_ctx *ctx,
+	const struct bpf_jit_canonical_params *params)
+{
+	const struct bpf_jit_binding_value *dst_value;
+	const struct bpf_jit_binding_value *src_value;
+	const struct bpf_jit_binding_value *shift_value;
+	const struct bpf_jit_binding_value *mask_value;
+	const struct bpf_jit_binding_value *width_value;
+	const struct bpf_jit_binding_value *order_value;
+	u64 raw_mask, effective_mask, full_mask;
+	u32 width, shift, field_width;
+	bool is64, mask_first;
+	u8 dst_reg, src_reg;
+
+	dst_value = &params->params[BPF_JIT_BFX_PARAM_DST_REG];
+	src_value = &params->params[BPF_JIT_BFX_PARAM_SRC_REG];
+	shift_value = &params->params[BPF_JIT_BFX_PARAM_SHIFT];
+	mask_value = &params->params[BPF_JIT_BFX_PARAM_MASK];
+	width_value = &params->params[BPF_JIT_BFX_PARAM_WIDTH];
+	order_value = &params->params[BPF_JIT_BFX_PARAM_ORDER];
+
+	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
+	    src_value->type != BPF_JIT_BIND_VAL_REG ||
+	    shift_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    mask_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    width_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    order_value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+
+	width = (u32)width_value->value;
+	shift = (u32)shift_value->value;
+	if ((width != 32 && width != 64) || shift >= width)
+		return -EINVAL;
+	if (order_value->value != BPF_JIT_BFX_ORDER_SHIFT_MASK &&
+	    order_value->value != BPF_JIT_BFX_ORDER_MASK_SHIFT)
+		return -EINVAL;
+
+	is64 = width == 64;
+	mask_first = order_value->value == BPF_JIT_BFX_ORDER_MASK_SHIFT;
+	dst_reg = bpf2a64[(u8)dst_value->value];
+	src_reg = bpf2a64[(u8)src_value->value];
+	raw_mask = arm64_bitfield_mask_from_imm((s32)mask_value->value, width);
+	effective_mask = mask_first ? (raw_mask >> shift) : raw_mask;
+	full_mask = is64 ? ~0ULL : 0xffffffffULL;
+
+	if (!shift && effective_mask == full_mask) {
+		if (src_reg != dst_reg)
+			emit(A64_MOV(is64, dst_reg, src_reg), ctx);
+		return 0;
+	}
+
+	if (!effective_mask) {
+		emit_a64_mov_i(is64, dst_reg, 0, ctx);
+		return 0;
+	}
+
+	if (!arm64_bitfield_low_mask_width(effective_mask, &field_width))
+		return -EINVAL;
+
+	emit(A64_UBFX(is64, dst_reg, src_reg, shift, field_width), ctx);
+	return 0;
+}
+
+static int emit_canonical_select_arm64(
+	struct jit_ctx *ctx,
+	const struct bpf_jit_canonical_params *params)
+{
+	const struct bpf_jit_binding_value *dst_value;
+	const struct bpf_jit_binding_value *cond_op_value;
+	const struct bpf_jit_binding_value *cond_a_value;
+	const struct bpf_jit_binding_value *cond_b_value;
+	const struct bpf_jit_binding_value *true_value;
+	const struct bpf_jit_binding_value *false_value;
+	const struct bpf_jit_binding_value *width_value;
+	enum aarch64_insn_condition cond;
+	bool is64, true_noop, false_noop;
+	u8 dst_reg, true_reg, false_reg;
+	int err;
+
+	dst_value = &params->params[BPF_JIT_SEL_PARAM_DST_REG];
+	cond_op_value = &params->params[BPF_JIT_SEL_PARAM_COND_OP];
+	cond_a_value = &params->params[BPF_JIT_SEL_PARAM_COND_A];
+	cond_b_value = &params->params[BPF_JIT_SEL_PARAM_COND_B];
+	true_value = &params->params[BPF_JIT_SEL_PARAM_TRUE_VAL];
+	false_value = &params->params[BPF_JIT_SEL_PARAM_FALSE_VAL];
+	width_value = &params->params[BPF_JIT_SEL_PARAM_WIDTH];
+
+	if (dst_value->type != BPF_JIT_BIND_VAL_REG ||
+	    cond_op_value->type != BPF_JIT_BIND_VAL_IMM ||
+	    cond_a_value->type != BPF_JIT_BIND_VAL_REG ||
+	    width_value->type != BPF_JIT_BIND_VAL_IMM)
+		return -EINVAL;
+	if ((cond_b_value->type != BPF_JIT_BIND_VAL_REG &&
+	     cond_b_value->type != BPF_JIT_BIND_VAL_IMM) ||
+	    (true_value->type != BPF_JIT_BIND_VAL_REG &&
+	     true_value->type != BPF_JIT_BIND_VAL_IMM) ||
+	    (false_value->type != BPF_JIT_BIND_VAL_REG &&
+	     false_value->type != BPF_JIT_BIND_VAL_IMM))
+		return -EINVAL;
+
+	if (width_value->value != 32 && width_value->value != 64)
+		return -EINVAL;
+
+	is64 = width_value->value == 64;
+	dst_reg = bpf2a64[(u8)dst_value->value];
+	true_noop = arm64_binding_value_is_noop(true_value, (u8)dst_value->value);
+	false_noop = arm64_binding_value_is_noop(false_value, (u8)dst_value->value);
+	if (true_noop && false_noop)
+		return 0;
+
+	err = bpf_jmp_to_a64_cond((u8)cond_op_value->value, &cond);
+	if (err)
+		return err;
+
+	err = emit_arm64_cmp_binding(ctx, is64, (u8)cond_op_value->value,
+				     bpf2a64[(u8)cond_a_value->value],
+				     cond_b_value);
+	if (err)
+		return err;
+
+	if (arm64_select_binding_is_imm(true_value, 1) &&
+	    arm64_select_binding_is_imm(false_value, 0))
+		return emit_a64_cset(ctx, is64, dst_reg, cond);
+	if (arm64_select_binding_is_imm(true_value, 0) &&
+	    arm64_select_binding_is_imm(false_value, 1)) {
+		enum aarch64_insn_condition inv_cond;
+
+		err = a64_invert_cond(cond, &inv_cond);
+		if (err)
+			return err;
+		return emit_a64_cset(ctx, is64, dst_reg, inv_cond);
+	}
+	if (arm64_select_binding_is_imm(true_value, -1) &&
+	    arm64_select_binding_is_imm(false_value, 0))
+		return emit_a64_csetm(ctx, is64, dst_reg, cond);
+	if (arm64_select_binding_is_imm(true_value, 0) &&
+	    arm64_select_binding_is_imm(false_value, -1)) {
+		enum aarch64_insn_condition inv_cond;
+
+		err = a64_invert_cond(cond, &inv_cond);
+		if (err)
+			return err;
+		return emit_a64_csetm(ctx, is64, dst_reg, inv_cond);
+	}
+
+	if (true_noop) {
+		true_reg = dst_reg;
+	} else if (true_value->type == BPF_JIT_BIND_VAL_REG) {
+		true_reg = bpf2a64[(u8)true_value->value];
+	} else {
+		true_reg = bpf2a64[TMP_REG_1];
+		err = emit_arm64_binding_value(ctx, true_value, is64, true_reg);
+		if (err)
+			return err;
+	}
+
+	if (false_noop) {
+		false_reg = dst_reg;
+	} else if (false_value->type == BPF_JIT_BIND_VAL_REG) {
+		false_reg = bpf2a64[(u8)false_value->value];
+	} else {
+		false_reg = true_noop ? bpf2a64[TMP_REG_1] : bpf2a64[TMP_REG_2];
+		err = emit_arm64_binding_value(ctx, false_value, is64, false_reg);
+		if (err)
+			return err;
+	}
+
+	return emit_a64_cond_select(ctx, A64_CONDSEL_CSEL, is64, dst_reg,
+				    true_reg, false_reg, cond);
+}
+
+static const struct bpf_jit_rule *
+bpf_jit_rule_lookup_prog(const struct bpf_prog *bpf_prog, u32 insn_idx)
+{
+	const struct bpf_jit_policy *policy;
+	const struct bpf_prog_aux *main_aux = bpf_prog_main_aux(bpf_prog);
+
+	policy = main_aux->jit_policy;
+	if (!policy || !policy->active_cnt)
+		return NULL;
+
+	if (bpf_prog->aux->main_prog_aux)
+		insn_idx += bpf_prog->aux->subprog_start;
+
+	return bpf_jit_rule_lookup(policy, insn_idx);
+}
+
+static int bpf_jit_try_emit_rule(struct jit_ctx *ctx,
+				 const struct bpf_jit_rule *rule)
+{
+	int err;
+
+	switch (rule->canonical_form) {
+	case BPF_JIT_CF_ROTATE:
+		if (rule->native_choice != BPF_JIT_ROT_ROR &&
+		    rule->native_choice != BPF_JIT_ROT_RORX)
+			return -EINVAL;
+		err = emit_canonical_rotate_arm64(ctx, &rule->params,
+						  rule->native_choice);
+		if (err)
+			return err;
+		return rule->site_len;
+	case BPF_JIT_CF_WIDE_MEM:
+		if (rule->native_choice != BPF_JIT_WMEM_WIDE_LOAD)
+			return -EINVAL;
+		err = emit_canonical_wide_load_arm64(ctx, &rule->params);
+		if (err)
+			return err;
+		return rule->site_len;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		if (rule->native_choice != BPF_JIT_BFX_EXTRACT)
+			return -EINVAL;
+		err = emit_canonical_bitfield_extract_arm64(ctx, &rule->params);
+		if (err)
+			return err;
+		return rule->site_len;
+	case BPF_JIT_CF_COND_SELECT:
+		if (rule->native_choice != BPF_JIT_SEL_CMOVCC)
+			return -EINVAL;
+		err = emit_canonical_select_arm64(ctx, &rule->params);
+		if (err)
+			return err;
+		return rule->site_len;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int bpf_jit_apply_prog_rule(struct jit_ctx *ctx, u32 insn_idx)
+{
+	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(ctx->prog);
+	const struct bpf_jit_rule *rule;
+	int region_start = ctx->idx;
+	int exentry_start = ctx->exentry_idx;
+	int consumed, j;
+
+	rule = bpf_jit_rule_lookup_prog(ctx->prog, insn_idx);
+	if (!rule)
+		return 0;
+
+	consumed = bpf_jit_try_emit_rule(ctx, rule);
+	if (consumed <= 0) {
+		ctx->idx = region_start;
+		ctx->exentry_idx = exentry_start;
+		if (ctx->image && ctx->write && consumed < 0)
+			bpf_jit_recompile_rule_log(ctx->prog, rule,
+						   "emitter fallback (err=%d)",
+						   consumed);
+		return 0;
+	}
+
+	for (j = 1; j < consumed - 1; j++)
+		ctx->offset[insn_idx + j] = region_start;
+	ctx->offset[insn_idx + consumed - 1] = ctx->idx;
+
+	if (ctx->image && ctx->write) {
+		main_aux->jit_recompile_num_applied++;
+		bpf_jit_recompile_rule_log(ctx->prog, rule,
+					   "applied successfully");
+	}
+
+	return consumed;
 }
 
 /* generated main prog prologue:
@@ -601,7 +1329,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	if (ctx->fp_used) {
 		if (ctx->priv_sp_used) {
 			/* Set up private stack pointer */
-			priv_stack_ptr = prog->aux->priv_stack_ptr + PRIV_STACK_GUARD_SZ;
+			priv_stack_ptr = ctx->priv_stack_ptr + PRIV_STACK_GUARD_SZ;
 			emit_percpu_ptr(priv_sp, priv_stack_ptr, ctx);
 			emit(A64_ADD_I(1, fp, priv_sp, ctx->stack_size), ctx);
 		} else {
@@ -1136,11 +1864,11 @@ static int add_exception_handler(const struct bpf_insn *insn,
 		   (BPF_MODE(insn->code) == BPF_PROBE_MEM32SX) ||
 		   (BPF_MODE(insn->code) == BPF_PROBE_ATOMIC);
 
-	if (!ctx->prog->aux->extable ||
-	    WARN_ON_ONCE(ctx->exentry_idx >= ctx->prog->aux->num_exentries))
+	if (!ctx->extable ||
+	    WARN_ON_ONCE(ctx->exentry_idx >= ctx->num_exentries))
 		return -EINVAL;
 
-	ex = &ctx->prog->aux->extable[ctx->exentry_idx];
+	ex = &ctx->extable[ctx->exentry_idx];
 	pc = (unsigned long)&ctx->ro_image[ctx->idx - 1];
 
 	/*
@@ -1902,6 +2630,8 @@ emit_cond_jmp:
 static int build_body(struct jit_ctx *ctx, bool extra_pass)
 {
 	const struct bpf_prog *prog = ctx->prog;
+	const struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
+	bool has_active_rules = main_aux->jit_policy && main_aux->jit_policy->active_cnt;
 	int i;
 
 	/*
@@ -1918,6 +2648,15 @@ static int build_body(struct jit_ctx *ctx, bool extra_pass)
 		int ret;
 
 		ctx->offset[i] = ctx->idx;
+		if (has_active_rules) {
+			ret = bpf_jit_apply_prog_rule(ctx, i);
+			if (ret < 0)
+				return ret;
+			if (ret > 0) {
+				i += ret - 1;
+				continue;
+			}
+		}
 		ret = build_insn(insn, ctx, extra_pass);
 		if (ret > 0) {
 			i++;
@@ -1955,7 +2694,7 @@ static int validate_ctx(struct jit_ctx *ctx)
 	if (validate_code(ctx))
 		return -1;
 
-	if (WARN_ON_ONCE(ctx->exentry_idx != ctx->prog->aux->num_exentries))
+	if (WARN_ON_ONCE(ctx->exentry_idx != ctx->num_exentries))
 		return -1;
 
 	return 0;
@@ -2003,6 +2742,11 @@ struct arm64_jit_data {
 	struct bpf_binary_header *header;
 	u8 *ro_image;
 	struct bpf_binary_header *ro_header;
+	struct exception_table_entry *extable;
+	u32 jited_len;
+	u32 num_exentries;
+	void __percpu *priv_stack_ptr;
+	bool allocated_priv_stack;
 	struct jit_ctx ctx;
 };
 
@@ -2012,12 +2756,16 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	struct bpf_prog *tmp, *orig_prog = prog;
 	struct bpf_binary_header *header;
 	struct bpf_binary_header *ro_header = NULL;
+	struct exception_table_entry *extable = NULL;
 	struct arm64_jit_data *jit_data;
 	void __percpu *priv_stack_ptr = NULL;
 	bool was_classic = bpf_prog_was_classic(prog);
 	int priv_stack_alloc_sz;
 	bool tmp_blinded = false;
 	bool extra_pass = false;
+	bool keep_staged = false;
+	bool allocated_priv_stack = false;
+	bool recompile = prog->aux->jit_recompile_active;
 	struct jit_ctx ctx;
 	u8 *image_ptr;
 	u8 *ro_image_ptr;
@@ -2036,7 +2784,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	if (tmp != prog) {
 		tmp_blinded = true;
 		prog = tmp;
+		recompile = prog->aux->jit_recompile_active;
 	}
+	if (recompile)
+		bpf_jit_recompile_clear_stage(prog);
 
 	jit_data = prog->aux->jit_data;
 	if (!jit_data) {
@@ -2062,13 +2813,18 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 		}
 
 		priv_stack_init_guard(priv_stack_ptr, priv_stack_alloc_sz);
-		prog->aux->priv_stack_ptr = priv_stack_ptr;
+		if (!recompile)
+			prog->aux->priv_stack_ptr = priv_stack_ptr;
+		allocated_priv_stack = true;
 	}
 	if (jit_data->ctx.offset) {
 		ctx = jit_data->ctx;
 		ro_image_ptr = jit_data->ro_image;
 		ro_header = jit_data->ro_header;
 		header = jit_data->header;
+		extable = jit_data->extable;
+		priv_stack_ptr = jit_data->priv_stack_ptr;
+		allocated_priv_stack = jit_data->allocated_priv_stack;
 		image_ptr = (void *)header + ((void *)ro_image_ptr
 						 - (void *)ro_header);
 		extra_pass = true;
@@ -2086,6 +2842,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	ctx.user_vm_start = bpf_arena_get_user_vm_start(prog->aux->arena);
 	ctx.arena_vm_start = bpf_arena_get_kern_vm_start(prog->aux->arena);
+	ctx.num_exentries = prog->aux->num_exentries;
+	ctx.priv_stack_ptr = priv_stack_ptr;
 
 	if (priv_stack_ptr)
 		ctx.priv_sp_used = true;
@@ -2138,7 +2896,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 	ctx.image = (__le32 *)image_ptr;
 	ctx.ro_image = (__le32 *)ro_image_ptr;
 	if (extable_size)
-		prog->aux->extable = (void *)ro_image_ptr + extable_offset;
+		extable = (void *)ro_image_ptr + extable_offset;
+	ctx.extable = extable;
 skip_init_ctx:
 	ctx.idx = 0;
 	ctx.exentry_idx = 0;
@@ -2204,46 +2963,81 @@ skip_init_ctx:
 			prog = orig_prog;
 			goto out_off;
 		}
+		header = NULL;
 		/*
 		 * The instructions have now been copied to the ROX region from
 		 * where they will execute. Now the data cache has to be cleaned to
 		 * the PoU and the I-cache has to be invalidated for the VAs.
 		 */
 		bpf_flush_icache(ro_header, ctx.ro_image + ctx.idx);
-	} else {
-		jit_data->ctx = ctx;
-		jit_data->ro_image = ro_image_ptr;
-		jit_data->header = header;
-		jit_data->ro_header = ro_header;
-	}
-
-	prog->bpf_func = (void *)ctx.ro_image + cfi_get_offset();
-	prog->jited = 1;
-	prog->jited_len = prog_size - cfi_get_offset();
-
-	if (!prog->is_func || extra_pass) {
 		int i;
 
 		/* offset[prog->len] is the size of program */
 		for (i = 0; i <= prog->len; i++)
 			ctx.offset[i] *= AARCH64_INSN_SIZE;
-		bpf_prog_fill_jited_linfo(prog, ctx.offset + 1);
-		/*
-		 * The bpf_prog_update_insn_ptrs function expects offsets to
-		 * point to the first byte of the jitted instruction (unlike
-		 * the bpf_prog_fill_jited_linfo above, which, for historical
-		 * reasons, expects to point to the next instruction)
-		 */
-		bpf_prog_update_insn_ptrs(prog, ctx.offset, ctx.ro_image);
+	}
+
+	keep_staged = recompile || (prog->is_func && !extra_pass);
+	if (keep_staged) {
+		jit_data->ctx = ctx;
+		jit_data->ro_image = ro_image_ptr;
+		jit_data->header = header;
+		jit_data->ro_header = ro_header;
+		jit_data->extable = ctx.extable;
+		jit_data->jited_len = prog_size - cfi_get_offset();
+		jit_data->num_exentries = ctx.num_exentries;
+		jit_data->priv_stack_ptr = priv_stack_ptr;
+		jit_data->allocated_priv_stack = allocated_priv_stack;
+	}
+
+	if (recompile) {
+		if (!prog->is_func || extra_pass) {
+			prog->aux->jit_recompile_staged = true;
+			prog->aux->jit_recompile_bpf_func =
+				(void *)ctx.ro_image + cfi_get_offset();
+			prog->aux->jit_recompile_jited_len =
+				prog_size - cfi_get_offset();
+			prog->aux->jit_recompile_extable = ctx.extable;
+			prog->aux->jit_recompile_num_exentries =
+				ctx.num_exentries;
+			prog->aux->jit_recompile_priv_stack_ptr = priv_stack_ptr;
+			prog->aux->jit_recompile_exception_boundary =
+				prog->aux->exception_boundary;
+		}
+	} else {
+		prog->bpf_func = (void *)ctx.ro_image + cfi_get_offset();
+		prog->jited = 1;
+		prog->jited_len = prog_size - cfi_get_offset();
+		if (!prog->is_func || extra_pass) {
+			prog->aux->priv_stack_ptr = priv_stack_ptr;
+			prog->aux->extable = ctx.extable;
+			prog->aux->num_exentries = ctx.num_exentries;
+			bpf_prog_fill_jited_linfo(prog, ctx.offset + 1);
+			/*
+			 * The bpf_prog_update_insn_ptrs function expects
+			 * offsets to point to the first byte of the jitted
+			 * instruction (unlike the bpf_prog_fill_jited_linfo
+			 * above, which, for historical reasons, expects to
+			 * point to the next instruction)
+			 */
+			bpf_prog_update_insn_ptrs(prog, ctx.offset,
+						  ctx.ro_image);
+		}
+	}
+
 out_off:
-		if (!ro_header && priv_stack_ptr) {
+	if (!keep_staged) {
+		if (!ro_header && allocated_priv_stack) {
 			free_percpu(priv_stack_ptr);
-			prog->aux->priv_stack_ptr = NULL;
+			if (!recompile)
+				prog->aux->priv_stack_ptr = NULL;
 		}
 		kvfree(ctx.offset);
 out_priv_stack:
 		kfree(jit_data);
 		prog->aux->jit_data = NULL;
+		if (recompile)
+			bpf_jit_recompile_clear_stage(prog);
 	}
 out:
 	if (tmp_blinded)
@@ -2263,6 +3057,57 @@ out_free_hdr:
 bool bpf_jit_supports_private_stack(void)
 {
 	return true;
+}
+
+int bpf_jit_recompile_commit(struct bpf_prog *prog)
+{
+	struct arm64_jit_data *jit_data = prog->aux->jit_data;
+	bpf_func_t staged_func;
+
+	if (!jit_data || !bpf_jit_recompile_has_staged_image(prog))
+		return -EINVAL;
+
+	bpf_prog_update_insn_ptrs(prog, jit_data->ctx.offset, jit_data->ro_image);
+	bpf_prog_fill_jited_linfo(prog, jit_data->ctx.offset + 1);
+
+	prog->aux->priv_stack_ptr = prog->aux->jit_recompile_priv_stack_ptr;
+	prog->aux->extable = prog->aux->jit_recompile_extable;
+	prog->aux->num_exentries = prog->aux->jit_recompile_num_exentries;
+	prog->aux->exception_boundary =
+		prog->aux->jit_recompile_exception_boundary;
+	prog->jited = 1;
+	prog->jited_len = prog->aux->jit_recompile_jited_len;
+	staged_func = prog->aux->jit_recompile_bpf_func;
+	smp_store_release(&prog->bpf_func, staged_func);
+
+	kvfree(jit_data->ctx.offset);
+	kfree(jit_data);
+	prog->aux->jit_data = NULL;
+	bpf_jit_recompile_clear_stage(prog);
+	return 0;
+}
+
+void bpf_jit_recompile_abort(struct bpf_prog *prog)
+{
+	struct arm64_jit_data *jit_data = prog->aux->jit_data;
+
+	if (!jit_data)
+		goto out_clear;
+
+	if (jit_data->ro_header) {
+		if (jit_data->header)
+			bpf_arch_text_copy(&jit_data->ro_header->size,
+					   &jit_data->header->size,
+					   sizeof(jit_data->header->size));
+		bpf_jit_binary_pack_free(jit_data->ro_header, jit_data->header);
+	}
+	kvfree(jit_data->ctx.offset);
+	if (jit_data->allocated_priv_stack)
+		free_percpu(jit_data->priv_stack_ptr);
+	kfree(jit_data);
+	prog->aux->jit_data = NULL;
+out_clear:
+	bpf_jit_recompile_clear_stage(prog);
 }
 
 bool bpf_jit_supports_kfunc_call(void)
@@ -3156,6 +4001,28 @@ bool bpf_jit_supports_timed_may_goto(void)
 	return true;
 }
 
+bool bpf_jit_arch_form_supported(u16 canonical_form, u16 native_choice)
+{
+	switch (canonical_form) {
+	case BPF_JIT_CF_COND_SELECT:
+		return native_choice == BPF_JIT_SEL_CMOVCC;
+	case BPF_JIT_CF_WIDE_MEM:
+		return native_choice == BPF_JIT_WMEM_WIDE_LOAD;
+	case BPF_JIT_CF_ROTATE:
+		return native_choice == BPF_JIT_ROT_ROR ||
+		       native_choice == BPF_JIT_ROT_RORX;
+	case BPF_JIT_CF_BITFIELD_EXTRACT:
+		return native_choice == BPF_JIT_BFX_EXTRACT;
+	default:
+		return false;
+	}
+}
+
+bool bpf_jit_supports_recompile(void)
+{
+	return true;
+}
+
 bool bpf_jit_inlines_helper_call(s32 imm)
 {
 	switch (imm) {
@@ -3170,6 +4037,11 @@ bool bpf_jit_inlines_helper_call(s32 imm)
 
 void bpf_jit_free(struct bpf_prog *prog)
 {
+	if (prog->aux->jit_recompile_active ||
+	    prog->aux->jit_recompile_bpf_func ||
+	    prog->aux->jit_recompile_staged)
+		bpf_jit_recompile_abort(prog);
+
 	if (prog->jited) {
 		struct arm64_jit_data *jit_data = prog->aux->jit_data;
 		struct bpf_binary_header *hdr;
@@ -3182,7 +4054,9 @@ void bpf_jit_free(struct bpf_prog *prog)
 		 * before freeing it.
 		 */
 		if (jit_data) {
-			bpf_jit_binary_pack_finalize(jit_data->ro_header, jit_data->header);
+			bpf_jit_binary_pack_finalize(jit_data->ro_header,
+						     jit_data->header);
+			kvfree(jit_data->ctx.offset);
 			kfree(jit_data);
 		}
 		prog->bpf_func = (void *)prog->bpf_func - cfi_get_offset();

@@ -207,6 +207,14 @@
 #define A64_LSR(sf, Rd, Rn, shift) A64_UBFM(sf, Rd, Rn, shift, (sf) ? 63 : 31)
 /* Rd = Rn >> shift; signed */
 #define A64_ASR(sf, Rd, Rn, shift) A64_SBFM(sf, Rd, Rn, shift, (sf) ? 63 : 31)
+/* Rd = EXTR(Rm, Rn, lsb) / rotate-right immediate when Rm == Rn */
+#define A64_EXTR(sf, Rd, Rn, Rm, lsb) \
+	aarch64_insn_gen_extr(A64_VARIANT(sf), Rm, Rn, Rd, lsb)
+#define A64_ROR_I(sf, Rd, Rn, imm) A64_EXTR(sf, Rd, Rn, Rn, imm)
+#define A64_UBFX(sf, Rd, Rn, lsb, width) \
+	A64_UBFM(sf, Rd, Rn, lsb, (lsb) + (width) - 1)
+#define A64_SBFX(sf, Rd, Rn, lsb, width) \
+	A64_SBFM(sf, Rd, Rn, lsb, (lsb) + (width) - 1)
 
 /* Zero extend */
 #define A64_UXTH(sf, Rd, Rn) A64_UBFM(sf, Rd, Rn, 0, 15)
@@ -258,6 +266,7 @@
 #define A64_LSLV(sf, Rd, Rn, Rm) A64_DATA2(sf, Rd, Rn, Rm, LSLV)
 #define A64_LSRV(sf, Rd, Rn, Rm) A64_DATA2(sf, Rd, Rn, Rm, LSRV)
 #define A64_ASRV(sf, Rd, Rn, Rm) A64_DATA2(sf, Rd, Rn, Rm, ASRV)
+#define A64_RORV(sf, Rd, Rn, Rm) A64_DATA2(sf, Rd, Rn, Rm, RORV)
 
 /* Data-processing (3 source) */
 /* Rd = Ra + Rn * Rm */

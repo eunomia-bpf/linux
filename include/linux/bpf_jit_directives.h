@@ -177,7 +177,7 @@ bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx);
 /* Weak default returns false until an architecture overrides it. */
 bool bpf_jit_arch_form_supported(u16 canonical_form, u16 native_choice);
 
-#if defined(CONFIG_X86_64)
+#if defined(CONFIG_X86_64) || defined(CONFIG_ARM64)
 static inline bool
 bpf_jit_recompile_has_staged_image(const struct bpf_prog *prog)
 {
