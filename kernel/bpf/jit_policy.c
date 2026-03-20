@@ -36,7 +36,6 @@ void bpf_jit_free_policy(struct bpf_jit_policy *policy)
 
 	for (i = 0; i < policy->rule_cnt; i++)
 		bpf_jit_rule_release(&policy->rules[i]);
-	kvfree(policy->blob);
 	kvfree(policy);
 }
 
@@ -107,7 +106,6 @@ static struct bpf_jit_policy *bpf_jit_alloc_policy(u32 rule_cnt)
 
 	policy->rule_cnt = rule_cnt;
 	policy->active_cnt = 0;
-	policy->blob = NULL;
 	return policy;
 }
 
@@ -213,7 +211,6 @@ bpf_jit_parse_policy_format_v2(struct bpf_prog *prog,
 		return ERR_PTR(-EINVAL);
 	}
 
-	policy->blob = blob;
 	return policy;
 }
 
@@ -368,8 +365,6 @@ struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd)
 	}
 
 	policy = bpf_jit_parse_policy_format_v2(prog, hdr, blob, blob_len);
-	if (!IS_ERR(policy))
-		blob = NULL;
 	if (IS_ERR(policy))
 		goto out;
 

@@ -2500,21 +2500,6 @@ static int emit_bpf_alu32_insn(u8 **pprog, const struct bpf_insn *insn,
 	return 0;
 }
 
-static int emit_canonical_zero_ext_elide(u8 **pprog,
-					 const struct bpf_jit_canonical_params *params,
-					 bool use_priv_fp)
-{
-	struct bpf_insn insn = {};
-
-	insn.code = (u8)params->params[BPF_JIT_ZEXT_PARAM_CODE].value;
-	insn.dst_reg = (u8)params->params[BPF_JIT_ZEXT_PARAM_DST_REG].value;
-	insn.src_reg = (u8)params->params[BPF_JIT_ZEXT_PARAM_SRC_REG].value;
-	insn.off = (s16)params->params[BPF_JIT_ZEXT_PARAM_OFF].value;
-	insn.imm = (s32)params->params[BPF_JIT_ZEXT_PARAM_IMM].value;
-
-	return emit_bpf_alu32_insn(pprog, &insn, use_priv_fp);
-}
-
 static void emit_movbe_load(u8 **pprog, u32 dst_reg, u32 base_reg,
 			    int off, u32 width)
 {
@@ -3177,13 +3162,6 @@ static int bpf_jit_try_emit_rule(u8 **pprog,
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		err = emit_canonical_bitfield_extract(pprog, &rule->params,
 					      use_priv_fp);
-		if (err)
-			return err;
-		return rule->site_len;
-
-	case BPF_JIT_CF_ZERO_EXT_ELIDE:
-		err = emit_canonical_zero_ext_elide(pprog, &rule->params,
-					    use_priv_fp);
 		if (err)
 			return err;
 		return rule->site_len;
@@ -5839,18 +5817,24 @@ bool bpf_jit_arch_form_supported(u16 canonical_form, u16 native_choice)
 	case BPF_JIT_CF_COND_SELECT:
 		return native_choice == BPF_JIT_SEL_CMOVCC &&
 		       boot_cpu_has(X86_FEATURE_CMOV);
+	case BPF_JIT_CF_WIDE_MEM:
+		return native_choice == BPF_JIT_WMEM_WIDE_LOAD;
 	case BPF_JIT_CF_ROTATE:
 		return native_choice == BPF_JIT_ROT_ROR ||
 		       (native_choice == BPF_JIT_ROT_RORX &&
 			boot_cpu_has(X86_FEATURE_BMI2));
+	case BPF_JIT_CF_ADDR_CALC:
+		return native_choice == BPF_JIT_ACALC_LEA;
 	case BPF_JIT_CF_BITFIELD_EXTRACT:
 		return native_choice == BPF_JIT_BFX_EXTRACT &&
 		       boot_cpu_has(X86_FEATURE_BMI1);
 	case BPF_JIT_CF_ENDIAN_FUSION:
 		return native_choice == BPF_JIT_ENDIAN_MOVBE &&
 		       boot_cpu_has(X86_FEATURE_MOVBE);
+	case BPF_JIT_CF_BRANCH_FLIP:
+		return native_choice == BPF_JIT_BFLIP_FLIPPED;
 	default:
-		return true;
+		return false;
 	}
 }
 

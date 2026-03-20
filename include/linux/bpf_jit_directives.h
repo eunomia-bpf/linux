@@ -60,26 +60,12 @@ enum bpf_jit_addr_calc_param {
 	BPF_JIT_ACALC_PARAM_SCALE	= 3,
 };
 
-enum bpf_jit_bitfield_extract_order {
-	BPF_JIT_BFX_ORDER_SHIFT_MASK = 0,
-	BPF_JIT_BFX_ORDER_MASK_SHIFT = 1,
-};
-
 enum bpf_jit_bitfield_extract_param {
 	BPF_JIT_BFX_PARAM_DST_REG	= 0,
 	BPF_JIT_BFX_PARAM_SRC_REG	= 1,
 	BPF_JIT_BFX_PARAM_SHIFT		= 2,
 	BPF_JIT_BFX_PARAM_MASK		= 3,
 	BPF_JIT_BFX_PARAM_WIDTH		= 4,
-	BPF_JIT_BFX_PARAM_ORDER		= 5,
-};
-
-enum bpf_jit_zero_ext_param {
-	BPF_JIT_ZEXT_PARAM_DST_REG	= 0,
-	BPF_JIT_ZEXT_PARAM_CODE		= 1,
-	BPF_JIT_ZEXT_PARAM_SRC_REG	= 2,
-	BPF_JIT_ZEXT_PARAM_OFF		= 3,
-	BPF_JIT_ZEXT_PARAM_IMM		= 4,
 };
 
 enum bpf_jit_cond_select_param {
@@ -139,13 +125,11 @@ struct bpf_jit_rule {
  * struct bpf_jit_policy - validated policy attached to a prog
  * @rule_cnt:   number of rules
  * @active_cnt: number of rules that passed validation
- * @blob:       retained v5 blob backing inline pattern pointers
  * @rules:      sorted by site_start for O(log n) lookup
  */
 struct bpf_jit_policy {
 	u32 rule_cnt;
 	u32 active_cnt;
-	void *blob;
 	struct bpf_jit_rule rules[];
 };
 

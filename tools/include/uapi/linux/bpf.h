@@ -1490,7 +1490,7 @@ enum bpf_jit_canonical_form {
 	BPF_JIT_CF_ADDR_CALC	= 3,	/* maps to ADDR_CALC emitter */
 	BPF_JIT_CF_COND_SELECT	= 4,	/* maps to COND_SELECT emitter */
 	BPF_JIT_CF_BITFIELD_EXTRACT = 5, /* maps to BITFIELD_EXTRACT emitter */
-	BPF_JIT_CF_ZERO_EXT_ELIDE = 6, /* maps to ZERO_EXT_ELIDE emitter */
+	BPF_JIT_CF_ZERO_EXT_ELIDE = 6, /* deprecated reserved ABI slot */
 	BPF_JIT_CF_ENDIAN_FUSION = 7, /* maps to ENDIAN_FUSION emitter */
 	BPF_JIT_CF_BRANCH_FLIP = 8, /* maps to BRANCH_FLIP emitter */
 };
@@ -1521,9 +1521,9 @@ enum bpf_jit_bitfield_extract_native {
 	BPF_JIT_BFX_EXTRACT	= 1,	/* x86: bextr or compact shift/mask */
 };
 
-/* ZERO_EXT_ELIDE native_choice values */
+/* Deprecated ZERO_EXT_ELIDE native_choice values */
 enum bpf_jit_zero_ext_native {
-	BPF_JIT_ZEXT_ELIDE	= 1,	/* x86: drop redundant zero-extend */
+	BPF_JIT_ZEXT_ELIDE	= 1,	/* deprecated reserved */
 };
 
 /* ENDIAN_FUSION native_choice values */

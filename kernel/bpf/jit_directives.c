@@ -290,8 +290,7 @@ static bool bpf_jit_recompile_has_trampoline_dependency(
 }
 
 static int bpf_jit_recompile_prog_images(
-	struct bpf_prog *prog,
-	struct bpf_jit_recompile_rollback_state *rollback)
+	struct bpf_prog *prog)
 {
 	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 	struct bpf_binary_header **old_headers = NULL;
@@ -303,8 +302,6 @@ static int bpf_jit_recompile_prog_images(
 	u32 i;
 	int err = 0;
 	bool keep_old_images = false;
-
-	(void)rollback;
 
 	if (main_aux->func_cnt && main_aux->func) {
 		real_func_cnt = main_aux->real_func_cnt ?: main_aux->func_cnt;
@@ -503,6 +500,12 @@ static int bpf_jit_recompile_prog_images(
 		}
 
 		synchronize_rcu();
+		/*
+		 * Trampoline regeneration failure can leave old trampoline text
+		 * transiently calling into the previous JIT image.
+		 */
+		if (keep_old_images)
+			synchronize_rcu();
 
 	for (i = 0; i < image_cnt; i++) {
 		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
@@ -525,10 +528,10 @@ static int bpf_jit_recompile_prog_images(
 				ksym_prog->aux->ksym.fp_start,
 				ksym_prog->aux->ksym.fp_end);
 
-		if (!keep_old_images && old_headers[i] &&
+		if (old_headers[i] &&
 		    old_headers[i] != bpf_jit_binary_pack_hdr(image_prog))
 			bpf_jit_binary_pack_free(old_headers[i], NULL);
-		if (!keep_old_images && old_priv_stacks[i])
+		if (old_priv_stacks[i])
 			free_percpu(old_priv_stacks[i]);
 
 		image_prog->aux->jit_recompile_active = false;
@@ -693,7 +696,7 @@ do_recompile:
 	main_aux->jit_recompile_num_applied = 0;
 
 	/* Trigger re-JIT for the active func[] images. */
-	err = bpf_jit_recompile_prog_images(prog, &rollback);
+	err = bpf_jit_recompile_prog_images(prog);
 	if (err) {
 		struct bpf_jit_policy *failed_policy = NULL;
 

@@ -687,8 +687,7 @@ static u32 arm64_bitfield_mask_width(u64 mask)
 }
 
 static int emit_canonical_rotate_arm64(struct jit_ctx *ctx,
-				       const struct bpf_jit_canonical_params *params,
-				       u16 native_choice)
+				       const struct bpf_jit_canonical_params *params)
 {
 	const struct bpf_jit_binding_value *dst_value;
 	const struct bpf_jit_binding_value *src_value;
@@ -704,7 +703,6 @@ static int emit_canonical_rotate_arm64(struct jit_ctx *ctx,
 
 	width = (u32)width_value->value;
 	rot_amount = (u32)amount_value->value;
-	(void)native_choice;
 	is64 = width == 64;
 	ror_imm = width - rot_amount;
 	emit(A64_ROR_I(is64, bpf2a64[(u8)dst_value->value],
@@ -917,8 +915,7 @@ static int bpf_jit_try_emit_rule(struct jit_ctx *ctx,
 
 	switch (rule->canonical_form) {
 	case BPF_JIT_CF_ROTATE:
-		err = emit_canonical_rotate_arm64(ctx, &rule->params,
-						  rule->native_choice);
+		err = emit_canonical_rotate_arm64(ctx, &rule->params);
 		if (err)
 			return err;
 		return rule->site_len;

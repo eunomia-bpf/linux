@@ -358,6 +358,16 @@ static bool bpf_jit_parse_cond_select_shape(
 	return true;
 }
 
+static bool bpf_jit_cond_select_has_dst_alias(
+	const struct bpf_jit_cond_select_shape *shape)
+{
+	if (shape->dst_reg == shape->cond_a)
+		return true;
+
+	return shape->cond_b.type == BPF_JIT_BIND_VAL_REG &&
+	       shape->dst_reg == shape->cond_b.value;
+}
+
 static void bpf_jit_cond_select_fill_params(
 	struct bpf_jit_canonical_params *params,
 	const struct bpf_jit_cond_select_shape *shape)
@@ -399,6 +409,8 @@ bpf_jit_validate_cond_select_rule(const struct bpf_insn *insns,
 	struct bpf_jit_cond_select_shape shape;
 
 	if (!bpf_jit_parse_cond_select_shape(insns, insn_cnt, rule, &shape))
+		return false;
+	if (bpf_jit_cond_select_has_dst_alias(&shape))
 		return false;
 
 	if (params)
@@ -843,7 +855,9 @@ bpf_jit_validate_rotate_rule(const struct bpf_insn *insns,
 	struct bpf_jit_rotate_shape shape;
 	u32 i;
 
-	(void)insn_cnt;
+	if (!bpf_jit_site_range_valid(rule->site_start, rule->site_len,
+				      insn_cnt, NULL))
+		return false;
 
 	for (i = 0; i < ARRAY_SIZE(rotate_specs); i++) {
 		if (rotate_specs[i].site_len != rule->site_len)
@@ -1048,8 +1062,6 @@ bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
 		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_MASK, desc.mask);
 		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_WIDTH,
 				      desc.width);
-		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_ORDER,
-				      BPF_JIT_BFX_ORDER_SHIFT_MASK);
 	}
 
 	return true;
@@ -1107,6 +1119,8 @@ static bool bpf_jit_parse_addr_calc_shape(
 	if (add_insn->dst_reg != mov_insn->dst_reg ||
 	    add_insn->off != 0 || add_insn->imm != 0)
 		return false;
+	if (add_insn->src_reg == mov_insn->dst_reg)
+		return false;
 
 	if (shape) {
 		shape->dst_reg = mov_insn->dst_reg;
@@ -1139,94 +1153,6 @@ bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
 				      shape.index_reg);
 		bpf_jit_param_set_imm(params, BPF_JIT_ACALC_PARAM_SCALE,
 				      shape.scale);
-	}
-
-	return true;
-}
-
-static bool bpf_jit_zero_ext_elide_is_tail(const struct bpf_insn *insn, u8 dst_reg)
-{
-	if (insn_is_zext(insn))
-		return insn->dst_reg == dst_reg &&
-		       insn->src_reg == dst_reg &&
-		       !insn->off;
-
-	if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X)) {
-		return insn->dst_reg == dst_reg &&
-		       insn->src_reg == dst_reg &&
-		       !insn->off &&
-		       !insn->imm;
-	}
-
-	if (insn->code == (BPF_ALU64 | BPF_AND | BPF_K)) {
-		return insn->dst_reg == dst_reg &&
-		       !insn->off &&
-		       insn->imm == -1;
-	}
-
-	return false;
-}
-
-struct bpf_jit_zero_ext_elide_shape {
-	u8 code;
-	u8 dst_reg;
-	u8 src_reg;
-	s16 off;
-	s32 imm;
-};
-
-static bool bpf_jit_parse_zero_ext_elide_shape(
-	const struct bpf_insn *insns,
-	const struct bpf_jit_rule *rule,
-	struct bpf_jit_zero_ext_elide_shape *shape)
-{
-	const struct bpf_insn *alu32_insn;
-	const struct bpf_insn *zext_insn;
-	u32 idx = rule->site_start;
-
-	if (rule->site_len != 2)
-		return false;
-
-	alu32_insn = &insns[idx];
-	zext_insn = &insns[idx + 1];
-	if (!bpf_jit_alu32_insn_linearizable(alu32_insn) ||
-	    !bpf_jit_zero_ext_elide_is_tail(zext_insn, alu32_insn->dst_reg))
-		return false;
-
-	if (shape) {
-		shape->code = alu32_insn->code;
-		shape->dst_reg = alu32_insn->dst_reg;
-		shape->src_reg = alu32_insn->src_reg;
-		shape->off = alu32_insn->off;
-		shape->imm = alu32_insn->imm;
-	}
-
-	return true;
-}
-
-static bool
-bpf_jit_validate_zero_ext_elide_rule(const struct bpf_insn *insns,
-				     u32 insn_cnt,
-				     const struct bpf_jit_rule *rule,
-				     struct bpf_jit_canonical_params *params)
-{
-	struct bpf_jit_zero_ext_elide_shape shape;
-
-	if (!bpf_jit_parse_zero_ext_elide_shape(insns, rule, &shape))
-		return false;
-
-	if (params) {
-		memset(params, 0, sizeof(*params));
-		bpf_jit_param_set_reg(params, BPF_JIT_ZEXT_PARAM_DST_REG,
-				      shape.dst_reg);
-		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_CODE,
-				      shape.code);
-		bpf_jit_param_set_reg(params, BPF_JIT_ZEXT_PARAM_SRC_REG,
-				      shape.src_reg);
-		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_OFF,
-				      shape.off);
-		bpf_jit_param_set_imm(params, BPF_JIT_ZEXT_PARAM_IMM,
-				      shape.imm);
 	}
 
 	return true;
@@ -1386,6 +1312,123 @@ static bool bpf_jit_branch_flip_body_linear(const struct bpf_insn *insns,
 	return true;
 }
 
+#define BPF_JIT_BRANCH_FLIP_X86_MAX_NATIVE_BYTES	(128U + 64U)
+#define BPF_JIT_BRANCH_FLIP_X86_MAX_COND_JUMP_BYTES	6U
+#define BPF_JIT_BRANCH_FLIP_X86_MAX_JUMP_BYTES		5U
+
+static bool bpf_jit_imm8(s32 imm)
+{
+	return imm >= -128 && imm <= 127;
+}
+
+static u32 bpf_jit_branch_flip_x86_cmp_max_native_bytes(
+	const struct bpf_insn *jcc)
+{
+	if (BPF_SRC(jcc->code) == BPF_X)
+		return 3;
+
+	if (BPF_OP(jcc->code) == BPF_JSET)
+		return 7;
+
+	if (!jcc->imm)
+		return 3;
+
+	return bpf_jit_imm8(jcc->imm) ? 4 : 7;
+}
+
+static u32 bpf_jit_branch_flip_x86_insn_max_native_bytes(
+	const struct bpf_insn *insn)
+{
+	u8 cls = BPF_CLASS(insn->code);
+	u8 op = BPF_OP(insn->code);
+	u8 src = BPF_SRC(insn->code);
+
+	if (cls == BPF_ALU) {
+		switch (op) {
+		case BPF_ADD:
+		case BPF_SUB:
+		case BPF_AND:
+		case BPF_OR:
+		case BPF_XOR:
+			return src == BPF_X ? 3 : (bpf_jit_imm8(insn->imm) ? 4 : 7);
+		case BPF_NEG:
+			return 3;
+		case BPF_MOV:
+			return src == BPF_X ? 4 : 7;
+		case BPF_MUL:
+			return src == BPF_X ? 4 : (bpf_jit_imm8(insn->imm) ? 4 : 7);
+		case BPF_LSH:
+		case BPF_RSH:
+		case BPF_ARSH:
+			return src == BPF_X ? 12 : 4;
+		case BPF_DIV:
+		case BPF_MOD:
+			return 22;
+		default:
+			return 0;
+		}
+	}
+
+	if (cls == BPF_ALU64) {
+		switch (op) {
+		case BPF_ADD:
+		case BPF_SUB:
+		case BPF_AND:
+		case BPF_OR:
+		case BPF_XOR:
+			return src == BPF_X ? 3 : (bpf_jit_imm8(insn->imm) ? 4 : 7);
+		case BPF_NEG:
+			return 3;
+		case BPF_MOV:
+			return src == BPF_X ? 4 : 7;
+		case BPF_MUL:
+			return src == BPF_X ? 4 : (bpf_jit_imm8(insn->imm) ? 4 : 7);
+		case BPF_LSH:
+		case BPF_RSH:
+		case BPF_ARSH:
+			return src == BPF_X ? 12 : 4;
+		case BPF_DIV:
+		case BPF_MOD:
+			return 22;
+		default:
+			return 0;
+		}
+	}
+
+	if (insn->code == (BPF_ALU | BPF_END | BPF_FROM_BE) ||
+	    insn->code == (BPF_ALU | BPF_END | BPF_FROM_LE) ||
+	    insn->code == (BPF_ALU64 | BPF_END | BPF_FROM_LE))
+		return 9;
+
+	if (cls == BPF_LDX)
+		return 8;
+
+	return 0;
+}
+
+static bool bpf_jit_branch_flip_x86_body_native_bytes(const struct bpf_insn *insns,
+						      u32 start, u32 len,
+						      u32 *out_bytes)
+{
+	u32 total = 0;
+	u32 i;
+
+	for (i = start; i < start + len; i++) {
+		u32 insn_bytes;
+
+		insn_bytes = bpf_jit_branch_flip_x86_insn_max_native_bytes(&insns[i]);
+		if (!insn_bytes)
+			return false;
+		if (check_add_overflow(total, insn_bytes, &total))
+			return false;
+	}
+
+	if (out_bytes)
+		*out_bytes = total;
+
+	return true;
+}
+
 static bool bpf_jit_branch_flip_cond_op_valid(u8 op);
 
 struct bpf_jit_branch_flip_shape {
@@ -1408,6 +1451,7 @@ static bool bpf_jit_parse_branch_flip_shape(
 	const struct bpf_insn *ja_insn;
 	u32 idx = rule->site_start;
 	u32 body_a_start, body_b_start, body_a_len, body_b_len, join_target;
+	u32 body_a_native_bytes, body_b_native_bytes, native_bytes;
 	u32 ja_idx;
 
 	if (rule->site_len < 4)
@@ -1445,6 +1489,26 @@ static bool bpf_jit_parse_branch_flip_shape(
 		return false;
 	if (!bpf_jit_branch_flip_body_linear(insns, body_a_start, body_a_len) ||
 	    !bpf_jit_branch_flip_body_linear(insns, body_b_start, body_b_len))
+		return false;
+	if (!bpf_jit_branch_flip_x86_body_native_bytes(insns, body_a_start,
+						       body_a_len,
+						       &body_a_native_bytes) ||
+	    !bpf_jit_branch_flip_x86_body_native_bytes(insns, body_b_start,
+						       body_b_len,
+						       &body_b_native_bytes))
+		return false;
+
+	native_bytes = bpf_jit_branch_flip_x86_cmp_max_native_bytes(jcc);
+	if (check_add_overflow(native_bytes, body_a_native_bytes, &native_bytes) ||
+	    check_add_overflow(native_bytes, body_b_native_bytes, &native_bytes) ||
+	    check_add_overflow(native_bytes,
+			       BPF_JIT_BRANCH_FLIP_X86_MAX_COND_JUMP_BYTES,
+			       &native_bytes) ||
+	    check_add_overflow(native_bytes,
+			       BPF_JIT_BRANCH_FLIP_X86_MAX_JUMP_BYTES,
+			       &native_bytes))
+		return false;
+	if (native_bytes > BPF_JIT_BRANCH_FLIP_X86_MAX_NATIVE_BYTES)
 		return false;
 
 	if (shape) {
@@ -1609,11 +1673,6 @@ static const struct bpf_jit_form_meta bpf_jit_form_meta[] = {
 		.name = "bitfield_extract",
 		.native_choice_mask = BIT(BPF_JIT_BFX_EXTRACT),
 		.validate = bpf_jit_validate_bitfield_extract_rule,
-	},
-	[BPF_JIT_CF_ZERO_EXT_ELIDE] = {
-		.name = "zero_ext_elide",
-		.native_choice_mask = BIT(BPF_JIT_ZEXT_ELIDE),
-		.validate = bpf_jit_validate_zero_ext_elide_rule,
 	},
 	[BPF_JIT_CF_ENDIAN_FUSION] = {
 		.name = "endian_fusion",
