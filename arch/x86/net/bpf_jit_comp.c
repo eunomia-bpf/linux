@@ -6085,6 +6085,23 @@ bool bpf_jit_supports_fsession(void)
 	return true;
 }
 
+bool bpf_jit_arch_form_supported(u16 canonical_form, u16 native_choice)
+{
+	switch (canonical_form) {
+	case BPF_JIT_CF_COND_SELECT:
+		return native_choice != BPF_JIT_SEL_CMOVCC ||
+		       boot_cpu_has(X86_FEATURE_CMOV);
+	case BPF_JIT_CF_ROTATE:
+		return native_choice != BPF_JIT_ROT_RORX ||
+		       boot_cpu_has(X86_FEATURE_BMI2);
+	case BPF_JIT_CF_ENDIAN_FUSION:
+		return native_choice != BPF_JIT_ENDIAN_MOVBE ||
+		       boot_cpu_has(X86_FEATURE_MOVBE);
+	default:
+		return true;
+	}
+}
+
 bool bpf_jit_supports_recompile(void)
 {
 	return true;

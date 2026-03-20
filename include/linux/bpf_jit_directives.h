@@ -156,14 +156,26 @@ void __printf(2, 3) bpf_jit_recompile_prog_log(const struct bpf_prog *prog,
 void __printf(3, 4) bpf_jit_recompile_rule_log(const struct bpf_prog *prog,
 					       const struct bpf_jit_rule *rule,
 					       const char *fmt, ...);
+void bpf_jit_rule_release(struct bpf_jit_rule *rule);
 
 /* Policy blob parsing & validation */
 struct bpf_jit_policy *bpf_jit_parse_policy(struct bpf_prog *prog, int fd);
 void bpf_jit_free_policy(struct bpf_jit_policy *policy);
 
+/* Shared canonical-site validation helpers */
+bool bpf_jit_pattern_rule_shape_valid(const struct bpf_jit_rule *rule);
+bool bpf_jit_validate_rule(const struct bpf_prog *prog,
+			   const struct bpf_insn *insns,
+			   u32 insn_cnt,
+			   const struct bpf_jit_rule *rule,
+			   struct bpf_jit_canonical_params *params);
+
 /* Rule lookup during JIT emission by absolute rule site_start. */
 const struct bpf_jit_rule *
 bpf_jit_rule_lookup(const struct bpf_jit_policy *policy, u32 insn_idx);
+
+/* Weak default returns false until an architecture overrides it. */
+bool bpf_jit_arch_form_supported(u16 canonical_form, u16 native_choice);
 
 #if defined(CONFIG_X86_64)
 static inline bool
