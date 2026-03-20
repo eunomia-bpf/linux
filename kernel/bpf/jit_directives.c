@@ -5,6 +5,7 @@
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
 #include <linux/overflow.h>
+#include <linux/printk.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 
@@ -20,6 +21,8 @@ struct bpf_jit_recompile_prog_state {
 	u32 insn_cnt;
 	u32 jited_len;
 	u32 num_exentries;
+	u32 fp_start;
+	u32 fp_end;
 	bool jited;
 	bool exception_boundary;
 };
@@ -92,6 +95,8 @@ bpf_jit_recompile_save_prog_state(struct bpf_jit_recompile_prog_state *state,
 	state->jit_data = prog->aux->jit_data;
 	state->jited_len = prog->jited_len;
 	state->num_exentries = prog->aux->num_exentries;
+	state->fp_start = prog->aux->ksym.fp_start;
+	state->fp_end = prog->aux->ksym.fp_end;
 	state->jited = prog->jited;
 	state->exception_boundary = prog->aux->exception_boundary;
 	state->insn_cnt = prog->len;
@@ -130,14 +135,16 @@ bpf_jit_recompile_restore_prog_state(const struct bpf_jit_recompile_prog_state *
 		memcpy(prog->insnsi, state->insnsi_copy,
 		       array_size(state->insn_cnt, sizeof(*prog->insnsi)));
 
-	prog->bpf_func = state->bpf_func;
 	prog->aux->priv_stack_ptr = state->priv_stack_ptr;
 	prog->aux->extable = state->extable;
 	prog->aux->jit_data = state->jit_data;
 	prog->jited_len = state->jited_len;
 	prog->aux->num_exentries = state->num_exentries;
+	prog->aux->ksym.fp_start = state->fp_start;
+	prog->aux->ksym.fp_end = state->fp_end;
 	prog->jited = state->jited;
 	prog->aux->exception_boundary = state->exception_boundary;
+	smp_store_release(&prog->bpf_func, state->bpf_func);
 	bpf_jit_recompile_reset_prog_aux(prog);
 }
 
@@ -197,7 +204,8 @@ bpf_jit_recompile_restore(struct bpf_jit_recompile_rollback_state *state)
 		bpf_jit_recompile_restore_prog_state(&state->prog_states[i]);
 
 	if (state->main_aux)
-		state->main_aux->bpf_exception_cb = state->bpf_exception_cb;
+		smp_store_release(&state->main_aux->bpf_exception_cb,
+				  state->bpf_exception_cb);
 }
 
 static bool
@@ -276,34 +284,27 @@ static bool bpf_pseudo_call_insn(const struct bpf_insn *insn)
 static bool bpf_jit_recompile_has_trampoline_dependency(
 	const struct bpf_prog *prog)
 {
-	if (!prog || !prog->aux)
-		return false;
-
-	if (bpf_prog_has_active_trampoline(prog))
-		return true;
-	if (READ_ONCE(prog->aux->dst_trampoline))
-		return true;
-	if (bpf_prog_has_trampoline(prog))
-		return true;
-	if (prog->type == BPF_PROG_TYPE_EXT)
-		return true;
-	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS &&
-	    rcu_access_pointer(prog->aux->st_ops_assoc))
-		return true;
-
-	return false;
+	return prog && prog->aux &&
+	       prog->type == BPF_PROG_TYPE_STRUCT_OPS &&
+	       rcu_access_pointer(prog->aux->st_ops_assoc);
 }
 
-static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
+static int bpf_jit_recompile_prog_images(
+	struct bpf_prog *prog,
+	struct bpf_jit_recompile_rollback_state *rollback)
 {
 	struct bpf_prog_aux *main_aux = bpf_prog_main_aux(prog);
 	struct bpf_binary_header **old_headers = NULL;
 	void __percpu **old_priv_stacks = NULL;
+	bpf_func_t old_prog_func = READ_ONCE(prog->bpf_func);
 	u64 (*new_exception_cb)(u64 cookie, u64 sp, u64 bp, u64, u64);
 	u32 image_cnt = 1;
 	u32 real_func_cnt = 0;
 	u32 i;
 	int err = 0;
+	bool keep_old_images = false;
+
+	(void)rollback;
 
 	if (main_aux->func_cnt && main_aux->func) {
 		real_func_cnt = main_aux->real_func_cnt ?: main_aux->func_cnt;
@@ -485,10 +486,23 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 		prog->aux->ksym.fp_end = main_aux->func[0]->aux->ksym.fp_end;
 		smp_store_release(&prog->bpf_func, main_aux->func[0]->bpf_func);
 	}
-	if (new_exception_cb)
-		smp_store_release(&main_aux->bpf_exception_cb, new_exception_cb);
+		if (new_exception_cb)
+			smp_store_release(&main_aux->bpf_exception_cb, new_exception_cb);
 
-	synchronize_rcu();
+		err = bpf_prog_regenerate_trampolines(prog, old_prog_func);
+		if (err) {
+			bpf_jit_recompile_prog_log(
+				prog,
+				"warning: trampoline regeneration failed (err=%d); keeping old JIT text resident\n",
+				err);
+			pr_warn_ratelimited(
+				"bpf jit recompile: prog id %u trampoline regeneration failed (err=%d); keeping old JIT text resident\n",
+				prog->aux->id, err);
+			keep_old_images = true;
+			err = 0;
+		}
+
+		synchronize_rcu();
 
 	for (i = 0; i < image_cnt; i++) {
 		struct bpf_prog *image_prog = main_aux->func_cnt && main_aux->func ?
@@ -511,10 +525,10 @@ static int bpf_jit_recompile_prog_images(struct bpf_prog *prog)
 				ksym_prog->aux->ksym.fp_start,
 				ksym_prog->aux->ksym.fp_end);
 
-		if (old_headers[i] &&
+		if (!keep_old_images && old_headers[i] &&
 		    old_headers[i] != bpf_jit_binary_pack_hdr(image_prog))
 			bpf_jit_binary_pack_free(old_headers[i], NULL);
-		if (old_priv_stacks[i])
+		if (!keep_old_images && old_priv_stacks[i])
 			free_percpu(old_priv_stacks[i]);
 
 		image_prog->aux->jit_recompile_active = false;
@@ -623,7 +637,7 @@ int bpf_prog_jit_recompile(union bpf_attr *attr)
 	if (bpf_jit_recompile_has_trampoline_dependency(prog)) {
 		bpf_jit_recompile_prog_log(
 			prog,
-			"trampoline-linked programs are not supported: active trampoline users or trampoline-attached execution require trampoline regeneration\n");
+			"live struct_ops programs are not supported: trampoline regeneration does not cover struct_ops yet\n");
 		err = -EOPNOTSUPP;
 		goto out_put;
 	}
@@ -679,7 +693,7 @@ do_recompile:
 	main_aux->jit_recompile_num_applied = 0;
 
 	/* Trigger re-JIT for the active func[] images. */
-	err = bpf_jit_recompile_prog_images(prog);
+	err = bpf_jit_recompile_prog_images(prog, &rollback);
 	if (err) {
 		struct bpf_jit_policy *failed_policy = NULL;
 

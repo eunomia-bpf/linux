@@ -134,6 +134,86 @@ static int bpf_tramp_ftrace_ops_func(struct ftrace_ops *ops, unsigned long ip,
 }
 #endif
 
+static bool bpf_trampoline_has_live_users(const struct bpf_trampoline *tr)
+{
+	int kind;
+
+	if (tr->extension_prog)
+		return true;
+
+	for (kind = 0; kind < BPF_TRAMP_MAX; kind++) {
+		if (tr->progs_cnt[kind] > 0)
+			return true;
+	}
+
+	return false;
+}
+
+static bool bpf_trampoline_has_linked_prog(const struct bpf_trampoline *tr,
+					   const struct bpf_prog *prog)
+{
+	struct bpf_tramp_link *link;
+	int kind;
+
+	for (kind = 0; kind < BPF_TRAMP_MAX; kind++) {
+		hlist_for_each_entry(link, &tr->progs_hlist[kind], tramp_hlist) {
+			if (link->link.prog == prog)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+static bool bpf_trampoline_refs_prog(const struct bpf_trampoline *tr,
+				     const struct bpf_prog *prog)
+{
+	return tr->extension_prog == prog ||
+	       bpf_trampoline_has_linked_prog(tr, prog);
+}
+
+static bool bpf_trampoline_targets_prog(const struct bpf_trampoline *tr,
+					const struct bpf_prog *prog)
+{
+	u32 obj_id;
+
+	if (!prog || !prog->aux || !prog->aux->id)
+		return false;
+	if (tr->key & 0x80000000ULL)
+		return false;
+
+	bpf_trampoline_unpack_key(tr->key, &obj_id, NULL);
+	return obj_id == prog->aux->id;
+}
+
+static bpf_func_t bpf_trampoline_target_func(const struct bpf_trampoline *tr,
+					     const struct bpf_prog *prog)
+{
+	const struct bpf_prog_aux *aux = bpf_prog_main_aux(prog);
+	u32 btf_id, real_func_cnt;
+	u32 i;
+
+	if (!bpf_trampoline_targets_prog(tr, prog))
+		return NULL;
+
+	bpf_trampoline_unpack_key(tr->key, NULL, &btf_id);
+	if (!aux->func_info || !aux->func_info_cnt)
+		return READ_ONCE(prog->bpf_func);
+
+	real_func_cnt = aux->real_func_cnt ?: aux->func_cnt;
+	for (i = 0; i < aux->func_info_cnt; i++) {
+		if (aux->func_info[i].type_id != btf_id)
+			continue;
+		if (i == 0)
+			return READ_ONCE(prog->bpf_func);
+		if (!aux->func || i >= real_func_cnt || !aux->func[i])
+			return NULL;
+		return READ_ONCE(aux->func[i]->bpf_func);
+	}
+
+	return NULL;
+}
+
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog)
 {
 	enum bpf_attach_type eatype = prog->expected_attach_type;
@@ -150,44 +230,6 @@ bool bpf_prog_has_trampoline(const struct bpf_prog *prog)
 	default:
 		return false;
 	}
-}
-
-bool bpf_prog_has_active_trampoline(const struct bpf_prog *prog)
-{
-	u32 prog_id, obj_id, btf_id;
-	struct bpf_trampoline *tr;
-	int bucket, kind;
-
-	if (!prog || !prog->aux)
-		return false;
-
-	prog_id = prog->aux->id;
-	if (!prog_id)
-		return false;
-
-	mutex_lock(&trampoline_mutex);
-	for (bucket = 0; bucket < TRAMPOLINE_TABLE_SIZE; bucket++) {
-		hlist_for_each_entry(tr, &trampoline_key_table[bucket], hlist_key) {
-			bpf_trampoline_unpack_key(tr->key, &obj_id, &btf_id);
-			if (obj_id != prog_id || (btf_id & 0x80000000))
-				continue;
-
-			if (READ_ONCE(tr->extension_prog)) {
-				mutex_unlock(&trampoline_mutex);
-				return true;
-			}
-
-			for (kind = 0; kind < BPF_TRAMP_MAX; kind++) {
-				if (READ_ONCE(tr->progs_cnt[kind]) > 0) {
-					mutex_unlock(&trampoline_mutex);
-					return true;
-				}
-			}
-		}
-	}
-	mutex_unlock(&trampoline_mutex);
-
-	return false;
 }
 
 void bpf_image_ksym_init(void *data, unsigned int size, struct bpf_ksym *ksym)
@@ -758,6 +800,168 @@ out:
 out_free:
 	bpf_tramp_image_free(im);
 	goto out;
+}
+
+static int bpf_trampoline_retarget_target(struct bpf_trampoline *tr,
+					  bpf_func_t target_bpf_func)
+{
+	struct bpf_tramp_image *old_image = tr->cur_image;
+	void *old_addr = tr->func.addr;
+	int err;
+
+	tr->cur_image = NULL;
+	tr->func.addr = (void *)target_bpf_func;
+	err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
+	if (err) {
+		tr->func.addr = old_addr;
+		tr->cur_image = old_image;
+		return err;
+	}
+
+	if (old_image)
+		bpf_tramp_image_put(old_image);
+	return 0;
+}
+
+static int bpf_trampoline_activate_extension(struct bpf_trampoline *tr)
+{
+	int err;
+
+	err = bpf_arch_text_poke(tr->func.addr, BPF_MOD_NOP, BPF_MOD_JUMP, NULL,
+				 READ_ONCE(tr->extension_prog->bpf_func));
+	return err == 0 || err == 1 ? 0 : err;
+}
+
+static int bpf_trampoline_retarget_extension(struct bpf_trampoline *tr,
+					     bpf_func_t from, bpf_func_t to)
+{
+	int err;
+
+	err = bpf_arch_text_poke(tr->func.addr, BPF_MOD_JUMP, BPF_MOD_JUMP,
+				 (void *)from, (void *)to);
+	if (err == 0 || err == 1)
+		return 0;
+
+	err = bpf_arch_text_poke(tr->func.addr, BPF_MOD_JUMP, BPF_MOD_JUMP,
+				 (void *)to, (void *)to);
+	return err == 0 || err == 1 ? 0 : err;
+}
+
+static int bpf_trampoline_collect_prog_matches(struct bpf_prog *prog,
+					       struct bpf_trampoline ***trs,
+					       u32 *nr)
+{
+	struct bpf_trampoline **matches = NULL, **new_matches;
+	u32 count = 0, cap = 0;
+	struct bpf_trampoline *tr;
+	int bucket;
+	int err = 0;
+
+	mutex_lock(&trampoline_mutex);
+	for (bucket = 0; bucket < TRAMPOLINE_TABLE_SIZE; bucket++) {
+		hlist_for_each_entry(tr, &trampoline_key_table[bucket], hlist_key) {
+			bool match;
+
+			mutex_lock(&tr->mutex);
+			match = bpf_trampoline_refs_prog(tr, prog) ||
+				(bpf_trampoline_targets_prog(tr, prog) &&
+				 bpf_trampoline_has_live_users(tr));
+			mutex_unlock(&tr->mutex);
+			if (!match)
+				continue;
+			if (count == cap) {
+				u32 new_cap = cap ? cap << 1 : 4;
+
+				new_matches = krealloc_array(matches, new_cap,
+							     sizeof(*matches),
+							     GFP_KERNEL_ACCOUNT);
+				if (!new_matches) {
+					err = -ENOMEM;
+					goto out_unlock;
+				}
+				matches = new_matches;
+				cap = new_cap;
+			}
+
+			refcount_inc(&tr->refcnt);
+			matches[count++] = tr;
+		}
+	}
+
+out_unlock:
+	mutex_unlock(&trampoline_mutex);
+	if (err) {
+		while (count--)
+			bpf_trampoline_put(matches[count]);
+		kfree(matches);
+		return err;
+	}
+
+	*trs = matches;
+	*nr = count;
+	return 0;
+}
+
+int bpf_prog_regenerate_trampolines(struct bpf_prog *prog,
+				    bpf_func_t other_bpf_func)
+{
+	struct bpf_trampoline **trs = NULL;
+	bpf_func_t new_bpf_func = READ_ONCE(prog->bpf_func);
+	u32 nr = 0, i;
+	int err;
+
+	if (!prog || !prog->aux || !new_bpf_func)
+		return 0;
+
+	err = bpf_trampoline_collect_prog_matches(prog, &trs, &nr);
+	if (err)
+		return err;
+
+	for (i = 0; i < nr; i++) {
+		struct bpf_trampoline *tr = trs[i];
+		bpf_func_t target_bpf_func = NULL;
+		bool attached_ext;
+		bool attached_prog;
+		bool target_prog;
+
+		mutex_lock(&tr->mutex);
+
+		attached_ext = tr->extension_prog == prog;
+		attached_prog = bpf_trampoline_has_linked_prog(tr, prog);
+		target_prog = bpf_trampoline_targets_prog(tr, prog) &&
+			      bpf_trampoline_has_live_users(tr);
+		if (target_prog) {
+			target_bpf_func = bpf_trampoline_target_func(tr, prog);
+			if (!target_bpf_func) {
+				err = -ENOENT;
+				goto out_unlock_tr;
+			}
+		}
+
+		if (attached_ext) {
+			err = bpf_trampoline_retarget_extension(tr, other_bpf_func,
+								new_bpf_func);
+		} else if (tr->extension_prog) {
+			err = target_prog ?
+				bpf_trampoline_activate_extension(tr) : 0;
+		} else if (target_prog) {
+			err = bpf_trampoline_retarget_target(tr, target_bpf_func);
+		} else if (attached_prog) {
+			err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
+		} else {
+			err = 0;
+		}
+
+out_unlock_tr:
+		mutex_unlock(&tr->mutex);
+		if (err)
+			break;
+	}
+
+	while (nr--)
+		bpf_trampoline_put(trs[nr]);
+	kfree(trs);
+	return err;
 }
 
 static enum bpf_tramp_prog_type bpf_attach_type_to_tramp(struct bpf_prog *prog)

@@ -1465,6 +1465,8 @@ int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 			       struct bpf_trampoline *tr,
 			       struct bpf_prog *tgt_prog);
+int bpf_prog_regenerate_trampolines(struct bpf_prog *prog,
+				    bpf_func_t other_bpf_func);
 struct bpf_trampoline *bpf_trampoline_get(u64 key,
 					  struct bpf_attach_target_info *tgt_info);
 void bpf_trampoline_put(struct bpf_trampoline *tr);
@@ -1551,7 +1553,6 @@ bool bpf_has_frame_pointer(unsigned long ip);
 int bpf_jit_charge_modmem(u32 size);
 void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
-bool bpf_prog_has_active_trampoline(const struct bpf_prog *prog);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 					   struct bpf_trampoline *tr,
@@ -1564,6 +1565,11 @@ static inline int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 					     struct bpf_prog *tgt_prog)
 {
 	return -ENOTSUPP;
+}
+static inline int bpf_prog_regenerate_trampolines(struct bpf_prog *prog,
+						  bpf_func_t other_bpf_func)
+{
+	return 0;
 }
 static inline struct bpf_trampoline *bpf_trampoline_get(u64 key,
 							struct bpf_attach_target_info *tgt_info)
@@ -1583,11 +1589,6 @@ static inline bool is_bpf_image_address(unsigned long address)
 	return false;
 }
 static inline bool bpf_prog_has_trampoline(const struct bpf_prog *prog)
-{
-	return false;
-}
-
-static inline bool bpf_prog_has_active_trampoline(const struct bpf_prog *prog)
 {
 	return false;
 }

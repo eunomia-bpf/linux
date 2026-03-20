@@ -546,6 +546,8 @@ bpf_jit_validate_wide_mem_rule(const struct bpf_insn *insns,
 
 	encoded_width = shape.width |
 			(shape.big_endian ? BPF_JIT_WMEM_F_BIG_ENDIAN : 0);
+	if (shape.width < 2 || shape.width > 8)
+		return false;
 	if (rule->site_len != 3 * shape.width - 2)
 		return false;
 
@@ -622,17 +624,15 @@ static bool bpf_jit_rotate_match_shift(const struct bpf_insn *insn,
  */
 static bool bpf_jit_rotate_mask_matches(u32 rot_amount, s32 imm)
 {
-	u32 low_mask;
 	u32 high_mask;
 	u32 mask = (u32)imm;
 
 	if (!rot_amount || rot_amount >= 32)
 		return false;
 
-	low_mask = (1U << (32 - rot_amount)) - 1;
-	high_mask = ~low_mask;
+	high_mask = ~((1U << (32 - rot_amount)) - 1);
 
-	return mask == low_mask || mask == high_mask;
+	return mask == high_mask;
 }
 
 static bool
@@ -745,6 +745,76 @@ bpf_jit_rotate_validate_common(const struct bpf_insn *insns, u32 idx,
 	return true;
 }
 
+static bool bpf_jit_alu32_insn_linearizable(const struct bpf_insn *insn)
+{
+	u8 op = BPF_OP(insn->code);
+
+	if (BPF_CLASS(insn->code) != BPF_ALU || op == BPF_END)
+		return false;
+
+	switch (op) {
+	case BPF_ADD:
+	case BPF_SUB:
+	case BPF_AND:
+	case BPF_OR:
+	case BPF_XOR:
+	case BPF_MUL:
+	case BPF_LSH:
+	case BPF_RSH:
+	case BPF_ARSH:
+	case BPF_DIV:
+	case BPF_MOD:
+	case BPF_NEG:
+		return insn->off == 0;
+	case BPF_MOV:
+		if (BPF_SRC(insn->code) == BPF_X)
+			return !insn->imm &&
+			       (insn->off == 0 ||
+				insn->off == 8 ||
+				insn->off == 16);
+		return insn->off == 0;
+	default:
+		return false;
+	}
+}
+
+static bool bpf_jit_alu64_insn_linearizable(const struct bpf_insn *insn)
+{
+	u8 op = BPF_OP(insn->code);
+
+	if (BPF_CLASS(insn->code) != BPF_ALU64 || op == BPF_END)
+		return false;
+
+	switch (op) {
+	case BPF_ADD:
+	case BPF_SUB:
+	case BPF_AND:
+	case BPF_OR:
+	case BPF_XOR:
+	case BPF_MUL:
+	case BPF_LSH:
+	case BPF_RSH:
+	case BPF_ARSH:
+	case BPF_NEG:
+		return insn->off == 0;
+	case BPF_DIV:
+	case BPF_MOD:
+		return true;
+	case BPF_MOV:
+		if (BPF_SRC(insn->code) == BPF_X)
+			return !insn->imm &&
+			       !insn_is_cast_user(insn) &&
+			       !insn_is_mov_percpu_addr(insn) &&
+			       (insn->off == 0 ||
+				insn->off == 8 ||
+				insn->off == 16 ||
+				insn->off == 32);
+		return insn->off == 0;
+	default:
+		return false;
+	}
+}
+
 /**
  * bpf_jit_validate_rotate_rule - validate a ROTATE rule against prog
  *
@@ -804,11 +874,68 @@ out_fill:
 struct bpf_jit_bitfield_extract_desc {
 	u8 dst_reg;
 	u8 src_reg;
-	s32 shift;
-	s32 mask;
+	u32 shift;
+	s64 mask;
 	u8 width;
 	bool mask_first;
 };
+
+static u64 bpf_jit_bitfield_mask_from_imm(s32 mask, u32 width)
+{
+	if (width == 32)
+		return (u32)mask;
+
+	return (u64)(s64)mask;
+}
+
+static u64 bpf_jit_bitfield_low_mask(u32 width)
+{
+	if (width >= 64)
+		return ~0ULL;
+
+	return (1ULL << width) - 1;
+}
+
+static bool bpf_jit_bitfield_low_mask_width(u64 mask, u32 *field_width)
+{
+	u32 width = 0;
+
+	if (!mask)
+		return false;
+
+	while (mask & 1) {
+		width++;
+		mask >>= 1;
+	}
+	if (mask)
+		return false;
+
+	if (field_width)
+		*field_width = width;
+	return true;
+}
+
+static bool
+bpf_jit_normalize_bitfield_extract_desc(struct bpf_jit_bitfield_extract_desc *desc)
+{
+	u64 effective_mask;
+	u32 field_width;
+
+	effective_mask = bpf_jit_bitfield_mask_from_imm((s32)desc->mask,
+							desc->width);
+	if (desc->mask_first)
+		effective_mask >>= desc->shift;
+
+	effective_mask &= bpf_jit_bitfield_low_mask(desc->width - desc->shift);
+	if (!bpf_jit_bitfield_low_mask_width(effective_mask, &field_width))
+		return false;
+	if (desc->shift + field_width > desc->width)
+		return false;
+
+	desc->mask = (s64)effective_mask;
+	desc->mask_first = false;
+	return true;
+}
 
 static bool bpf_jit_parse_bitfield_extract_site(
 	const struct bpf_insn *insns,
@@ -907,6 +1034,8 @@ bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
 
 	if (!bpf_jit_parse_bitfield_extract_site(insns, rule, &desc))
 		return false;
+	if (!bpf_jit_normalize_bitfield_extract_desc(&desc))
+		return false;
 
 	if (params) {
 		memset(params, 0, sizeof(*params));
@@ -920,8 +1049,6 @@ bpf_jit_validate_bitfield_extract_rule(const struct bpf_insn *insns,
 		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_WIDTH,
 				      desc.width);
 		bpf_jit_param_set_imm(params, BPF_JIT_BFX_PARAM_ORDER,
-				      desc.mask_first ?
-				      BPF_JIT_BFX_ORDER_MASK_SHIFT :
 				      BPF_JIT_BFX_ORDER_SHIFT_MASK);
 	}
 
@@ -1017,11 +1144,6 @@ bpf_jit_validate_addr_calc_rule(const struct bpf_insn *insns,
 	return true;
 }
 
-static bool bpf_jit_zero_ext_elide_is_alu32(const struct bpf_insn *insn)
-{
-	return BPF_CLASS(insn->code) == BPF_ALU && BPF_OP(insn->code) != BPF_END;
-}
-
 static bool bpf_jit_zero_ext_elide_is_tail(const struct bpf_insn *insn, u8 dst_reg)
 {
 	if (insn_is_zext(insn))
@@ -1067,7 +1189,7 @@ static bool bpf_jit_parse_zero_ext_elide_shape(
 
 	alu32_insn = &insns[idx];
 	zext_insn = &insns[idx + 1];
-	if (!bpf_jit_zero_ext_elide_is_alu32(alu32_insn) ||
+	if (!bpf_jit_alu32_insn_linearizable(alu32_insn) ||
 	    !bpf_jit_zero_ext_elide_is_tail(zext_insn, alu32_insn->dst_reg))
 		return false;
 
@@ -1238,16 +1360,27 @@ static bool bpf_jit_branch_flip_body_linear(const struct bpf_insn *insns,
 		return false;
 
 	for (i = start; i < start + len; i++) {
-		u8 cls = BPF_CLASS(insns[i].code);
-		u8 op = BPF_OP(insns[i].code);
+		const struct bpf_insn *insn = &insns[i];
+		u8 cls = BPF_CLASS(insn->code);
+		u8 mode = BPF_MODE(insn->code);
+		u8 size = BPF_SIZE(insn->code);
 
-		if ((cls == BPF_JMP || cls == BPF_JMP32) &&
-		    op != BPF_CALL && op != BPF_EXIT)
-			return false;
-		if (cls == BPF_STX || cls == BPF_ST)
-			return false;
-		if (insns[i].code == (BPF_LD | BPF_IMM | BPF_DW))
-			return false;
+		if (bpf_jit_alu32_insn_linearizable(insn) ||
+		    bpf_jit_alu64_insn_linearizable(insn))
+			continue;
+		if (insn->code == (BPF_ALU | BPF_END | BPF_FROM_BE) ||
+		    insn->code == (BPF_ALU | BPF_END | BPF_FROM_LE) ||
+		    insn->code == (BPF_ALU64 | BPF_END | BPF_FROM_LE))
+			continue;
+		if (cls == BPF_LDX && mode == BPF_MEM &&
+		    (size == BPF_B || size == BPF_H ||
+		     size == BPF_W || size == BPF_DW))
+			continue;
+		if (cls == BPF_LDX && mode == BPF_MEMSX &&
+		    (size == BPF_B || size == BPF_H || size == BPF_W))
+			continue;
+
+		return false;
 	}
 
 	return true;
