@@ -68,7 +68,8 @@ static int test_run_xdp_prog(int prog_fd, __u32 *retval)
 	return 0;
 }
 
-int main(void)
+/* Test 1: same-length rejit (2 insns -> 2 insns) */
+static int test_same_length(void)
 {
 	static const struct bpf_insn prog_a[] = {
 		{
@@ -97,20 +98,13 @@ int main(void)
 	memset(log_buf, 0, sizeof(log_buf));
 	prog_fd = load_xdp_prog(prog_a, ARRAY_SIZE(prog_a), log_buf, sizeof(log_buf));
 	if (prog_fd < 0) {
-		fprintf(stderr, "BPF_PROG_LOAD failed: %s\n%s\n",
+		fprintf(stderr, "test_same_length: BPF_PROG_LOAD failed: %s\n%s\n",
 			strerror(errno), log_buf);
 		return 1;
 	}
 
-	if (test_run_xdp_prog(prog_fd, &retval) < 0) {
-		fprintf(stderr, "BPF_PROG_TEST_RUN before rejit failed: %s\n",
-			strerror(errno));
-		close(prog_fd);
-		return 1;
-	}
-
-	if (retval != XDP_PASS) {
-		fprintf(stderr, "unexpected pre-rejit retval %u\n", retval);
+	if (test_run_xdp_prog(prog_fd, &retval) < 0 || retval != XDP_PASS) {
+		fprintf(stderr, "test_same_length: pre-rejit run failed\n");
 		close(prog_fd);
 		return 1;
 	}
@@ -118,26 +112,110 @@ int main(void)
 	memset(log_buf, 0, sizeof(log_buf));
 	if (rejit_xdp_prog(prog_fd, prog_b, ARRAY_SIZE(prog_b),
 			   log_buf, sizeof(log_buf)) < 0) {
-		fprintf(stderr, "BPF_PROG_REJIT failed: %s\n%s\n",
+		fprintf(stderr, "test_same_length: BPF_PROG_REJIT failed: %s\n%s\n",
 			strerror(errno), log_buf);
 		close(prog_fd);
 		return 1;
 	}
 
-	if (test_run_xdp_prog(prog_fd, &retval) < 0) {
-		fprintf(stderr, "BPF_PROG_TEST_RUN after rejit failed: %s\n",
-			strerror(errno));
+	if (test_run_xdp_prog(prog_fd, &retval) < 0 || retval != XDP_DROP) {
+		fprintf(stderr, "test_same_length: post-rejit run failed (retval=%u)\n",
+			retval);
 		close(prog_fd);
 		return 1;
 	}
 
 	close(prog_fd);
+	printf("test_same_length: PASS (XDP_PASS -> XDP_DROP)\n");
+	return 0;
+}
 
-	if (retval != XDP_DROP) {
-		fprintf(stderr, "unexpected post-rejit retval %u\n", retval);
+/* Test 2: different-length rejit (2 insns -> 4 insns) */
+static int test_different_length(void)
+{
+	/* Original: 2 insns, returns XDP_PASS */
+	static const struct bpf_insn prog_short[] = {
+		{
+			.code = BPF_ALU64 | BPF_MOV | BPF_K,
+			.dst_reg = BPF_REG_0,
+			.imm = XDP_PASS,
+		},
+		{
+			.code = BPF_JMP | BPF_EXIT,
+		},
+	};
+	/* Replacement: 4 insns, returns XDP_TX (3) via r0 = 1 + 2 */
+	static const struct bpf_insn prog_long[] = {
+		{
+			.code = BPF_ALU64 | BPF_MOV | BPF_K,
+			.dst_reg = BPF_REG_0,
+			.imm = 1,
+		},
+		{
+			.code = BPF_ALU64 | BPF_MOV | BPF_K,
+			.dst_reg = BPF_REG_1,
+			.imm = 2,
+		},
+		{
+			.code = BPF_ALU64 | BPF_ADD | BPF_X,
+			.dst_reg = BPF_REG_0,
+			.src_reg = BPF_REG_1,
+		},
+		{
+			.code = BPF_JMP | BPF_EXIT,
+		},
+	};
+	char log_buf[65536];
+	__u32 retval = 0;
+	int prog_fd;
+
+	memset(log_buf, 0, sizeof(log_buf));
+	prog_fd = load_xdp_prog(prog_short, ARRAY_SIZE(prog_short),
+				log_buf, sizeof(log_buf));
+	if (prog_fd < 0) {
+		fprintf(stderr, "test_different_length: BPF_PROG_LOAD failed: %s\n%s\n",
+			strerror(errno), log_buf);
 		return 1;
 	}
 
-	printf("same prog_fd re-jitted from XDP_PASS to XDP_DROP\n");
+	if (test_run_xdp_prog(prog_fd, &retval) < 0 || retval != XDP_PASS) {
+		fprintf(stderr, "test_different_length: pre-rejit run failed\n");
+		close(prog_fd);
+		return 1;
+	}
+
+	memset(log_buf, 0, sizeof(log_buf));
+	if (rejit_xdp_prog(prog_fd, prog_long, ARRAY_SIZE(prog_long),
+			   log_buf, sizeof(log_buf)) < 0) {
+		fprintf(stderr, "test_different_length: BPF_PROG_REJIT failed: %s\n%s\n",
+			strerror(errno), log_buf);
+		close(prog_fd);
+		return 1;
+	}
+
+	if (test_run_xdp_prog(prog_fd, &retval) < 0 || retval != XDP_TX) {
+		fprintf(stderr, "test_different_length: post-rejit run failed (retval=%u, expected=%u)\n",
+			retval, XDP_TX);
+		close(prog_fd);
+		return 1;
+	}
+
+	close(prog_fd);
+	printf("test_different_length: PASS (2 insns -> 4 insns, XDP_PASS -> XDP_TX)\n");
 	return 0;
+}
+
+int main(void)
+{
+	int ret = 0;
+
+	ret |= test_same_length();
+	ret |= test_different_length();
+
+	if (ret)
+		fprintf(stderr, "SOME TESTS FAILED\n");
+	else
+		printf("ALL TESTS PASSED\n");
+
+	return ret;
 }

@@ -1683,6 +1683,7 @@ struct bpf_prog_aux {
 	struct btf *attach_btf;
 	struct bpf_ctx_arg_aux *ctx_arg_info;
 	void __percpu *priv_stack_ptr;
+	struct mutex rejit_mutex; /* serializes BPF_PROG_REJIT on this prog */
 	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
 	struct bpf_prog *dst_prog;
 	struct bpf_trampoline *dst_trampoline;

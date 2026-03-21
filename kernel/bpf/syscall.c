@@ -3160,20 +3160,15 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 {
 	const struct bpf_prog_aux *aux = prog->aux;
 
-	if (!prog->jited || prog->sleepable || prog->is_func ||
-	    prog->has_callchain_buf || prog->call_get_stack)
+	if (!prog->jited || prog->is_func)
 		return false;
 
-	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux) ||
-	    aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
+	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux))
 		return false;
 
-	if (prog->orig_prog || aux->attach_btf || aux->attach_btf_id ||
-	    aux->dst_prog || aux->dst_trampoline || aux->func_cnt ||
-	    aux->real_func_cnt || aux->used_map_cnt || aux->used_maps ||
-	    aux->poke_tab || aux->size_poke_tab || aux->kfunc_tab ||
-	    aux->kfunc_btf_tab || aux->ctx_arg_info || aux->jit_data ||
-	    aux->priv_stack_ptr || rcu_access_pointer(aux->st_ops_assoc))
+	if (aux->dst_prog || aux->dst_trampoline || aux->func_cnt ||
+	    aux->real_func_cnt || aux->poke_tab || aux->size_poke_tab ||
+	    rcu_access_pointer(aux->st_ops_assoc))
 		return false;
 
 	return true;
@@ -3201,6 +3196,10 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->extable, tmp->aux->extable);
 	swap(prog->aux->priv_stack_ptr, tmp->aux->priv_stack_ptr);
 	swap(prog->aux->jit_data, tmp->aux->jit_data);
+	swap(prog->aux->used_maps, tmp->aux->used_maps);
+	swap(prog->aux->used_map_cnt, tmp->aux->used_map_cnt);
+	swap(prog->aux->kfunc_tab, tmp->aux->kfunc_tab);
+	swap(prog->aux->kfunc_btf_tab, tmp->aux->kfunc_btf_tab);
 
 #ifdef CONFIG_SECURITY
 	swap(prog->aux->security, tmp->aux->security);
@@ -3208,10 +3207,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 
 	bpf_prog_kallsyms_del(prog);
 
-	memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
 	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
-
-	prog->len = tmp->len;
 	prog->jited = tmp->jited;
 	prog->jited_len = tmp->jited_len;
 	prog->gpl_compatible = tmp->gpl_compatible;
@@ -3249,7 +3245,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 }
 
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_REJIT_LAST_FIELD rejit.log_buf
+#define BPF_PROG_REJIT_LAST_FIELD rejit.fd_array_cnt
 
 static int bpf_prog_rejit(union bpf_attr *attr)
 {
@@ -3276,6 +3272,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	if (!bpf_prog_rejit_supported(prog))
 		goto out_put_prog;
 
+	mutex_lock(&prog->aux->rejit_mutex);
+
 	load_attr.prog_type = prog->type;
 	load_attr.expected_attach_type = prog->expected_attach_type;
 	load_attr.insn_cnt = attr->rejit.insn_cnt;
@@ -3285,11 +3283,13 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	load_attr.log_buf = attr->rejit.log_buf;
 	load_attr.prog_flags = (prog->sleepable ? BPF_F_SLEEPABLE : 0) |
 			       (prog->aux->xdp_has_frags ? BPF_F_XDP_HAS_FRAGS : 0);
+	load_attr.fd_array = attr->rejit.fd_array;
+	load_attr.fd_array_cnt = attr->rejit.fd_array_cnt;
 
 	tmp = bpf_prog_alloc(bpf_prog_size(attr->rejit.insn_cnt), GFP_USER);
 	err = -ENOMEM;
 	if (!tmp)
-		goto out_put_prog;
+		goto out_unlock;
 
 	tmp->expected_attach_type = prog->expected_attach_type;
 	tmp->sleepable = prog->sleepable;
@@ -3297,6 +3297,13 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	tmp->aux->xdp_has_frags = prog->aux->xdp_has_frags;
 	tmp->aux->user = get_current_user();
 	tmp->len = attr->rejit.insn_cnt;
+
+	/* Propagate attach_btf info so the verifier can resolve tracing targets. */
+	if (prog->aux->attach_btf) {
+		btf_get(prog->aux->attach_btf);
+		tmp->aux->attach_btf = prog->aux->attach_btf;
+	}
+	tmp->aux->attach_btf_id = prog->aux->attach_btf_id;
 
 	err = -EFAULT;
 	if (copy_from_bpfptr(tmp->insns, make_bpfptr(attr->rejit.insns, false),
@@ -3341,25 +3348,34 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		goto free_tmp_noref;
 
 	err = -EOPNOTSUPP;
-	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited || tmp->len != prog->len)
+	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited)
 		goto free_tmp_noref;
 
 	bpf_prog_rejit_swap(prog, tmp);
-	synchronize_rcu();
+	if (prog->sleepable)
+		synchronize_rcu_tasks_trace();
+	else
+		synchronize_rcu();
 
 	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	mutex_unlock(&prog->aux->rejit_mutex);
 	bpf_prog_put(prog);
 	return 0;
 
 free_tmp_noref:
 	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
-	goto out_put_prog;
+	goto out_unlock;
 free_tmp_sec:
 	security_bpf_prog_free(tmp);
 free_tmp:
+	if (tmp->aux->attach_btf)
+		btf_put(tmp->aux->attach_btf);
+	tmp->aux->attach_btf = NULL;
 	free_uid(tmp->aux->user);
 	kvfree(tmp->aux->orig_insns);
 	bpf_prog_free(tmp);
+out_unlock:
+	mutex_unlock(&prog->aux->rejit_mutex);
 out_put_prog:
 	bpf_prog_put(prog);
 	return err;

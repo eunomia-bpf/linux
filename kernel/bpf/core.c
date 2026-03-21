@@ -138,6 +138,7 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	mutex_init(&fp->aux->used_maps_mutex);
 	mutex_init(&fp->aux->ext_mutex);
 	mutex_init(&fp->aux->dst_mutex);
+	mutex_init(&fp->aux->rejit_mutex);
 	mutex_init(&fp->aux->st_ops_assoc_mutex);
 
 #ifdef CONFIG_BPF_SYSCALL
@@ -652,6 +653,7 @@ static void __bpf_ksym_del(struct bpf_ksym *ksym)
 
 	latch_tree_erase(&ksym->tnode, &bpf_tree, &bpf_tree_ops);
 	list_del_rcu(&ksym->lnode);
+	INIT_LIST_HEAD_RCU(&ksym->lnode);
 }
 
 void bpf_ksym_del(struct bpf_ksym *ksym)

@@ -1930,6 +1930,8 @@ union bpf_attr {
 		__u32		log_level;
 		__u32		log_size;
 		__aligned_u64	log_buf;
+		__aligned_u64	fd_array;
+		__u32		fd_array_cnt;
 	} rejit;
 
 } __attribute__((aligned(8)));
