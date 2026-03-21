@@ -2380,6 +2380,7 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
 	module_put(prog->aux->mod);
 	kvfree(prog->aux->jited_linfo);
 	kvfree(prog->aux->linfo);
+	kvfree(prog->aux->orig_insns);
 	kfree(prog->aux->kfunc_tab);
 	kfree(prog->aux->ctx_arg_info);
 	if (prog->aux->attach_btf)
@@ -3020,6 +3021,13 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 			     make_bpfptr(attr->insns, uattr.is_kernel),
 			     bpf_prog_insn_size(prog)) != 0)
 		goto free_prog;
+	prog->aux->orig_insns = kvmemdup(prog->insns, bpf_prog_insn_size(prog),
+					 GFP_USER);
+	if (!prog->aux->orig_insns) {
+		err = -ENOMEM;
+		goto free_prog;
+	}
+	prog->aux->orig_prog_len = bpf_prog_insn_size(prog);
 	/* copy eBPF program license from user space */
 	if (strncpy_from_bpfptr(license,
 				make_bpfptr(attr->license, uattr.is_kernel),
@@ -3139,6 +3147,7 @@ free_prog:
 	free_uid(prog->aux->user);
 	if (prog->aux->attach_btf)
 		btf_put(prog->aux->attach_btf);
+	kvfree(prog->aux->orig_insns);
 	bpf_prog_free(prog);
 put_token:
 	bpf_token_put(token);
@@ -5054,6 +5063,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	if (!bpf_capable()) {
 		info.jited_prog_len = 0;
 		info.xlated_prog_len = 0;
+		info.orig_prog_len = 0;
 		info.nr_jited_ksyms = 0;
 		info.nr_jited_func_lens = 0;
 		info.nr_func_info = 0;
@@ -5080,6 +5090,19 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 				return -EFAULT;
 		} else {
 			info.xlated_prog_insns = 0;
+		}
+	}
+
+	ulen = info.orig_prog_len;
+	info.orig_prog_len = prog->aux->orig_prog_len;
+	if (info.orig_prog_len && ulen) {
+		if (bpf_dump_raw_ok(file->f_cred)) {
+			uinsns = u64_to_user_ptr(info.orig_prog_insns);
+			ulen = min_t(u32, info.orig_prog_len, ulen);
+			if (copy_to_user(uinsns, prog->aux->orig_insns, ulen))
+				return -EFAULT;
+		} else {
+			info.orig_prog_insns = 0;
 		}
 	}
 
