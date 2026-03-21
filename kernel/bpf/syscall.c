@@ -3154,6 +3154,208 @@ put_token:
 	return err;
 }
 
+#define BPF_PROG_REJIT_LOAD_ATTR_SIZE offsetofend(union bpf_attr, keyring_id)
+
+static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
+{
+	const struct bpf_prog_aux *aux = prog->aux;
+
+	if (!prog->jited || prog->sleepable || prog->is_func ||
+	    prog->has_callchain_buf || prog->call_get_stack)
+		return false;
+
+	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux) ||
+	    aux->cgroup_atype != CGROUP_BPF_ATTACH_TYPE_INVALID)
+		return false;
+
+	if (prog->orig_prog || aux->attach_btf || aux->attach_btf_id ||
+	    aux->dst_prog || aux->dst_trampoline || aux->func_cnt ||
+	    aux->real_func_cnt || aux->used_map_cnt || aux->used_btf_cnt ||
+	    aux->used_maps || aux->used_btfs || aux->poke_tab ||
+	    aux->size_poke_tab || aux->kfunc_tab || aux->kfunc_btf_tab ||
+	    aux->ctx_arg_info || aux->btf || aux->func_info ||
+	    aux->func_info_aux || aux->linfo || aux->jited_linfo ||
+	    aux->extable || aux->num_exentries || aux->jit_data ||
+	    aux->priv_stack_ptr || rcu_access_pointer(aux->st_ops_assoc))
+		return false;
+
+	return true;
+}
+
+static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
+{
+	bool old_jited = prog->jited;
+	u32 old_jited_len = prog->jited_len;
+	bpf_func_t old_bpf_func = prog->bpf_func;
+
+	swap(prog->aux->orig_insns, tmp->aux->orig_insns);
+	swap(prog->aux->orig_prog_len, tmp->aux->orig_prog_len);
+	swap(prog->aux->priv_stack_ptr, tmp->aux->priv_stack_ptr);
+	swap(prog->aux->jit_data, tmp->aux->jit_data);
+
+#ifdef CONFIG_SECURITY
+	swap(prog->aux->security, tmp->aux->security);
+#endif
+
+	bpf_prog_kallsyms_del(prog);
+
+	memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
+	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
+
+	prog->len = tmp->len;
+	prog->jited = tmp->jited;
+	prog->jited_len = tmp->jited_len;
+	prog->gpl_compatible = tmp->gpl_compatible;
+	prog->cb_access = tmp->cb_access;
+	prog->dst_needed = tmp->dst_needed;
+	prog->blinding_requested = tmp->blinding_requested;
+	prog->blinded = tmp->blinded;
+	prog->kprobe_override = tmp->kprobe_override;
+	prog->enforce_expected_attach_type = tmp->enforce_expected_attach_type;
+	prog->call_get_stack = tmp->call_get_stack;
+	prog->call_get_func_ip = tmp->call_get_func_ip;
+	prog->call_session_cookie = tmp->call_session_cookie;
+	prog->tstamp_type_access = tmp->tstamp_type_access;
+
+	prog->aux->max_ctx_offset = tmp->aux->max_ctx_offset;
+	prog->aux->max_pkt_offset = tmp->aux->max_pkt_offset;
+	prog->aux->max_tp_access = tmp->aux->max_tp_access;
+	prog->aux->stack_depth = tmp->aux->stack_depth;
+	prog->aux->max_rdonly_access = tmp->aux->max_rdonly_access;
+	prog->aux->max_rdwr_access = tmp->aux->max_rdwr_access;
+	prog->aux->verifier_zext = tmp->aux->verifier_zext;
+	prog->aux->changes_pkt_data = tmp->aux->changes_pkt_data;
+	prog->aux->kprobe_write_ctx = tmp->aux->kprobe_write_ctx;
+	prog->aux->verified_insns = tmp->aux->verified_insns;
+	prog->aux->load_time = ktime_get_boottime_ns();
+
+	/* Publish the replacement image after metadata and xlated insns are in place. */
+	smp_wmb();
+	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
+	tmp->jited = old_jited;
+	tmp->jited_len = old_jited_len;
+	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
+
+	bpf_prog_kallsyms_add(prog);
+}
+
+/* last field in 'union bpf_attr' used by this command */
+#define BPF_PROG_REJIT_LAST_FIELD rejit.log_buf
+
+static int bpf_prog_rejit(union bpf_attr *attr)
+{
+	union bpf_attr load_attr = {};
+	bpfptr_t load_uattr = KERNEL_BPFPTR(&load_attr);
+	struct bpf_prog *prog, *tmp = NULL;
+	int err;
+
+	if (CHECK_ATTR(BPF_PROG_REJIT))
+		return -EINVAL;
+
+	if (!capable(CAP_BPF) || !capable(CAP_SYS_ADMIN))
+		return -EPERM;
+
+	if (!attr->rejit.insns || !attr->rejit.insn_cnt ||
+	    attr->rejit.insn_cnt > BPF_COMPLEXITY_LIMIT_INSNS)
+		return -E2BIG;
+
+	prog = bpf_prog_get(attr->rejit.prog_fd);
+	if (IS_ERR(prog))
+		return PTR_ERR(prog);
+
+	err = -EOPNOTSUPP;
+	if (!bpf_prog_rejit_supported(prog))
+		goto out_put_prog;
+
+	load_attr.prog_type = prog->type;
+	load_attr.expected_attach_type = prog->expected_attach_type;
+	load_attr.insn_cnt = attr->rejit.insn_cnt;
+	load_attr.insns = attr->rejit.insns;
+	load_attr.log_level = attr->rejit.log_level;
+	load_attr.log_size = attr->rejit.log_size;
+	load_attr.log_buf = attr->rejit.log_buf;
+	load_attr.prog_flags = (prog->sleepable ? BPF_F_SLEEPABLE : 0) |
+			       (prog->aux->xdp_has_frags ? BPF_F_XDP_HAS_FRAGS : 0);
+
+	tmp = bpf_prog_alloc(bpf_prog_size(attr->rejit.insn_cnt), GFP_USER);
+	err = -ENOMEM;
+	if (!tmp)
+		goto out_put_prog;
+
+	tmp->expected_attach_type = prog->expected_attach_type;
+	tmp->sleepable = prog->sleepable;
+	tmp->aux->dev_bound = prog->aux->dev_bound;
+	tmp->aux->xdp_has_frags = prog->aux->xdp_has_frags;
+	tmp->aux->user = get_current_user();
+	tmp->len = attr->rejit.insn_cnt;
+
+	err = -EFAULT;
+	if (copy_from_bpfptr(tmp->insns, make_bpfptr(attr->rejit.insns, false),
+			     bpf_prog_insn_size(tmp)) != 0)
+		goto free_tmp;
+
+	tmp->aux->orig_insns = kvmemdup(tmp->insns, bpf_prog_insn_size(tmp),
+					GFP_USER);
+	if (!tmp->aux->orig_insns) {
+		err = -ENOMEM;
+		goto free_tmp;
+	}
+	tmp->aux->orig_prog_len = bpf_prog_insn_size(tmp);
+	tmp->gpl_compatible = prog->gpl_compatible;
+	tmp->orig_prog = NULL;
+	tmp->jited = 0;
+
+	atomic64_set(&tmp->aux->refcnt, 1);
+
+	err = find_prog_type(prog->type, tmp);
+	if (err < 0)
+		goto free_tmp;
+
+	tmp->aux->load_time = ktime_get_boottime_ns();
+	memcpy(tmp->aux->name, prog->aux->name, sizeof(tmp->aux->name));
+
+	err = security_bpf_prog_load(tmp, &load_attr, NULL, true);
+	if (err)
+		goto free_tmp_sec;
+
+	err = bpf_check(&tmp, &load_attr, load_uattr,
+			BPF_PROG_REJIT_LOAD_ATTR_SIZE);
+	if (err < 0)
+		goto free_tmp_noref;
+
+	tmp = bpf_prog_select_runtime(tmp, &err);
+	if (err < 0)
+		goto free_tmp_noref;
+
+	err = bpf_prog_mark_insn_arrays_ready(tmp);
+	if (err < 0)
+		goto free_tmp_noref;
+
+	err = -EOPNOTSUPP;
+	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited || tmp->len != prog->len)
+		goto free_tmp_noref;
+
+	bpf_prog_rejit_swap(prog, tmp);
+	synchronize_rcu();
+
+	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	bpf_prog_put(prog);
+	return 0;
+
+free_tmp_noref:
+	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	goto out_put_prog;
+free_tmp_sec:
+	security_bpf_prog_free(tmp);
+free_tmp:
+	free_uid(tmp->aux->user);
+	kvfree(tmp->aux->orig_insns);
+	bpf_prog_free(tmp);
+out_put_prog:
+	bpf_prog_put(prog);
+	return err;
+}
+
 #define BPF_OBJ_LAST_FIELD path_fd
 
 static int bpf_obj_pin(const union bpf_attr *attr)
@@ -6350,6 +6552,9 @@ static int __sys_bpf(enum bpf_cmd cmd, bpfptr_t uattr, unsigned int size)
 		break;
 	case BPF_PROG_ASSOC_STRUCT_OPS:
 		err = prog_assoc_struct_ops(&attr);
+		break;
+	case BPF_PROG_REJIT:
+		err = bpf_prog_rejit(&attr);
 		break;
 	default:
 		err = -EINVAL;
