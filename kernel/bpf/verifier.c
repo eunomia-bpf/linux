@@ -3172,6 +3172,7 @@ static int bpf_find_exception_callback_insn_off(struct bpf_verifier_env *env)
 
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
+	const struct bpf_kfunc_inline_ops *inline_ops;
 	u32 func_id;
 	s32 imm;
 	u16 offset;
@@ -3198,6 +3199,98 @@ struct bpf_kfunc_btf_tab {
 	struct bpf_kfunc_btf descs[MAX_KFUNC_BTFS];
 	u32 nr_descs;
 };
+
+struct bpf_kfunc_inline_desc {
+	struct list_head list;
+	struct bpf_kfunc_inline_ops *ops;
+	char *func_name;
+};
+
+static DEFINE_MUTEX(bpf_kfunc_inline_mutex);
+static LIST_HEAD(bpf_kfunc_inline_list);
+
+static struct bpf_kfunc_inline_desc *
+__bpf_kfunc_inline_find(const char *func_name)
+{
+	struct bpf_kfunc_inline_desc *desc;
+
+	list_for_each_entry(desc, &bpf_kfunc_inline_list, list) {
+		if (!strcmp(desc->func_name, func_name))
+			return desc;
+	}
+
+	return NULL;
+}
+
+static const struct bpf_kfunc_inline_ops *
+bpf_kfunc_inline_lookup(const char *func_name)
+{
+	struct bpf_kfunc_inline_desc *desc;
+	const struct bpf_kfunc_inline_ops *ops = NULL;
+
+	mutex_lock(&bpf_kfunc_inline_mutex);
+	desc = __bpf_kfunc_inline_find(func_name);
+	if (desc)
+		ops = desc->ops;
+	mutex_unlock(&bpf_kfunc_inline_mutex);
+
+	return ops;
+}
+
+int bpf_register_kfunc_inline_ops(const char *func_name,
+				  struct bpf_kfunc_inline_ops *ops)
+{
+	struct bpf_kfunc_inline_desc *desc;
+
+	if (!func_name || !ops || !ops->emit_x86 || ops->max_emit_bytes <= 0)
+		return -EINVAL;
+
+	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
+	if (!desc)
+		return -ENOMEM;
+
+	desc->func_name = kstrdup(func_name, GFP_KERNEL);
+	if (!desc->func_name) {
+		kfree(desc);
+		return -ENOMEM;
+	}
+
+	desc->ops = ops;
+
+	mutex_lock(&bpf_kfunc_inline_mutex);
+	if (__bpf_kfunc_inline_find(func_name)) {
+		mutex_unlock(&bpf_kfunc_inline_mutex);
+		kfree(desc->func_name);
+		kfree(desc);
+		return -EEXIST;
+	}
+	list_add_tail(&desc->list, &bpf_kfunc_inline_list);
+	mutex_unlock(&bpf_kfunc_inline_mutex);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_register_kfunc_inline_ops);
+
+void bpf_unregister_kfunc_inline_ops(const char *func_name)
+{
+	struct bpf_kfunc_inline_desc *desc;
+
+	if (!func_name)
+		return;
+
+	mutex_lock(&bpf_kfunc_inline_mutex);
+	desc = __bpf_kfunc_inline_find(func_name);
+	if (desc)
+		list_del(&desc->list);
+	mutex_unlock(&bpf_kfunc_inline_mutex);
+
+	if (!desc)
+		return;
+
+	kfree(desc->func_name);
+	kfree(desc);
+}
+EXPORT_SYMBOL_GPL(bpf_unregister_kfunc_inline_ops);
 
 static int specialize_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_desc *desc,
 			    int insn_idx);
@@ -3519,6 +3612,8 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	desc->offset = offset;
 	desc->addr = addr;
 	desc->func_model = func_model;
+	desc->inline_ops = kfunc.flags && (*kfunc.flags & KF_INLINE_EMIT) ?
+			       bpf_kfunc_inline_lookup(kfunc.name) : NULL;
 	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
 	     kfunc_desc_cmp_by_id_off, NULL);
 	return 0;
@@ -3596,6 +3691,26 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 		      sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
 
 	return res ? &res->func_model : NULL;
+}
+
+const struct bpf_kfunc_inline_ops *
+bpf_jit_find_kfunc_inline_ops(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn)
+{
+	const struct bpf_kfunc_desc desc = {
+		.imm = insn->imm,
+		.offset = insn->off,
+	};
+	const struct bpf_kfunc_desc *res;
+	struct bpf_kfunc_desc_tab *tab;
+
+	tab = prog->aux->kfunc_tab;
+	if (!tab)
+		return NULL;
+	res = bsearch(&desc, tab->descs, tab->nr_descs,
+		      sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
+
+	return res ? res->inline_ops : NULL;
 }
 
 static int add_kfunc_in_insns(struct bpf_verifier_env *env,

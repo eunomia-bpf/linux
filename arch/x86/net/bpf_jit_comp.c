@@ -576,6 +576,28 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
+static int emit_inline_kfunc_call(u8 **pprog, struct bpf_prog *bpf_prog,
+				  const struct bpf_insn *insn, bool emit)
+{
+	const struct bpf_kfunc_inline_ops *ops;
+	u8 *prog = *pprog;
+	u32 off = 0;
+	int ret;
+
+	ops = bpf_jit_find_kfunc_inline_ops(bpf_prog, insn);
+	if (!ops)
+		return -ENOENT;
+
+	ret = ops->emit_x86(prog, &off, emit, insn, bpf_prog);
+	if (ret < 0)
+		return ret;
+	if (ret != off || ret > ops->max_emit_bytes)
+		return -EFAULT;
+
+	*pprog = prog + off;
+	return 0;
+}
+
 static int emit_rsb_call(u8 **pprog, void *func, void *ip)
 {
 	OPTIMIZER_HIDE_VAR(func);
@@ -2443,6 +2465,9 @@ populate_extable:
 			u8 *ip = image + addrs[i - 1];
 
 			func = (u8 *) __bpf_call_base + imm32;
+			if (src_reg == BPF_PSEUDO_KFUNC_CALL &&
+			    !emit_inline_kfunc_call(&prog, bpf_prog, insn, !!rw_image))
+				break;
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
 				LOAD_TAIL_CALL_CNT_PTR(stack_depth);
 				ip += 7;

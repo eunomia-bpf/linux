@@ -965,6 +965,14 @@ struct bpf_func_proto {
 	bool (*allowed)(const struct bpf_prog *prog);
 };
 
+struct bpf_kfunc_inline_ops {
+	/* Returns emitted byte count, or negative error to fall back to CALL. */
+	int (*emit_x86)(u8 *image, u32 *off, bool emit,
+			const struct bpf_insn *insn,
+			struct bpf_prog *prog);
+	int max_emit_bytes;
+};
+
 /* bpf_context is intentionally undefined structure. Pointer to bpf_context is
  * the first argument to eBPF programs.
  * For socket filters: 'struct bpf_context *' == 'struct sk_buff *'
@@ -3032,10 +3040,16 @@ const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id,
 						 const struct bpf_prog *prog);
 void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
+int bpf_register_kfunc_inline_ops(const char *func_name,
+				  struct bpf_kfunc_inline_ops *ops);
+void bpf_unregister_kfunc_inline_ops(const char *func_name);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
+const struct bpf_kfunc_inline_ops *
+bpf_jit_find_kfunc_inline_ops(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn);
 int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
 		       u16 btf_fd_idx, u8 **func_addr);
 
@@ -3315,6 +3329,17 @@ static inline void bpf_task_storage_free(struct task_struct *task)
 {
 }
 
+static inline int
+bpf_register_kfunc_inline_ops(const char *func_name,
+			      struct bpf_kfunc_inline_ops *ops)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void bpf_unregister_kfunc_inline_ops(const char *func_name)
+{
+}
+
 static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 {
 	return false;
@@ -3323,6 +3348,13 @@ static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 static inline const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
+{
+	return NULL;
+}
+
+static inline const struct bpf_kfunc_inline_ops *
+bpf_jit_find_kfunc_inline_ops(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn)
 {
 	return NULL;
 }
