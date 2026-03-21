@@ -3170,12 +3170,9 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 
 	if (prog->orig_prog || aux->attach_btf || aux->attach_btf_id ||
 	    aux->dst_prog || aux->dst_trampoline || aux->func_cnt ||
-	    aux->real_func_cnt || aux->used_map_cnt || aux->used_btf_cnt ||
-	    aux->used_maps || aux->used_btfs || aux->poke_tab ||
-	    aux->size_poke_tab || aux->kfunc_tab || aux->kfunc_btf_tab ||
-	    aux->ctx_arg_info || aux->btf || aux->func_info ||
-	    aux->func_info_aux || aux->linfo || aux->jited_linfo ||
-	    aux->extable || aux->num_exentries || aux->jit_data ||
+	    aux->real_func_cnt || aux->used_map_cnt || aux->used_maps ||
+	    aux->poke_tab || aux->size_poke_tab || aux->kfunc_tab ||
+	    aux->kfunc_btf_tab || aux->ctx_arg_info || aux->jit_data ||
 	    aux->priv_stack_ptr || rcu_access_pointer(aux->st_ops_assoc))
 		return false;
 
@@ -3190,6 +3187,18 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 
 	swap(prog->aux->orig_insns, tmp->aux->orig_insns);
 	swap(prog->aux->orig_prog_len, tmp->aux->orig_prog_len);
+	swap(prog->aux->used_btfs, tmp->aux->used_btfs);
+	swap(prog->aux->used_btf_cnt, tmp->aux->used_btf_cnt);
+	swap(prog->aux->btf, tmp->aux->btf);
+	swap(prog->aux->func_info, tmp->aux->func_info);
+	swap(prog->aux->func_info_aux, tmp->aux->func_info_aux);
+	swap(prog->aux->func_info_cnt, tmp->aux->func_info_cnt);
+	swap(prog->aux->linfo, tmp->aux->linfo);
+	swap(prog->aux->jited_linfo, tmp->aux->jited_linfo);
+	swap(prog->aux->nr_linfo, tmp->aux->nr_linfo);
+	swap(prog->aux->linfo_idx, tmp->aux->linfo_idx);
+	swap(prog->aux->num_exentries, tmp->aux->num_exentries);
+	swap(prog->aux->extable, tmp->aux->extable);
 	swap(prog->aux->priv_stack_ptr, tmp->aux->priv_stack_ptr);
 	swap(prog->aux->jit_data, tmp->aux->jit_data);
 
