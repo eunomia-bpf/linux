@@ -3306,14 +3306,18 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 					      bool is_insert)
 {
 	struct bpf_map *map;
-	int id = 0;
+	u32 id = 0;
 
-	rcu_read_lock();
-	while ((map = idr_get_next(&map_idr, &id))) {
+	/* Use bpf_map_get_curr_or_next() which takes a map reference,
+	 * allowing us to drop all locks before calling map_poke_run
+	 * (which may sleep via synchronize_rcu inside text_poke).
+	 */
+	while ((map = bpf_map_get_curr_or_next(&id))) {
 		struct bpf_array *array;
 		u32 key;
 
 		if (map->map_type != BPF_MAP_TYPE_PROG_ARRAY) {
+			bpf_map_put(map);
 			id++;
 			continue;
 		}
@@ -3331,9 +3335,9 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 				map->ops->map_poke_run(map, key, prog, NULL);
 			mutex_unlock(&array->aux->poke_mutex);
 		}
+		bpf_map_put(map);
 		id++;
 	}
-	rcu_read_unlock();
 }
 
 static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
