@@ -3171,6 +3171,13 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	    rcu_access_pointer(aux->st_ops_assoc))
 		return false;
 
+	/* Live trampoline attachments (fentry/fexit/fmod_ret/freplace/LSM)
+	 * are allowed: after REJIT succeeds, we refresh all associated
+	 * trampolines and XDP dispatchers to pick up the new bpf_func.
+	 * The tramp_attach_cnt check is kept here for future use if we
+	 * need to disable trampoline REJIT support.
+	 */
+
 	return true;
 }
 
@@ -3251,6 +3258,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 {
 	union bpf_attr load_attr = {};
 	bpfptr_t load_uattr = KERNEL_BPFPTR(&load_attr);
+	int *kfd_array = NULL;
 	struct bpf_prog *prog, *tmp = NULL;
 	int err;
 
@@ -3283,8 +3291,33 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	load_attr.log_buf = attr->rejit.log_buf;
 	load_attr.prog_flags = (prog->sleepable ? BPF_F_SLEEPABLE : 0) |
 			       (prog->aux->xdp_has_frags ? BPF_F_XDP_HAS_FRAGS : 0);
-	load_attr.fd_array = attr->rejit.fd_array;
 	load_attr.fd_array_cnt = attr->rejit.fd_array_cnt;
+
+	/* Copy fd_array from userspace into a kernel buffer so that
+	 * KERNEL_BPFPTR semantics work correctly in the verifier.
+	 * Without this, the verifier would try copy_from_kernel_nofault()
+	 * on a user-space address, causing EFAULT.
+	 */
+	if (attr->rejit.fd_array && attr->rejit.fd_array_cnt) {
+		size_t fda_size = (size_t)attr->rejit.fd_array_cnt * sizeof(int);
+
+		if (fda_size / sizeof(int) != attr->rejit.fd_array_cnt) {
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		kfd_array = kvmalloc(fda_size, GFP_USER);
+		if (!kfd_array) {
+			err = -ENOMEM;
+			goto out_unlock;
+		}
+		if (copy_from_user(kfd_array,
+				   u64_to_user_ptr(attr->rejit.fd_array),
+				   fda_size)) {
+			err = -EFAULT;
+			goto out_unlock;
+		}
+		load_attr.fd_array = (__u64)(unsigned long)kfd_array;
+	}
 
 	tmp = bpf_prog_alloc(bpf_prog_size(attr->rejit.insn_cnt), GFP_USER);
 	err = -ENOMEM;
@@ -3351,7 +3384,29 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited)
 		goto free_tmp_noref;
 
-	bpf_prog_rejit_swap(prog, tmp);
+	{
+		/* Save old bpf_func before swap for trampoline/freplace refresh */
+		bpf_func_t old_bpf_func = prog->bpf_func;
+		int refresh_err;
+
+		bpf_prog_rejit_swap(prog, tmp);
+
+		/* Refresh all backends that cache raw bpf_func addresses.
+		 * This must happen AFTER bpf_func is updated but BEFORE the
+		 * old JIT image is freed (via synchronize_rcu + put below).
+		 */
+
+		/* Phase 2: Refresh trampolines (fentry/fexit/fmod_ret/LSM/freplace) */
+		refresh_err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
+		if (refresh_err)
+			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
+				refresh_err);
+
+		/* Phase 1: Refresh XDP dispatcher if this prog is registered */
+		if (prog->type == BPF_PROG_TYPE_XDP)
+			bpf_prog_refresh_xdp(prog);
+	}
+
 	if (prog->sleepable)
 		synchronize_rcu_tasks_trace();
 	else
@@ -3742,6 +3797,9 @@ static void bpf_tracing_link_release(struct bpf_link *link)
 						tr_link->trampoline,
 						tr_link->tgt_prog));
 
+	/* Decrement live trampoline attachment counter for REJIT detection */
+	atomic_dec(&link->prog->aux->tramp_attach_cnt);
+
 	bpf_trampoline_put(tr_link->trampoline);
 
 	/* tgt_prog is NULL if target is a kernel function */
@@ -3983,6 +4041,9 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 
 	link->tgt_prog = tgt_prog;
 	link->trampoline = tr;
+
+	/* Track this live trampoline attachment for REJIT support detection */
+	atomic_inc(&prog->aux->tramp_attach_cnt);
 
 	/* Always clear the trampoline and target prog from prog->aux to make
 	 * sure the original attach destination is not kept alive after a

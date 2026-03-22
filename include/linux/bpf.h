@@ -970,6 +970,18 @@ struct bpf_kfunc_inline_ops {
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
 			const struct bpf_insn *insn,
 			struct bpf_prog *prog);
+	/*
+	 * ARM64 emit callback.  Returns the number of A64 instructions
+	 * emitted (each 4 bytes), or negative error to fall back to BL.
+	 * @image:  ctx->image pointer (may be NULL during sizing pass)
+	 * @idx:    pointer to current instruction index in image[]
+	 * @emit:   true when actually writing, false for sizing pass
+	 * @insn:   the BPF_PSEUDO_KFUNC_CALL instruction
+	 * @prog:   the BPF program being JIT-compiled
+	 */
+	int (*emit_arm64)(u32 *image, int *idx, bool emit,
+			  const struct bpf_insn *insn,
+			  struct bpf_prog *prog);
 	int max_emit_bytes;
 };
 
@@ -1367,6 +1379,14 @@ struct bpf_trampoline {
 	struct bpf_tramp_image *cur_image;
 };
 
+/* Reverse index: tracks which trampolines use a given prog's bpf_func.
+ * Linked into prog->aux->trampoline_users. Protected by trampoline_mutex.
+ */
+struct bpf_tramp_user {
+	struct list_head list;          /* linked into prog->aux->trampoline_users */
+	struct bpf_trampoline *tr;
+};
+
 struct bpf_attach_target_info {
 	struct btf_func_model fmodel;
 	long tgt_addr;
@@ -1539,6 +1559,8 @@ int arch_prepare_bpf_dispatcher(void *image, void *buf, s64 *funcs, int num_func
 #define BPF_DISPATCHER_PTR(name) (&bpf_dispatcher_##name)
 void bpf_dispatcher_change_prog(struct bpf_dispatcher *d, struct bpf_prog *from,
 				struct bpf_prog *to);
+void bpf_dispatcher_refresh_prog(struct bpf_dispatcher *d,
+				 struct bpf_prog *prog);
 /* Called only from JIT-enabled code, so there's no need for stubs. */
 void bpf_image_ksym_init(void *data, unsigned int size, struct bpf_ksym *ksym);
 void bpf_image_ksym_add(struct bpf_ksym *ksym);
@@ -1549,6 +1571,7 @@ bool bpf_has_frame_pointer(unsigned long ip);
 int bpf_jit_charge_modmem(u32 size);
 void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
+int bpf_trampoline_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 					   struct bpf_trampoline *tr,
@@ -1575,6 +1598,13 @@ static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
 static inline void bpf_dispatcher_change_prog(struct bpf_dispatcher *d,
 					      struct bpf_prog *from,
 					      struct bpf_prog *to) {}
+static inline void bpf_dispatcher_refresh_prog(struct bpf_dispatcher *d,
+					       struct bpf_prog *prog) {}
+static inline int bpf_trampoline_refresh_prog(struct bpf_prog *prog,
+					      bpf_func_t old_bpf_func)
+{
+	return 0;
+}
 static inline bool is_bpf_image_address(unsigned long address)
 {
 	return false;
@@ -1684,6 +1714,8 @@ struct bpf_prog_aux {
 	struct bpf_ctx_arg_aux *ctx_arg_info;
 	void __percpu *priv_stack_ptr;
 	struct mutex rejit_mutex; /* serializes BPF_PROG_REJIT on this prog */
+	atomic_t tramp_attach_cnt; /* count of live trampoline/freplace attachments */
+	struct list_head trampoline_users; /* trampolines using this prog, protected by trampoline_mutex */
 	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
 	struct bpf_prog *dst_prog;
 	struct bpf_trampoline *dst_trampoline;

@@ -1192,6 +1192,43 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
+/*
+ * Try to inline a kfunc call using the module-provided ARM64 emit callback.
+ * Returns 0 on success (instructions emitted / counted), or negative error
+ * to fall back to normal BL emission.
+ *
+ * The ARM64 emit callback writes 32-bit A64 instructions directly into
+ * ctx->image[] using the same ctx->idx cursor that emit() uses, so the
+ * sizing pass (ctx->write == false) and emission pass stay in sync.
+ */
+static int emit_inline_kfunc_call_arm64(struct jit_ctx *ctx,
+					struct bpf_prog *bpf_prog,
+					const struct bpf_insn *insn)
+{
+	const struct bpf_kfunc_inline_ops *ops;
+	int saved_idx, n_insns;
+
+	ops = bpf_jit_find_kfunc_inline_ops(bpf_prog, insn);
+	if (!ops || !ops->emit_arm64)
+		return -ENOENT;
+
+	saved_idx = ctx->idx;
+	n_insns = ops->emit_arm64(ctx->image, &ctx->idx, ctx->write,
+				  insn, bpf_prog);
+	if (n_insns < 0)
+		return n_insns;
+
+	/* Sanity: the callback must advance idx by exactly n_insns */
+	if (ctx->idx - saved_idx != n_insns)
+		return -EFAULT;
+
+	/* Check against declared max (max_emit_bytes is in bytes) */
+	if (n_insns * 4 > ops->max_emit_bytes)
+		return -EFAULT;
+
+	return 0;
+}
+
 /* JITs an eBPF instruction.
  * Returns:
  * 0  - successfully JITed an 8-byte eBPF instruction.
@@ -1593,6 +1630,13 @@ emit_cond_jmp:
 			emit(A64_MRS_SP_EL0(r0), ctx);
 			break;
 		}
+
+		/* Try to inline a kfunc call via module-provided ARM64 emit */
+		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
+		    !emit_inline_kfunc_call_arm64(ctx,
+						  (struct bpf_prog *)ctx->prog,
+						  insn))
+			break;
 
 		ret = bpf_jit_get_func_addr(ctx->prog, insn, extra_pass,
 					    &func_addr, &func_addr_fixed);

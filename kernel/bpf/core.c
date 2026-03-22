@@ -139,6 +139,8 @@ struct bpf_prog *bpf_prog_alloc_no_stats(unsigned int size, gfp_t gfp_extra_flag
 	mutex_init(&fp->aux->ext_mutex);
 	mutex_init(&fp->aux->dst_mutex);
 	mutex_init(&fp->aux->rejit_mutex);
+	atomic_set(&fp->aux->tramp_attach_cnt, 0);
+	INIT_LIST_HEAD(&fp->aux->trampoline_users);
 	mutex_init(&fp->aux->st_ops_assoc_mutex);
 
 #ifdef CONFIG_BPF_SYSCALL

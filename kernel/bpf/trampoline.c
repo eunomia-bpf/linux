@@ -842,12 +842,32 @@ int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 			     struct bpf_trampoline *tr,
 			     struct bpf_prog *tgt_prog)
 {
+	struct bpf_tramp_user *tu;
 	int err;
+
+	/* Pre-allocate reverse index entry before taking locks */
+	tu = kzalloc(sizeof(*tu), GFP_KERNEL);
+	if (!tu)
+		return -ENOMEM;
 
 	mutex_lock(&tr->mutex);
 	err = __bpf_trampoline_link_prog(link, tr, tgt_prog);
+	if (err) {
+		mutex_unlock(&tr->mutex);
+		kfree(tu);
+		return err;
+	}
 	mutex_unlock(&tr->mutex);
-	return err;
+
+	/* Register reverse index: prog -> trampoline.
+	 * Protected by prog's rejit_mutex to avoid lock ordering issues.
+	 */
+	tu->tr = tr;
+	mutex_lock(&link->link.prog->aux->rejit_mutex);
+	list_add(&tu->list, &link->link.prog->aux->trampoline_users);
+	mutex_unlock(&link->link.prog->aux->rejit_mutex);
+
+	return 0;
 }
 
 static int __bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
@@ -885,11 +905,74 @@ int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 			       struct bpf_trampoline *tr,
 			       struct bpf_prog *tgt_prog)
 {
+	struct bpf_tramp_user *tu, *tmp;
 	int err;
 
 	mutex_lock(&tr->mutex);
 	err = __bpf_trampoline_unlink_prog(link, tr, tgt_prog);
 	mutex_unlock(&tr->mutex);
+
+	/* Remove reverse index entry. Protected by rejit_mutex. */
+	mutex_lock(&link->link.prog->aux->rejit_mutex);
+	list_for_each_entry_safe(tu, tmp,
+				 &link->link.prog->aux->trampoline_users,
+				 list) {
+		if (tu->tr == tr) {
+			list_del(&tu->list);
+			kfree(tu);
+			break;
+		}
+	}
+	mutex_unlock(&link->link.prog->aux->rejit_mutex);
+
+	return err;
+}
+
+/**
+ * bpf_trampoline_refresh_prog - regenerate all trampolines using this prog
+ *                                after its bpf_func changed (e.g. REJIT).
+ * @prog:          the prog whose bpf_func was updated
+ * @old_bpf_func:  the previous bpf_func value (needed for freplace text_poke)
+ *
+ * Must be called AFTER bpf_func is updated but BEFORE the old JIT image
+ * is freed. Caller must hold prog->aux->rejit_mutex.
+ *
+ * Returns 0 on success, negative errno on first failure (best-effort
+ * for remaining trampolines).
+ */
+int bpf_trampoline_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
+{
+	struct bpf_tramp_user *tu;
+	int err = 0;
+
+	/* trampoline_users list is protected by rejit_mutex (held by caller) */
+	list_for_each_entry(tu, &prog->aux->trampoline_users, list) {
+		struct bpf_trampoline *tr = tu->tr;
+
+		mutex_lock(&tr->mutex);
+
+		if (tr->extension_prog == prog) {
+			/* freplace: re-poke the jump target at the function
+			 * entry point from old_bpf_func to new bpf_func.
+			 */
+			err = bpf_arch_text_poke(tr->func.addr,
+						 BPF_MOD_JUMP, BPF_MOD_JUMP,
+						 (void *)old_bpf_func,
+						 (void *)prog->bpf_func);
+		} else {
+			/* fentry/fexit/fmod_ret/LSM: rebuild trampoline image.
+			 * bpf_trampoline_update() re-reads prog->bpf_func
+			 * from tr->progs_hlist[], picking up the new address.
+			 */
+			err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
+		}
+
+		mutex_unlock(&tr->mutex);
+
+		if (err)
+			break;
+	}
+
 	return err;
 }
 

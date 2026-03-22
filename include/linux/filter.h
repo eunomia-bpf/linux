@@ -1016,6 +1016,7 @@ DECLARE_STATIC_KEY_FALSE(bpf_master_redirect_enabled_key);
 u32 xdp_master_redirect(struct xdp_buff *xdp);
 
 void bpf_prog_change_xdp(struct bpf_prog *prev_prog, struct bpf_prog *prog);
+void bpf_prog_refresh_xdp(struct bpf_prog *prog);
 
 static inline u32 bpf_prog_insn_size(const struct bpf_prog *prog)
 {

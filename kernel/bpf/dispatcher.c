@@ -134,6 +134,32 @@ static void bpf_dispatcher_update(struct bpf_dispatcher *d, int prev_num_progs)
 		d->image_off = noff;
 }
 
+/**
+ * bpf_dispatcher_refresh_prog - rebuild dispatcher image after a prog's
+ *                                bpf_func changed (e.g. REJIT).
+ * @d:    dispatcher
+ * @prog: the prog whose bpf_func was updated in-place
+ *
+ * Unlike bpf_dispatcher_change_prog(), this does NOT add/remove a prog.
+ * It only rebuilds the dispatcher image so that baked-in addresses
+ * reflect the current prog->bpf_func values.
+ */
+void bpf_dispatcher_refresh_prog(struct bpf_dispatcher *d,
+				 struct bpf_prog *prog)
+{
+	if (!d || !prog)
+		return;
+
+	mutex_lock(&d->mutex);
+	if (!d->image || !bpf_dispatcher_find_prog(d, prog))
+		goto out;
+
+	/* Force rebuild: bpf_dispatcher_prepare() re-reads prog->bpf_func */
+	bpf_dispatcher_update(d, d->num_progs);
+out:
+	mutex_unlock(&d->mutex);
+}
+
 void bpf_dispatcher_change_prog(struct bpf_dispatcher *d, struct bpf_prog *from,
 				struct bpf_prog *to)
 {
