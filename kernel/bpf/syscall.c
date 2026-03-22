@@ -3415,13 +3415,13 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
 
 	bpf_prog_kallsyms_add(prog);
-
-	{
-		u32 i;
-
-		for (i = 0; i < prog->aux->real_func_cnt; i++)
-			bpf_prog_kallsyms_add(prog->aux->func[i]);
-	}
+	/* NOTE: subfuncs (prog->aux->func[i]) were already registered in
+	 * bpf_prog_kallsyms by jit_subprogs() during REJIT compilation.
+	 * Do NOT call bpf_prog_kallsyms_add() for them again here - that
+	 * would double-insert into the latch tree and corrupt it.
+	 * The subfuncs' ksym addresses are already correct since they were
+	 * set during JIT compilation of the new image.
+	 */
 }
 
 /* last field in 'union bpf_attr' used by this command */
@@ -3656,7 +3656,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	if (prog->sleepable)
 		synchronize_rcu_tasks_trace();
 	else
-		synchronize_rcu();
+		synchronize_rcu_expedited();
 
 	/* Release the extra dst_prog ref we took for the tmp verifier pass */
 	if (tmp->aux->dst_prog) {

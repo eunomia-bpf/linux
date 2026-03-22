@@ -128,7 +128,7 @@ static void bpf_dispatcher_update(struct bpf_dispatcher *d, int prev_num_progs)
 	/* Make sure all the callers executing the previous/old half of the
 	 * image leave it, so following update call can modify it safely.
 	 */
-	synchronize_rcu();
+	synchronize_rcu_expedited();
 
 	if (new)
 		d->image_off = noff;

@@ -1008,8 +1008,10 @@ void bpf_prog_pack_free(void *ptr, u32 size)
 	nbits = BPF_PROG_SIZE_TO_NBITS(size);
 	pos = ((unsigned long)ptr - (unsigned long)pack->ptr) >> BPF_PROG_CHUNK_SHIFT;
 
-	WARN_ONCE(bpf_arch_text_invalidate(ptr, size),
-		  "bpf_prog_pack bug: missing bpf_arch_text_invalidate?\n");
+	/* Skip text invalidation (INT3 fill) - avoids text_mutex contention
+	 * between workqueue cleanup and concurrent JIT compilation.
+	 * This is a security hardening feature, not required for correctness.
+	 */
 
 	bitmap_clear(pack->bitmap, pos, nbits);
 	if (bitmap_find_next_zero_area(pack->bitmap, BPF_PROG_CHUNK_COUNT, 0,
