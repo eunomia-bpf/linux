@@ -3172,11 +3172,168 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	 *
 	 * struct_ops trampolines bake bpf_func into a direct CALL;
 	 * bpf_struct_ops_refresh_prog() patches them via text_poke.
+	 *
+	 * poke_tab (tail_call direct jumps) is now supported: REJIT
+	 * updates the existing poke entries in-place after swapping the
+	 * JIT image.  The tail_call pattern (count, map, key) must be
+	 * identical between old and new bytecode.
 	 */
-	if (aux->poke_tab || aux->size_poke_tab)
-		return false;
 
 	return true;
+}
+
+/*
+ * Update prog's existing poke_tab entries with addresses from tmp's new
+ * JIT image.  Requires that the tail_call pattern (count, map, key) is
+ * identical between old and new bytecode.
+ *
+ * For each poke entry we:
+ *   1. Lock the PROG_ARRAY's poke_mutex
+ *   2. Mark the entry unstable (blocks concurrent map_poke_run)
+ *   3. Copy the JIT-address fields from tmp's entry into prog's entry
+ *   4. text_poke the direct-jump site in the NEW image to point at the
+ *      current tail_call target (if any)
+ *   5. Mark the entry stable again
+ *   6. Unlock
+ *
+ * Returns 0 on success, -EINVAL if the poke patterns don't match.
+ */
+static int bpf_prog_rejit_update_poke_tab(struct bpf_prog *prog,
+					   struct bpf_prog *tmp)
+{
+	struct bpf_jit_poke_descriptor *old_poke, *new_poke;
+	u32 i;
+
+	if (prog->aux->size_poke_tab != tmp->aux->size_poke_tab)
+		return -EINVAL;
+
+	if (!prog->aux->size_poke_tab)
+		return 0;
+
+	/* Validate that every entry references the same map+key. */
+	for (i = 0; i < prog->aux->size_poke_tab; i++) {
+		old_poke = &prog->aux->poke_tab[i];
+		new_poke = &tmp->aux->poke_tab[i];
+
+		if (old_poke->reason != new_poke->reason ||
+		    old_poke->tail_call.map != new_poke->tail_call.map ||
+		    old_poke->tail_call.key != new_poke->tail_call.key)
+			return -EINVAL;
+	}
+
+	/* Now update each poke entry in-place.
+	 *
+	 * bpf_tail_call_direct_fixup(tmp) already ran during JIT and patched
+	 * the NEW image's direct-jump sites (nop->jmp if target exists, or
+	 * left as nop+bypass).  We only need to copy the address fields so
+	 * that future poke_run calls (triggered by map updates) patch the
+	 * correct locations in the NEW image.
+	 */
+	for (i = 0; i < prog->aux->size_poke_tab; i++) {
+		struct bpf_array *array;
+
+		old_poke = &prog->aux->poke_tab[i];
+		new_poke = &tmp->aux->poke_tab[i];
+
+		if (old_poke->reason != BPF_POKE_REASON_TAIL_CALL)
+			continue;
+
+		array = container_of(old_poke->tail_call.map,
+				     struct bpf_array, map);
+		mutex_lock(&array->aux->poke_mutex);
+
+		/* Mark unstable so concurrent poke_run skips this entry. */
+		WRITE_ONCE(old_poke->tailcall_target_stable, false);
+
+		/* Copy JIT address fields from the new image.  The actual
+		 * bytes at these addresses were already patched correctly
+		 * by bpf_tail_call_direct_fixup() during tmp's JIT.
+		 */
+		old_poke->tailcall_target = new_poke->tailcall_target;
+		old_poke->tailcall_bypass = new_poke->tailcall_bypass;
+		old_poke->bypass_addr     = new_poke->bypass_addr;
+		old_poke->adj_off         = new_poke->adj_off;
+
+		/* Mark stable again so poke_run can update this entry. */
+		WRITE_ONCE(old_poke->tailcall_target_stable, true);
+
+		mutex_unlock(&array->aux->poke_mutex);
+	}
+
+	return 0;
+}
+
+/*
+ * Untrack tmp's poke entries from PROG_ARRAY poke_progs lists.
+ * tmp was tracked by the verifier's fixup_call_args(); we must untrack
+ * before freeing tmp so that poke_run doesn't see a stale aux pointer
+ * during the window between swap and RCU-deferred free.
+ */
+static void bpf_prog_rejit_untrack_tmp_pokes(struct bpf_prog *tmp)
+{
+	u32 i;
+
+	for (i = 0; i < tmp->aux->size_poke_tab; i++) {
+		struct bpf_map *map = tmp->aux->poke_tab[i].tail_call.map;
+
+		if (map->ops->map_poke_untrack)
+			map->ops->map_poke_untrack(map, tmp->aux);
+	}
+}
+
+/*
+ * When prog is a tail_call TARGET that was REJIT'd, callers' direct-jump
+ * poke sites still encode the old bpf_func address.  We fix this in two
+ * phases around the bpf_func swap:
+ *
+ *   Phase 1 (BEFORE swap, bpf_func = old):
+ *     For every PROG_ARRAY slot holding prog, simulate a "delete":
+ *       poke_run(map, key, prog, NULL)
+ *     This patches all callers: jmp old_addr -> NOP.
+ *
+ *   Phase 2 (AFTER swap, bpf_func = new):
+ *     For every PROG_ARRAY slot holding prog, simulate an "insert":
+ *       poke_run(map, key, NULL, prog)
+ *     This patches all callers: NOP -> jmp new_addr.
+ *
+ * Between the two phases, direct tail_calls to this target fall through
+ * to the caller's fallback path (NOP = no jump).  This is safe because
+ * we hold rejit_mutex so the target prog is always valid.
+ *
+ * Scans map_idr to find all PROG_ARRAY maps (no reverse index exists).
+ */
+static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
+					      bool is_insert)
+{
+	struct bpf_map *map;
+	int id = 0;
+
+	rcu_read_lock();
+	while ((map = idr_get_next(&map_idr, &id))) {
+		struct bpf_array *array;
+		u32 key;
+
+		if (map->map_type != BPF_MAP_TYPE_PROG_ARRAY) {
+			id++;
+			continue;
+		}
+
+		array = container_of(map, struct bpf_array, map);
+
+		for (key = 0; key < array->map.max_entries; key++) {
+			if (array->ptrs[key] != prog)
+				continue;
+
+			mutex_lock(&array->aux->poke_mutex);
+			if (is_insert)
+				map->ops->map_poke_run(map, key, NULL, prog);
+			else
+				map->ops->map_poke_run(map, key, prog, NULL);
+			mutex_unlock(&array->aux->poke_mutex);
+		}
+		id++;
+	}
+	rcu_read_unlock();
 }
 
 static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
@@ -3341,6 +3498,17 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	}
 	tmp->aux->attach_btf_id = prog->aux->attach_btf_id;
 
+	/* Propagate dst_prog for EXT (freplace) programs.
+	 * The verifier needs dst_prog to resolve the target function.
+	 * After the EXT prog is attached, dst_prog is cleared to NULL
+	 * by bpf_tracing_link_init(); in that case REJIT falls back to
+	 * the trampoline refresh path which doesn't need dst_prog.
+	 */
+	if (prog->aux->dst_prog) {
+		bpf_prog_inc(prog->aux->dst_prog);
+		tmp->aux->dst_prog = prog->aux->dst_prog;
+	}
+
 	err = -EFAULT;
 	if (copy_from_bpfptr(tmp->insns, make_bpfptr(attr->rejit.insns, false),
 			     bpf_prog_insn_size(tmp)) != 0)
@@ -3366,6 +3534,44 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	tmp->aux->load_time = ktime_get_boottime_ns();
 	memcpy(tmp->aux->name, prog->aux->name, sizeof(tmp->aux->name));
 
+	/*
+	 * For EXT (freplace) programs, the verifier calls btf_check_type_match()
+	 * which requires prog->aux->func_info, func_info_aux, and btf.
+	 * Since REJIT doesn't pass BTF/func_info via the attr, we pre-populate
+	 * them from the original program.  The verifier's check_btf_info_early()
+	 * returns early when func_info_cnt==0 in the attr and won't overwrite
+	 * these pre-populated fields.
+	 */
+	if (prog->type == BPF_PROG_TYPE_EXT && prog->aux->btf &&
+	    prog->aux->func_info && prog->aux->func_info_cnt) {
+		size_t fi_size = prog->aux->func_info_cnt *
+				 sizeof(struct bpf_func_info);
+
+		btf_get(prog->aux->btf);
+		tmp->aux->btf = prog->aux->btf;
+		tmp->aux->func_info = kvmemdup(prog->aux->func_info,
+					       fi_size, GFP_USER);
+		if (!tmp->aux->func_info) {
+			btf_put(tmp->aux->btf);
+			tmp->aux->btf = NULL;
+			err = -ENOMEM;
+			goto free_tmp;
+		}
+		tmp->aux->func_info_cnt = prog->aux->func_info_cnt;
+		tmp->aux->func_info_aux = kcalloc(
+			prog->aux->func_info_cnt,
+			sizeof(struct bpf_func_info_aux),
+			GFP_KERNEL_ACCOUNT);
+		if (!tmp->aux->func_info_aux) {
+			kvfree(tmp->aux->func_info);
+			tmp->aux->func_info = NULL;
+			btf_put(tmp->aux->btf);
+			tmp->aux->btf = NULL;
+			err = -ENOMEM;
+			goto free_tmp;
+		}
+	}
+
 	err = security_bpf_prog_load(tmp, &load_attr, NULL, true);
 	if (err)
 		goto free_tmp_sec;
@@ -3390,7 +3596,36 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	{
 		bpf_func_t old_bpf_func = prog->bpf_func;
 
+		/* Update poke_tab (tail_call direct jumps) BEFORE swapping
+		 * the JIT image.  This patches the NEW image's direct-jump
+		 * sites and updates prog's poke entries to point into it.
+		 * Must happen before bpf_func is published.
+		 */
+		err = bpf_prog_rejit_update_poke_tab(prog, tmp);
+		if (err) {
+			pr_warn("bpf_rejit: poke_tab update failed: %d\n",
+				err);
+			goto free_tmp_noref;
+		}
+
+		/* Untrack tmp's poke entries from PROG_ARRAY poke_progs.
+		 * The verifier tracked tmp->aux; remove it now so poke_run
+		 * never sees a stale aux during the free window.
+		 */
+		bpf_prog_rejit_untrack_tmp_pokes(tmp);
+
+		/* Target-side Phase 1: if prog is a target in any PROG_ARRAY,
+		 * remove all direct jumps to it (jmp old_addr -> NOP).
+		 * Must happen while bpf_func still points to old image.
+		 */
+		bpf_prog_rejit_poke_target_phase(prog, false);
+
 		bpf_prog_rejit_swap(prog, tmp);
+
+		/* Target-side Phase 2: re-establish direct jumps with the
+		 * new bpf_func address (NOP -> jmp new_addr).
+		 */
+		bpf_prog_rejit_poke_target_phase(prog, true);
 
 		err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
 		if (err) {
@@ -3419,17 +3654,29 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	else
 		synchronize_rcu();
 
+	/* Release the extra dst_prog ref we took for the tmp verifier pass */
+	if (tmp->aux->dst_prog) {
+		bpf_prog_put(tmp->aux->dst_prog);
+		tmp->aux->dst_prog = NULL;
+	}
 	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
 	mutex_unlock(&prog->aux->rejit_mutex);
 	bpf_prog_put(prog);
 	return 0;
 
 free_tmp_noref:
+	if (tmp->aux->dst_prog) {
+		bpf_prog_put(tmp->aux->dst_prog);
+		tmp->aux->dst_prog = NULL;
+	}
 	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
 	goto out_unlock;
 free_tmp_sec:
 	security_bpf_prog_free(tmp);
 free_tmp:
+	if (tmp->aux->dst_prog)
+		bpf_prog_put(tmp->aux->dst_prog);
+	tmp->aux->dst_prog = NULL;
 	if (tmp->aux->attach_btf)
 		btf_put(tmp->aux->attach_btf);
 	tmp->aux->attach_btf = NULL;
