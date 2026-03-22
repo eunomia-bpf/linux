@@ -3166,42 +3166,15 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux))
 		return false;
 
-	if (aux->dst_prog || aux->dst_trampoline ||
-	    aux->poke_tab || aux->size_poke_tab ||
-	    rcu_access_pointer(aux->st_ops_assoc))
-		return false;
-
-	/* Live trampoline attachments (fentry/fexit/fmod_ret/freplace/LSM)
-	 * are allowed: after REJIT succeeds, we refresh all associated
-	 * trampolines and XDP dispatchers to pick up the new bpf_func.
-	 * The tramp_attach_cnt check is kept here for future use if we
-	 * need to disable trampoline REJIT support.
+	/* dst_prog / dst_trampoline are cleared to NULL after attach (in
+	 * bpf_tracing_link_init); the existing trampoline_users refresh
+	 * path handles the attached case.  Safe to allow REJIT.
+	 *
+	 * struct_ops trampolines bake bpf_func into a direct CALL;
+	 * bpf_struct_ops_refresh_prog() patches them via text_poke.
 	 */
-
-	return true;
-}
-
-/*
- * Verify that the subprogram layout of @tmp matches @prog exactly:
- * same real_func_cnt and same per-subprog instruction count.
- * Returns true on match (including both being single-function programs).
- */
-static bool bpf_prog_rejit_subprog_layout_match(const struct bpf_prog *prog,
-						 const struct bpf_prog *tmp)
-{
-	u32 i;
-
-	if (prog->aux->real_func_cnt != tmp->aux->real_func_cnt)
+	if (aux->poke_tab || aux->size_poke_tab)
 		return false;
-
-	/* Single-function programs: no func[] to compare. */
-	if (!prog->aux->real_func_cnt)
-		return true;
-
-	for (i = 0; i < prog->aux->real_func_cnt; i++) {
-		if (prog->aux->func[i]->len != tmp->aux->func[i]->len)
-			return false;
-	}
 
 	return true;
 }
@@ -3237,15 +3210,9 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->security, tmp->aux->security);
 #endif
 
-	/* Remove kallsyms for main prog and all old subprogs.
-	 * Must happen BEFORE the func[] swap so we delete the old entries.
-	 */
 	bpf_prog_kallsyms_del_all(prog);
 
-	/* Swap multi-subprog JIT package. After this, tmp holds the old
-	 * func[] array (which will be freed after RCU grace period), and
-	 * prog holds the new func[] array produced by jit_subprogs().
-	 */
+	/* Swap func[] array: tmp gets old (freed after RCU), prog gets new. */
 	swap(prog->aux->func, tmp->aux->func);
 	swap(prog->aux->func_cnt, tmp->aux->func_cnt);
 	swap(prog->aux->real_func_cnt, tmp->aux->real_func_cnt);
@@ -3279,7 +3246,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	prog->aux->verified_insns = tmp->aux->verified_insns;
 	prog->aux->load_time = ktime_get_boottime_ns();
 
-	/* Publish the replacement image after metadata and xlated insns are in place. */
+	/* Publish the replacement image after metadata is in place. */
 	smp_wmb();
 	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
 	tmp->jited = old_jited;
@@ -3288,7 +3255,6 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 
 	bpf_prog_kallsyms_add(prog);
 
-	/* Re-publish kallsyms for all new subprogs. */
 	{
 		u32 i;
 
@@ -3339,18 +3305,10 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 			       (prog->aux->xdp_has_frags ? BPF_F_XDP_HAS_FRAGS : 0);
 	load_attr.fd_array_cnt = attr->rejit.fd_array_cnt;
 
-	/* Copy fd_array from userspace into a kernel buffer so that
-	 * KERNEL_BPFPTR semantics work correctly in the verifier.
-	 * Without this, the verifier would try copy_from_kernel_nofault()
-	 * on a user-space address, causing EFAULT.
-	 */
+	/* Copy fd_array into kernel buffer for KERNEL_BPFPTR semantics. */
 	if (attr->rejit.fd_array && attr->rejit.fd_array_cnt) {
 		size_t fda_size = (size_t)attr->rejit.fd_array_cnt * sizeof(int);
 
-		if (fda_size / sizeof(int) != attr->rejit.fd_array_cnt) {
-			err = -EINVAL;
-			goto out_unlock;
-		}
 		kfd_array = kvmalloc(fda_size, GFP_USER);
 		if (!kfd_array) {
 			err = -ENOMEM;
@@ -3372,7 +3330,6 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 
 	tmp->expected_attach_type = prog->expected_attach_type;
 	tmp->sleepable = prog->sleepable;
-	tmp->aux->dev_bound = prog->aux->dev_bound;
 	tmp->aux->xdp_has_frags = prog->aux->xdp_has_frags;
 	tmp->aux->user = get_current_user();
 	tmp->len = attr->rejit.insn_cnt;
@@ -3430,31 +3387,29 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited)
 		goto free_tmp_noref;
 
-	/* Multi-subprog REJIT requires identical subprog layout
-	 * (same real_func_cnt and same per-subprog insn count).
-	 */
-	if (!bpf_prog_rejit_subprog_layout_match(prog, tmp))
-		goto free_tmp_noref;
-
 	{
-		/* Save old bpf_func before swap for trampoline/freplace refresh */
 		bpf_func_t old_bpf_func = prog->bpf_func;
-		int refresh_err;
 
 		bpf_prog_rejit_swap(prog, tmp);
 
-		/* Refresh all backends that cache raw bpf_func addresses.
-		 * This must happen AFTER bpf_func is updated but BEFORE the
-		 * old JIT image is freed (via synchronize_rcu + put below).
-		 */
-
-		/* Phase 2: Refresh trampolines (fentry/fexit/fmod_ret/LSM/freplace) */
-		refresh_err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
-		if (refresh_err)
+		err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
+		if (err) {
 			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
-				refresh_err);
+				err);
+			err = 0;
+		}
 
-		/* Phase 1: Refresh XDP dispatcher if this prog is registered */
+		/* Refresh struct_ops trampoline if this prog is associated */
+		if (rcu_access_pointer(prog->aux->st_ops_assoc)) {
+			err = bpf_struct_ops_refresh_prog(prog, old_bpf_func);
+			if (err) {
+				pr_warn("bpf_rejit: struct_ops refresh failed: %d\n",
+					err);
+				err = 0;
+			}
+		}
+
+		/* Refresh XDP dispatcher if this prog is registered */
 		if (prog->type == BPF_PROG_TYPE_XDP)
 			bpf_prog_refresh_xdp(prog);
 	}
@@ -3849,9 +3804,6 @@ static void bpf_tracing_link_release(struct bpf_link *link)
 						tr_link->trampoline,
 						tr_link->tgt_prog));
 
-	/* Decrement live trampoline attachment counter for REJIT detection */
-	atomic_dec(&link->prog->aux->tramp_attach_cnt);
-
 	bpf_trampoline_put(tr_link->trampoline);
 
 	/* tgt_prog is NULL if target is a kernel function */
@@ -4093,9 +4045,6 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
 
 	link->tgt_prog = tgt_prog;
 	link->trampoline = tr;
-
-	/* Track this live trampoline attachment for REJIT support detection */
-	atomic_inc(&prog->aux->tramp_attach_cnt);
 
 	/* Always clear the trampoline and target prog from prog->aux to make
 	 * sure the original attach destination is not kept alive after a

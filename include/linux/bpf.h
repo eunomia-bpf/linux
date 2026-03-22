@@ -970,15 +970,6 @@ struct bpf_kfunc_inline_ops {
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
 			const struct bpf_insn *insn,
 			struct bpf_prog *prog);
-	/*
-	 * ARM64 emit callback.  Returns the number of A64 instructions
-	 * emitted (each 4 bytes), or negative error to fall back to BL.
-	 * @image:  ctx->image pointer (may be NULL during sizing pass)
-	 * @idx:    pointer to current instruction index in image[]
-	 * @emit:   true when actually writing, false for sizing pass
-	 * @insn:   the BPF_PSEUDO_KFUNC_CALL instruction
-	 * @prog:   the BPF program being JIT-compiled
-	 */
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
 			  const struct bpf_insn *insn,
 			  struct bpf_prog *prog);
@@ -1379,11 +1370,9 @@ struct bpf_trampoline {
 	struct bpf_tramp_image *cur_image;
 };
 
-/* Reverse index: tracks which trampolines use a given prog's bpf_func.
- * Linked into prog->aux->trampoline_users. Protected by trampoline_mutex.
- */
+/* Reverse index: prog -> trampolines using its bpf_func. Protected by rejit_mutex. */
 struct bpf_tramp_user {
-	struct list_head list;          /* linked into prog->aux->trampoline_users */
+	struct list_head list;
 	struct bpf_trampoline *tr;
 };
 
@@ -1714,8 +1703,7 @@ struct bpf_prog_aux {
 	struct bpf_ctx_arg_aux *ctx_arg_info;
 	void __percpu *priv_stack_ptr;
 	struct mutex rejit_mutex; /* serializes BPF_PROG_REJIT on this prog */
-	atomic_t tramp_attach_cnt; /* count of live trampoline/freplace attachments */
-	struct list_head trampoline_users; /* trampolines using this prog, protected by trampoline_mutex */
+	struct list_head trampoline_users; /* trampolines using this prog, protected by rejit_mutex */
 	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
 	struct bpf_prog *dst_prog;
 	struct bpf_trampoline *dst_trampoline;
@@ -2140,6 +2128,7 @@ int bpf_struct_ops_prepare_trampoline(struct bpf_tramp_links *tlinks,
 				      void **image, u32 *image_off,
 				      bool allow_alloc);
 void bpf_struct_ops_image_free(void *image);
+int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func);
 static inline bool bpf_try_module_get(const void *data, struct module *owner)
 {
 	if (owner == BPF_MODULE_OWNER)

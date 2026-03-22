@@ -1192,15 +1192,7 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
-/*
- * Try to inline a kfunc call using the module-provided ARM64 emit callback.
- * Returns 0 on success (instructions emitted / counted), or negative error
- * to fall back to normal BL emission.
- *
- * The ARM64 emit callback writes 32-bit A64 instructions directly into
- * ctx->image[] using the same ctx->idx cursor that emit() uses, so the
- * sizing pass (ctx->write == false) and emission pass stay in sync.
- */
+/* Try to inline a kfunc call via module-provided ARM64 emit callback. */
 static int emit_inline_kfunc_call_arm64(struct jit_ctx *ctx,
 					struct bpf_prog *bpf_prog,
 					const struct bpf_insn *insn)
@@ -1218,7 +1210,6 @@ static int emit_inline_kfunc_call_arm64(struct jit_ctx *ctx,
 	if (n_insns < 0)
 		return n_insns;
 
-	/* Sanity: the callback must advance idx by exactly n_insns */
 	if (ctx->idx - saved_idx != n_insns)
 		return -EFAULT;
 

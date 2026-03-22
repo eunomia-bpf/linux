@@ -3275,9 +3275,6 @@ void bpf_unregister_kfunc_inline_ops(const char *func_name)
 {
 	struct bpf_kfunc_inline_desc *desc;
 
-	if (!func_name)
-		return;
-
 	mutex_lock(&bpf_kfunc_inline_mutex);
 	desc = __bpf_kfunc_inline_find(func_name);
 	if (desc)

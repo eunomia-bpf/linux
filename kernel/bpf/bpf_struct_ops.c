@@ -1458,6 +1458,82 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog)
 	RCU_INIT_POINTER(prog->aux->st_ops_assoc, NULL);
 }
 
+/* Scan a struct_ops trampoline image for a CALL instruction (0xE8 rel32)
+ * targeting old_target.  Returns the IP of the CALL opcode, or NULL.
+ */
+static void *find_call_site(void *image, u32 image_size, void *old_target)
+{
+	u8 *p, *end;
+
+	end = (u8 *)image + image_size - 5;
+	for (p = image; p <= end; p++) {
+		if (*p == 0xE8) {
+			s32 disp = *(s32 *)(p + 1);
+			void *target = (void *)((long)(p + 5) + disp);
+
+			if (target == old_target)
+				return p;
+		}
+	}
+	return NULL;
+}
+
+/* After REJIT swaps prog->bpf_func, patch the struct_ops trampoline
+ * that has old_bpf_func baked in as a direct CALL target.
+ * Caller holds prog->aux->rejit_mutex.
+ */
+int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
+{
+	struct bpf_struct_ops_map *st_map;
+	struct bpf_map *map;
+	void *call_site;
+	u32 i;
+	int err;
+
+	guard(mutex)(&prog->aux->st_ops_assoc_mutex);
+
+	map = rcu_dereference_protected(prog->aux->st_ops_assoc,
+					lockdep_is_held(&prog->aux->st_ops_assoc_mutex));
+	if (!map || map == BPF_PTR_POISON)
+		return 0;
+
+	st_map = (struct bpf_struct_ops_map *)map;
+
+	for (i = 0; i < st_map->funcs_cnt; i++) {
+		struct bpf_ksym *ksym;
+
+		if (!st_map->links[i])
+			break;
+		if (st_map->links[i]->prog != prog)
+			continue;
+
+		ksym = st_map->ksyms[i];
+		if (!ksym)
+			break;
+
+		call_site = find_call_site((void *)ksym->start,
+					   ksym->end - ksym->start,
+					   (void *)old_bpf_func);
+		if (!call_site) {
+			pr_warn("struct_ops rejit: CALL site not found in trampoline %s\n",
+				ksym->name);
+			return -ENOENT;
+		}
+
+		err = bpf_arch_text_poke(call_site, BPF_MOD_CALL,
+					 BPF_MOD_CALL,
+					 (void *)old_bpf_func,
+					 (void *)prog->bpf_func);
+		if (err) {
+			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
+			return err;
+		}
+		return 0;
+	}
+
+	return 0;
+}
+
 /*
  * Get a reference to the struct_ops struct (i.e., kdata) associated with a
  * program. Should only be called in BPF program context (e.g., in a kfunc).
