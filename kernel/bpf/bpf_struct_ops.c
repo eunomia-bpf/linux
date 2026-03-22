@@ -1528,7 +1528,6 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
 			return err;
 		}
-		return 0;
 	}
 
 	return 0;

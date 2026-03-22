@@ -103,7 +103,8 @@ static int bpf_dispatcher_prepare(struct bpf_dispatcher *d, void *image, void *b
 	return arch_prepare_bpf_dispatcher(image, buf, &ips[0], d->num_progs);
 }
 
-static void bpf_dispatcher_update(struct bpf_dispatcher *d, int prev_num_progs)
+static void bpf_dispatcher_update(struct bpf_dispatcher *d, int prev_num_progs,
+				  bool expedited)
 {
 	void *new, *tmp;
 	u32 noff = 0;
@@ -128,7 +129,10 @@ static void bpf_dispatcher_update(struct bpf_dispatcher *d, int prev_num_progs)
 	/* Make sure all the callers executing the previous/old half of the
 	 * image leave it, so following update call can modify it safely.
 	 */
-	synchronize_rcu_expedited();
+	if (expedited)
+		synchronize_rcu_expedited();
+	else
+		synchronize_rcu();
 
 	if (new)
 		d->image_off = noff;
@@ -142,7 +146,7 @@ void bpf_dispatcher_refresh_prog(struct bpf_dispatcher *d,
 	if (!d->image || !bpf_dispatcher_find_prog(d, prog))
 		goto out;
 
-	bpf_dispatcher_update(d, d->num_progs);
+	bpf_dispatcher_update(d, d->num_progs, true);
 out:
 	mutex_unlock(&d->mutex);
 }
@@ -178,7 +182,7 @@ void bpf_dispatcher_change_prog(struct bpf_dispatcher *d, struct bpf_prog *from,
 	if (!changed)
 		goto out;
 
-	bpf_dispatcher_update(d, prev_num_progs);
+	bpf_dispatcher_update(d, prev_num_progs, false);
 out:
 	mutex_unlock(&d->mutex);
 }

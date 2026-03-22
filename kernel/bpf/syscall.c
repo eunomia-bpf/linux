@@ -3407,6 +3407,17 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	prog->aux->verified_insns = tmp->aux->verified_insns;
 	prog->aux->load_time = ktime_get_boottime_ns();
 
+	/* Copy the verified/rewritten BPF insns from tmp into prog so that
+	 * bpf_prog_get_info_by_fd() (bpftool prog dump xlated) shows the
+	 * current bytecode.  insns is a flexible array embedded in struct
+	 * bpf_prog, so we can only copy if the new insns fit within the
+	 * original allocation.
+	 */
+	if (bpf_prog_size(tmp->len) <= prog->pages * PAGE_SIZE) {
+		memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
+		prog->len = tmp->len;
+	}
+
 	/* Publish the replacement image after metadata is in place. */
 	smp_wmb();
 	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
@@ -3425,7 +3436,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 }
 
 /* last field in 'union bpf_attr' used by this command */
-#define BPF_PROG_REJIT_LAST_FIELD rejit.fd_array_cnt
+#define BPF_PROG_REJIT_LAST_FIELD rejit.flags
 
 static int bpf_prog_rejit(union bpf_attr *attr)
 {
@@ -3436,6 +3447,9 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	int err;
 
 	if (CHECK_ATTR(BPF_PROG_REJIT))
+		return -EINVAL;
+
+	if (attr->rejit.flags)
 		return -EINVAL;
 
 	if (!capable(CAP_BPF) || !capable(CAP_SYS_ADMIN))
@@ -3664,6 +3678,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		tmp->aux->dst_prog = NULL;
 	}
 	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	kvfree(kfd_array);
 	mutex_unlock(&prog->aux->rejit_mutex);
 	bpf_prog_put(prog);
 	return 0;
@@ -3684,10 +3699,15 @@ free_tmp:
 	if (tmp->aux->attach_btf)
 		btf_put(tmp->aux->attach_btf);
 	tmp->aux->attach_btf = NULL;
+	kvfree(tmp->aux->func_info);
+	tmp->aux->func_info = NULL;
+	kfree(tmp->aux->func_info_aux);
+	tmp->aux->func_info_aux = NULL;
 	free_uid(tmp->aux->user);
 	kvfree(tmp->aux->orig_insns);
 	bpf_prog_free(tmp);
 out_unlock:
+	kvfree(kfd_array);
 	mutex_unlock(&prog->aux->rejit_mutex);
 out_put_prog:
 	bpf_prog_put(prog);
