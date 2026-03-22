@@ -3166,8 +3166,8 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux))
 		return false;
 
-	if (aux->dst_prog || aux->dst_trampoline || aux->func_cnt ||
-	    aux->real_func_cnt || aux->poke_tab || aux->size_poke_tab ||
+	if (aux->dst_prog || aux->dst_trampoline ||
+	    aux->poke_tab || aux->size_poke_tab ||
 	    rcu_access_pointer(aux->st_ops_assoc))
 		return false;
 
@@ -3177,6 +3177,31 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	 * The tramp_attach_cnt check is kept here for future use if we
 	 * need to disable trampoline REJIT support.
 	 */
+
+	return true;
+}
+
+/*
+ * Verify that the subprogram layout of @tmp matches @prog exactly:
+ * same real_func_cnt and same per-subprog instruction count.
+ * Returns true on match (including both being single-function programs).
+ */
+static bool bpf_prog_rejit_subprog_layout_match(const struct bpf_prog *prog,
+						 const struct bpf_prog *tmp)
+{
+	u32 i;
+
+	if (prog->aux->real_func_cnt != tmp->aux->real_func_cnt)
+		return false;
+
+	/* Single-function programs: no func[] to compare. */
+	if (!prog->aux->real_func_cnt)
+		return true;
+
+	for (i = 0; i < prog->aux->real_func_cnt; i++) {
+		if (prog->aux->func[i]->len != tmp->aux->func[i]->len)
+			return false;
+	}
 
 	return true;
 }
@@ -3212,7 +3237,20 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->security, tmp->aux->security);
 #endif
 
-	bpf_prog_kallsyms_del(prog);
+	/* Remove kallsyms for main prog and all old subprogs.
+	 * Must happen BEFORE the func[] swap so we delete the old entries.
+	 */
+	bpf_prog_kallsyms_del_all(prog);
+
+	/* Swap multi-subprog JIT package. After this, tmp holds the old
+	 * func[] array (which will be freed after RCU grace period), and
+	 * prog holds the new func[] array produced by jit_subprogs().
+	 */
+	swap(prog->aux->func, tmp->aux->func);
+	swap(prog->aux->func_cnt, tmp->aux->func_cnt);
+	swap(prog->aux->real_func_cnt, tmp->aux->real_func_cnt);
+	swap(prog->aux->bpf_exception_cb, tmp->aux->bpf_exception_cb);
+	swap(prog->aux->exception_boundary, tmp->aux->exception_boundary);
 
 	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
 	prog->jited = tmp->jited;
@@ -3249,6 +3287,14 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
 
 	bpf_prog_kallsyms_add(prog);
+
+	/* Re-publish kallsyms for all new subprogs. */
+	{
+		u32 i;
+
+		for (i = 0; i < prog->aux->real_func_cnt; i++)
+			bpf_prog_kallsyms_add(prog->aux->func[i]);
+	}
 }
 
 /* last field in 'union bpf_attr' used by this command */
@@ -3382,6 +3428,12 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 
 	err = -EOPNOTSUPP;
 	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited)
+		goto free_tmp_noref;
+
+	/* Multi-subprog REJIT requires identical subprog layout
+	 * (same real_func_cnt and same per-subprog insn count).
+	 */
+	if (!bpf_prog_rejit_subprog_layout_match(prog, tmp))
 		goto free_tmp_noref;
 
 	{
