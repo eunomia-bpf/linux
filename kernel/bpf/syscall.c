@@ -2381,7 +2381,7 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
 	kvfree(prog->aux->jited_linfo);
 	kvfree(prog->aux->linfo);
 	kvfree(prog->aux->orig_insns);
-	kfree(prog->aux->kfunc_tab);
+	bpf_free_kfunc_desc_tab(prog->aux->kfunc_tab);
 	kfree(prog->aux->ctx_arg_info);
 	if (prog->aux->attach_btf)
 		btf_put(prog->aux->attach_btf);
@@ -3437,6 +3437,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_REJIT_LAST_FIELD rejit.flags
+#define BPF_PROG_REJIT_MAX_FD_ARRAY 64
 
 static int bpf_prog_rejit(union bpf_attr *attr)
 {
@@ -3457,6 +3458,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 
 	if (!attr->rejit.insns || !attr->rejit.insn_cnt ||
 	    attr->rejit.insn_cnt > BPF_COMPLEXITY_LIMIT_INSNS)
+		return -E2BIG;
+	if (attr->rejit.fd_array_cnt > BPF_PROG_REJIT_MAX_FD_ARRAY)
 		return -E2BIG;
 
 	prog = bpf_prog_get(attr->rejit.prog_fd);

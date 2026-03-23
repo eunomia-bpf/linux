@@ -1383,6 +1383,11 @@ enum {
  * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
  */
 #define BPF_PSEUDO_KFUNC_CALL	2
+/* when bpf_mov->src_reg == BPF_PSEUDO_KINSN_SIDECAR,
+ * the instruction carries packed kinsn metadata for the immediately
+ * following kfunc call.
+ */
+#define BPF_PSEUDO_KINSN_SIDECAR 3
 
 enum bpf_addr_space_cast {
 	BPF_ADDR_SPACE_CAST = 1,
@@ -1932,6 +1937,7 @@ union bpf_attr {
 		__aligned_u64	log_buf;
 		__aligned_u64	fd_array;
 		__u32		fd_array_cnt;
+		__u32		flags;
 	} rejit;
 
 } __attribute__((aligned(8)));
@@ -6708,6 +6714,8 @@ struct bpf_prog_info {
 	__u32 verified_insns;
 	__u32 attach_btf_obj_id;
 	__u32 attach_btf_id;
+	__u32 orig_prog_len;
+	__aligned_u64 orig_prog_insns;
 } __attribute__((aligned(8)));
 
 struct bpf_map_info {

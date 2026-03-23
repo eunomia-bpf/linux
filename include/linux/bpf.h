@@ -3168,6 +3168,7 @@ void bpf_cgrp_storage_free(struct cgroup *cgroup);
 int bpf_register_kinsn_ops(const char *func_name,
 			   const struct bpf_kinsn_ops *ops);
 void bpf_unregister_kinsn_ops(const char *func_name);
+void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
@@ -3465,6 +3466,10 @@ bpf_register_kinsn_ops(const char *func_name,
 }
 
 static inline void bpf_unregister_kinsn_ops(const char *func_name)
+{
+}
+
+static inline void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 {
 }
 

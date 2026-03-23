@@ -199,7 +199,7 @@ void bpf_prog_jit_attempt_done(struct bpf_prog *prog)
 		prog->aux->jited_linfo = NULL;
 	}
 
-	kfree(prog->aux->kfunc_tab);
+	bpf_free_kfunc_desc_tab(prog->aux->kfunc_tab);
 	prog->aux->kfunc_tab = NULL;
 }
 
@@ -1008,10 +1008,12 @@ void bpf_prog_pack_free(void *ptr, u32 size)
 	nbits = BPF_PROG_SIZE_TO_NBITS(size);
 	pos = ((unsigned long)ptr - (unsigned long)pack->ptr) >> BPF_PROG_CHUNK_SHIFT;
 
-	/* Skip text invalidation (INT3 fill) - avoids text_mutex contention
-	 * between workqueue cleanup and concurrent JIT compilation.
-	 * This is a security hardening feature, not required for correctness.
+	/* Poison freed JIT text so stale instructions do not remain executable.
+	 * Live patching already handles I-cache coherency for rewritten text;
+	 * this hardens pack chunks that are about to be recycled.
 	 */
+	WARN_ONCE(bpf_arch_text_invalidate(ptr, size),
+		  "bpf_prog_pack bug: missing bpf_arch_text_invalidate?\n");
 
 	bitmap_clear(pack->bitmap, pos, nbits);
 	if (bitmap_find_next_zero_area(pack->bitmap, BPF_PROG_CHUNK_COUNT, 0,

@@ -13,6 +13,12 @@
 #include <linux/btf_ids.h>
 #include <linux/rcupdate_wait.h>
 #include <linux/poll.h>
+#ifdef CONFIG_X86
+#include <asm/text-patching.h>
+#endif
+#ifdef CONFIG_ARM64
+#include <asm/insn.h>
+#endif
 
 struct bpf_struct_ops_value {
 	struct bpf_struct_ops_common_value common;
@@ -1458,23 +1464,40 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog)
 	RCU_INIT_POINTER(prog->aux->st_ops_assoc, NULL);
 }
 
-/* Scan a struct_ops trampoline image for a CALL instruction (0xE8 rel32)
- * targeting old_target.  Returns the IP of the CALL opcode, or NULL.
+/* Scan a struct_ops trampoline image for a direct call to old_target.
+ * Returns the IP of the call opcode, or NULL.
  */
 static void *find_call_site(void *image, u32 image_size, void *old_target)
 {
-	u8 *p, *end;
+	unsigned long start = (unsigned long)image;
+	unsigned long end = start + image_size;
 
-	end = (u8 *)image + image_size - 5;
-	for (p = image; p <= end; p++) {
-		if (*p == 0xE8) {
+#ifdef CONFIG_X86
+	for (; start + CALL_INSN_SIZE <= end; start++) {
+		u8 *p = (u8 *)start;
+
+		if (*p == CALL_INSN_OPCODE) {
 			s32 disp = *(s32 *)(p + 1);
-			void *target = (void *)((long)(p + 5) + disp);
+			void *target = (void *)((unsigned long)(p + CALL_INSN_SIZE) + disp);
 
 			if (target == old_target)
 				return p;
 		}
 	}
+#elif defined(CONFIG_ARM64)
+	for (; start + sizeof(u32) <= end; start += sizeof(u32)) {
+		u32 *p = (u32 *)start;
+		u32 insn = *p;
+
+		if (aarch64_insn_is_bl(insn)) {
+			void *target = (void *)(start + aarch64_get_branch_offset(insn));
+
+			if (target == old_target)
+				return p;
+		}
+	}
+#endif
+
 	return NULL;
 }
 

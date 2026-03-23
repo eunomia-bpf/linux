@@ -3239,7 +3239,7 @@ bpf_kinsn_lookup(const char *func_name)
 
 	mutex_lock(&bpf_kinsn_mutex);
 	desc = __bpf_kinsn_find(func_name);
-	if (desc)
+	if (desc && try_module_get(desc->ops->owner))
 		ops = desc->ops;
 	mutex_unlock(&bpf_kinsn_mutex);
 
@@ -3424,6 +3424,23 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
 		module_put(tab->descs[tab->nr_descs].module);
 		btf_put(tab->descs[tab->nr_descs].btf);
 	}
+	kfree(tab);
+}
+
+void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
+{
+	u32 i;
+
+	if (!tab)
+		return;
+
+	for (i = 0; i < tab->nr_descs; i++) {
+		const struct bpf_kinsn_ops *ops = tab->descs[i].kinsn_ops;
+
+		if (ops)
+			module_put(ops->owner);
+	}
+
 	kfree(tab);
 }
 
@@ -3626,6 +3643,10 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	desc->func_model = func_model;
 	desc->kinsn_ops = kfunc.flags && (*kfunc.flags & KF_KINSN) ?
 			      bpf_kinsn_lookup(kfunc.name) : NULL;
+	if (kfunc.flags && (*kfunc.flags & KF_KINSN) && !desc->kinsn_ops) {
+		verbose(env, "kfunc %s kinsn ops unavailable\n", kfunc.name);
+		return -ENOENT;
+	}
 	if (desc->kinsn_ops && bpf_kinsn_forbidden_flags(*kfunc.flags)) {
 		verbose(env, "kfunc %s has incompatible KF_KINSN flags\n", kfunc.name);
 		return -EINVAL;
