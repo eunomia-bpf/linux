@@ -27,6 +27,7 @@
 #include <linux/stddef.h>
 #include <linux/bpfptr.h>
 #include <linux/btf.h>
+#include <linux/tnum.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/static_call.h>
 #include <linux/memcontrol.h>
@@ -965,16 +966,116 @@ struct bpf_func_proto {
 	bool (*allowed)(const struct bpf_prog *prog);
 };
 
-struct bpf_kfunc_inline_ops {
-	/* Returns emitted byte count, or negative error to fall back to CALL. */
+enum bpf_kinsn_encoding {
+	BPF_KINSN_ENC_LEGACY_KFUNC = 1 << 0,
+	BPF_KINSN_ENC_PACKED_CALL  = 1 << 1,
+};
+
+enum bpf_kinsn_result_type {
+	BPF_KINSN_RES_VOID,
+	BPF_KINSN_RES_SCALAR,
+};
+
+enum bpf_kinsn_operand_kind {
+	BPF_KINSN_OPERAND_NONE,
+	BPF_KINSN_OPERAND_REG,
+	BPF_KINSN_OPERAND_IMM16,
+	BPF_KINSN_OPERAND_IMM32,
+};
+
+enum bpf_kinsn_mem_flags {
+	BPF_KINSN_MEM_RESULT = 1 << 0,
+};
+
+enum bpf_kinsn_effect_flags {
+	BPF_KINSN_EFFECT_HAS_TNUM = 1 << 0,
+};
+
+struct bpf_kinsn_scalar_state {
+	struct tnum var_off;
+	u64 umin_value;
+	u64 umax_value;
+	s64 smin_value;
+	s64 smax_value;
+	bool subreg32;
+};
+
+struct bpf_kinsn_operand {
+	u8 kind;
+	u8 regno;
+	s16 imm16;
+	s32 imm32;
+};
+
+struct bpf_kinsn_call {
+	u8 encoding;
+	u8 nr_operands;
+	u8 dst_reg;
+	u8 reserved;
+	struct bpf_kinsn_operand operands[4];
+	u64 payload;
+};
+
+struct bpf_kinsn_mem_access {
+	u8 base_reg;
+	u8 size;
+	u8 access_type;
+	u8 flags;
+	s16 off;
+};
+
+struct bpf_kinsn_effect {
+	u32 input_mask;
+	u32 clobber_mask;
+	enum bpf_kinsn_result_type result_type;
+	u8 result_reg;
+	u8 result_size;
+	u8 nr_mem_accesses;
+	u8 flags;
+	struct tnum result_tnum;
+	u64 umin_value;
+	u64 umax_value;
+	s64 smin_value;
+	s64 smax_value;
+	struct bpf_kinsn_mem_access mem_accesses[2];
+};
+
+struct bpf_kinsn_ops {
+	struct module *owner;
+	u16 api_version;
+	u16 max_emit_bytes;
+	u32 supported_encodings;
+
+	int (*decode_call)(const struct bpf_insn *insn,
+			   struct bpf_kinsn_call *call);
+	int (*validate_call)(const struct bpf_kinsn_call *call,
+			     struct bpf_verifier_log *log);
+	int (*model_call)(const struct bpf_kinsn_call *call,
+			  const struct bpf_kinsn_scalar_state *scalar_regs,
+			  struct bpf_kinsn_effect *effect);
+
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
-			const struct bpf_insn *insn,
+			const struct bpf_kinsn_call *call,
 			struct bpf_prog *prog);
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
-			  const struct bpf_insn *insn,
+			  const struct bpf_kinsn_call *call,
 			  struct bpf_prog *prog);
-	int max_emit_bytes;
 };
+
+#define BPF_KINSN_SIDECAR_PAYLOAD_BITS 52
+
+static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
+	       insn->src_reg == BPF_PSEUDO_KINSN_SIDECAR;
+}
+
+static inline u64 bpf_kinsn_sidecar_payload(const struct bpf_insn *insn)
+{
+	return (u64)insn->dst_reg |
+	       ((u64)(u16)insn->off << 4) |
+	       ((u64)(u32)insn->imm << 20);
+}
 
 /* bpf_context is intentionally undefined structure. Pointer to bpf_context is
  * the first argument to eBPF programs.
@@ -3064,16 +3165,19 @@ const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id,
 						 const struct bpf_prog *prog);
 void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
-int bpf_register_kfunc_inline_ops(const char *func_name,
-				  struct bpf_kfunc_inline_ops *ops);
-void bpf_unregister_kfunc_inline_ops(const char *func_name);
+int bpf_register_kinsn_ops(const char *func_name,
+			   const struct bpf_kinsn_ops *ops);
+void bpf_unregister_kinsn_ops(const char *func_name);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
-const struct bpf_kfunc_inline_ops *
-bpf_jit_find_kfunc_inline_ops(const struct bpf_prog *prog,
-			      const struct bpf_insn *insn);
+const struct bpf_kinsn_ops *
+bpf_jit_find_kinsn_ops(const struct bpf_prog *prog,
+		       const struct bpf_insn *insn);
+int bpf_jit_get_kinsn_call(const struct bpf_prog *prog,
+			   const struct bpf_insn *insn,
+			   struct bpf_kinsn_call *call);
 int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
 		       u16 btf_fd_idx, u8 **func_addr);
 
@@ -3354,13 +3458,13 @@ static inline void bpf_task_storage_free(struct task_struct *task)
 }
 
 static inline int
-bpf_register_kfunc_inline_ops(const char *func_name,
-			      struct bpf_kfunc_inline_ops *ops)
+bpf_register_kinsn_ops(const char *func_name,
+		       const struct bpf_kinsn_ops *ops)
 {
 	return -EOPNOTSUPP;
 }
 
-static inline void bpf_unregister_kfunc_inline_ops(const char *func_name)
+static inline void bpf_unregister_kinsn_ops(const char *func_name)
 {
 }
 
@@ -3376,11 +3480,19 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 	return NULL;
 }
 
-static inline const struct bpf_kfunc_inline_ops *
-bpf_jit_find_kfunc_inline_ops(const struct bpf_prog *prog,
-			      const struct bpf_insn *insn)
+static inline const struct bpf_kinsn_ops *
+bpf_jit_find_kinsn_ops(const struct bpf_prog *prog,
+		       const struct bpf_insn *insn)
 {
 	return NULL;
+}
+
+static inline int
+bpf_jit_get_kinsn_call(const struct bpf_prog *prog,
+		       const struct bpf_insn *insn,
+		       struct bpf_kinsn_call *call)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int

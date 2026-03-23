@@ -1192,21 +1192,26 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
-/* Try to inline a kfunc call via module-provided ARM64 emit callback. */
-static int emit_inline_kfunc_call_arm64(struct jit_ctx *ctx,
-					struct bpf_prog *bpf_prog,
-					const struct bpf_insn *insn)
+/* Try to inline a kinsn call via module-provided ARM64 emit callback. */
+static int emit_kinsn_call_arm64(struct jit_ctx *ctx,
+				 struct bpf_prog *bpf_prog,
+				 const struct bpf_insn *insn)
 {
-	const struct bpf_kfunc_inline_ops *ops;
+	const struct bpf_kinsn_ops *ops;
+	struct bpf_kinsn_call call;
 	int saved_idx, n_insns;
 
-	ops = bpf_jit_find_kfunc_inline_ops(bpf_prog, insn);
+	ops = bpf_jit_find_kinsn_ops(bpf_prog, insn);
 	if (!ops || !ops->emit_arm64)
-		return -ENOENT;
+		return -EOPNOTSUPP;
+
+	n_insns = bpf_jit_get_kinsn_call(bpf_prog, insn, &call);
+	if (n_insns)
+		return n_insns;
 
 	saved_idx = ctx->idx;
 	n_insns = ops->emit_arm64(ctx->image, &ctx->idx, ctx->write,
-				  insn, bpf_prog);
+				  &call, bpf_prog);
 	if (n_insns < 0)
 		return n_insns;
 
@@ -1251,6 +1256,9 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 	int off_adj;
 	int ret;
 	bool sign_extend;
+
+	if (bpf_kinsn_is_sidecar_insn(insn))
+		return 0;
 
 	switch (code) {
 	/* dst = src */
@@ -1622,12 +1630,16 @@ emit_cond_jmp:
 			break;
 		}
 
-		/* Try to inline a kfunc call via module-provided ARM64 emit */
+		/* Try to inline a kinsn call via module-provided ARM64 emit */
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
-		    !emit_inline_kfunc_call_arm64(ctx,
-						  (struct bpf_prog *)ctx->prog,
-						  insn))
+		    bpf_jit_find_kinsn_ops((struct bpf_prog *)ctx->prog, insn)) {
+			ret = emit_kinsn_call_arm64(ctx,
+						    (struct bpf_prog *)ctx->prog,
+						    insn);
+			if (ret)
+				return ret;
 			break;
+		}
 
 		ret = bpf_jit_get_func_addr(ctx->prog, insn, extra_pass,
 					    &func_addr, &func_addr_fixed);

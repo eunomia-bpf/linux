@@ -595,6 +595,9 @@ struct bpf_insn_aux_data {
 	u32 scc;
 	/* registers alive before this instruction. */
 	u16 live_regs_before;
+	/* per-call backtracking model for verified kinsn calls */
+	u32 kinsn_clobber_mask;
+	bool kinsn_call;
 };
 
 #define MAX_USED_MAPS 64 /* max number of maps accessed by one eBPF program */

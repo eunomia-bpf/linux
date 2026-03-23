@@ -576,19 +576,24 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
-static int emit_inline_kfunc_call(u8 **pprog, struct bpf_prog *bpf_prog,
-				  const struct bpf_insn *insn, bool emit)
+static int emit_kinsn_call(u8 **pprog, struct bpf_prog *bpf_prog,
+			   const struct bpf_insn *insn, bool emit)
 {
-	const struct bpf_kfunc_inline_ops *ops;
+	const struct bpf_kinsn_ops *ops;
+	struct bpf_kinsn_call call;
 	u8 *prog = *pprog;
 	u32 off = 0;
 	int ret;
 
-	ops = bpf_jit_find_kfunc_inline_ops(bpf_prog, insn);
-	if (!ops)
-		return -ENOENT;
+	ops = bpf_jit_find_kinsn_ops(bpf_prog, insn);
+	if (!ops || !ops->emit_x86)
+		return -EOPNOTSUPP;
 
-	ret = ops->emit_x86(prog, &off, emit, insn, bpf_prog);
+	ret = bpf_jit_get_kinsn_call(bpf_prog, insn, &call);
+	if (ret)
+		return ret;
+
+	ret = ops->emit_x86(prog, &off, emit, &call, bpf_prog);
 	if (ret < 0)
 		return ret;
 	if (ret != off || ret > ops->max_emit_bytes)
@@ -1887,6 +1892,8 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 		case BPF_ALU64 | BPF_MOV | BPF_K:
 		case BPF_ALU | BPF_MOV | BPF_K:
+			if (bpf_kinsn_is_sidecar_insn(insn))
+				break;
 			emit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64,
 				       dst_reg, imm32);
 			break;
@@ -2466,8 +2473,12 @@ populate_extable:
 
 			func = (u8 *) __bpf_call_base + imm32;
 			if (src_reg == BPF_PSEUDO_KFUNC_CALL &&
-			    !emit_inline_kfunc_call(&prog, bpf_prog, insn, !!rw_image))
+			    bpf_jit_find_kinsn_ops(bpf_prog, insn)) {
+				err = emit_kinsn_call(&prog, bpf_prog, insn, !!rw_image);
+				if (err)
+					return err;
 				break;
+			}
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
 				LOAD_TAIL_CALL_CNT_PTR(stack_depth);
 				ip += 7;
