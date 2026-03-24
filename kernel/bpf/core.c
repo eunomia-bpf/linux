@@ -201,6 +201,8 @@ void bpf_prog_jit_attempt_done(struct bpf_prog *prog)
 
 	bpf_free_kfunc_desc_tab(prog->aux->kfunc_tab);
 	prog->aux->kfunc_tab = NULL;
+	bpf_free_kinsn_desc_tab(prog->aux->kinsn_tab);
+	prog->aux->kinsn_tab = NULL;
 }
 
 /* The jit engine is responsible to provide an array

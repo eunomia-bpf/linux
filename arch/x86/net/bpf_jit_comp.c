@@ -576,27 +576,25 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
-static int emit_kinsn_call(u8 **pprog, struct bpf_prog *bpf_prog,
-			   const struct bpf_insn *insn, bool emit)
+static int emit_kinsn_desc_call(u8 **pprog, struct bpf_prog *bpf_prog,
+				const struct bpf_insn *insn, bool emit)
 {
-	const struct bpf_kinsn_ops *ops;
-	struct bpf_kinsn_call call;
+	const struct bpf_kinsn *kinsn;
 	u8 *prog = *pprog;
 	u32 off = 0;
+	u64 payload;
 	int ret;
 
-	ops = bpf_jit_find_kinsn_ops(bpf_prog, insn);
-	if (!ops || !ops->emit_x86)
-		return -EOPNOTSUPP;
-
-	ret = bpf_jit_get_kinsn_call(bpf_prog, insn, &call);
+	ret = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
 	if (ret)
 		return ret;
+	if (!kinsn || !kinsn->emit_x86)
+		return -EOPNOTSUPP;
 
-	ret = ops->emit_x86(prog, &off, emit, &call, bpf_prog);
+	ret = kinsn->emit_x86(prog, &off, emit, payload, bpf_prog);
 	if (ret < 0)
 		return ret;
-	if (ret != off || ret > ops->max_emit_bytes)
+	if (ret != off || ret > kinsn->max_emit_bytes)
 		return -EFAULT;
 
 	*pprog = prog + off;
@@ -995,6 +993,17 @@ static void emit_mov_imm64(u8 **pprog, u32 dst_reg,
 		EMIT(imm32_lo, 4);
 		EMIT(imm32_hi, 4);
 	}
+
+	*pprog = prog;
+}
+
+static void emit_movabs_imm64(u8 **pprog, u32 dst_reg, u64 imm64)
+{
+	u8 *prog = *pprog;
+
+	EMIT2(add_1mod(0x48, dst_reg), add_1reg(0xB8, dst_reg));
+	EMIT((u32)imm64, 4);
+	EMIT((u32)(imm64 >> 32), 4);
 
 	*pprog = prog;
 }
@@ -1609,8 +1618,7 @@ static void emit_priv_frame_ptr(u8 **pprog, void __percpu *priv_frame_ptr)
 	u8 *prog = *pprog;
 
 	/* movabs r9, priv_frame_ptr */
-	emit_mov_imm64(&prog, X86_REG_R9, (__force long) priv_frame_ptr >> 32,
-		       (u32) (__force long) priv_frame_ptr);
+	emit_movabs_imm64(&prog, X86_REG_R9, (u64)(__force long)priv_frame_ptr);
 
 #ifdef CONFIG_SMP
 	/* add <r9>, gs:[<off>] */
@@ -2472,9 +2480,9 @@ populate_extable:
 			u8 *ip = image + addrs[i - 1];
 
 			func = (u8 *) __bpf_call_base + imm32;
-			if (src_reg == BPF_PSEUDO_KFUNC_CALL &&
-			    bpf_jit_find_kinsn_ops(bpf_prog, insn)) {
-				err = emit_kinsn_call(&prog, bpf_prog, insn, !!rw_image);
+			if (src_reg == BPF_PSEUDO_KINSN_CALL) {
+				err = emit_kinsn_desc_call(&prog, bpf_prog, insn,
+							    !!rw_image);
 				if (err)
 					return err;
 				break;

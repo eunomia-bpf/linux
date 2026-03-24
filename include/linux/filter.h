@@ -484,6 +484,16 @@ static inline bool insn_is_cast_user(const struct bpf_insn *insn)
 		.off   = OFF,					\
 		.imm   = IMM })
 
+/* Kinsn descriptor call */
+
+#define BPF_CALL_KINSN(OFF, IMM)				\
+	((struct bpf_insn) {					\
+		.code  = BPF_JMP | BPF_CALL,			\
+		.dst_reg = 0,					\
+		.src_reg = BPF_PSEUDO_KINSN_CALL,		\
+		.off   = OFF,					\
+		.imm   = IMM })
+
 /* Raw code statement block */
 
 #define BPF_RAW_INSN(CODE, DST, SRC, OFF, IMM)			\

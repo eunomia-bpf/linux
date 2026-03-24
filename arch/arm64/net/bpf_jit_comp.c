@@ -1192,34 +1192,28 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
-/* Try to inline a kinsn call via module-provided ARM64 emit callback. */
-static int emit_kinsn_call_arm64(struct jit_ctx *ctx,
-				 struct bpf_prog *bpf_prog,
-				 const struct bpf_insn *insn)
+static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
+				      struct bpf_prog *bpf_prog,
+				      const struct bpf_insn *insn)
 {
-	const struct bpf_kinsn_ops *ops;
-	struct bpf_kinsn_call call;
+	const struct bpf_kinsn *kinsn;
+	u64 payload;
 	int saved_idx, n_insns;
 
-	ops = bpf_jit_find_kinsn_ops(bpf_prog, insn);
-	if (!ops || !ops->emit_arm64)
-		return -EOPNOTSUPP;
-
-	n_insns = bpf_jit_get_kinsn_call(bpf_prog, insn, &call);
+	n_insns = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
 	if (n_insns)
 		return n_insns;
+	if (!kinsn || !kinsn->emit_arm64)
+		return -EOPNOTSUPP;
 
 	saved_idx = ctx->idx;
-	n_insns = ops->emit_arm64(ctx->image, &ctx->idx, ctx->write,
-				  &call, bpf_prog);
+	n_insns = kinsn->emit_arm64(ctx->image, &ctx->idx, ctx->write,
+				    payload, bpf_prog);
 	if (n_insns < 0)
 		return n_insns;
-
 	if (ctx->idx - saved_idx != n_insns)
 		return -EFAULT;
-
-	/* Check against declared max (max_emit_bytes is in bytes) */
-	if (n_insns * 4 > ops->max_emit_bytes)
+	if (n_insns * 4 > kinsn->max_emit_bytes)
 		return -EFAULT;
 
 	return 0;
@@ -1631,11 +1625,10 @@ emit_cond_jmp:
 		}
 
 		/* Try to inline a kinsn call via module-provided ARM64 emit */
-		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL &&
-		    bpf_jit_find_kinsn_ops((struct bpf_prog *)ctx->prog, insn)) {
-			ret = emit_kinsn_call_arm64(ctx,
-						    (struct bpf_prog *)ctx->prog,
-						    insn);
+		if (insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
+			ret = emit_kinsn_desc_call_arm64(ctx,
+							 (struct bpf_prog *)ctx->prog,
+							 insn);
 			if (ret)
 				return ret;
 			break;

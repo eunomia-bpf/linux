@@ -272,6 +272,12 @@ static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
 }
 
+static __maybe_unused bool bpf_pseudo_kinsn_call(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_JMP | BPF_CALL) &&
+	       insn->src_reg == BPF_PSEUDO_KINSN_CALL;
+}
+
 struct bpf_map_desc {
 	struct bpf_map *ptr;
 	int uid;
@@ -3169,10 +3175,10 @@ static int bpf_find_exception_callback_insn_off(struct bpf_verifier_env *env)
 
 #define MAX_KFUNC_DESCS 256
 #define MAX_KFUNC_BTFS	256
+#define MAX_KINSN_DESCS 256
 
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
-	const struct bpf_kinsn_ops *kinsn_ops;
 	u32 func_id;
 	s32 imm;
 	u16 offset;
@@ -3200,109 +3206,23 @@ struct bpf_kfunc_btf_tab {
 	u32 nr_descs;
 };
 
-struct bpf_kinsn_ops_desc {
-	struct list_head list;
-	const struct bpf_kinsn_ops *ops;
-	char *func_name;
+struct bpf_kinsn_desc {
+	const struct bpf_kinsn *kinsn;
+	s32 imm;
+	u16 offset;
 };
 
-static DEFINE_MUTEX(bpf_kinsn_mutex);
-static LIST_HEAD(bpf_kinsn_list);
+struct bpf_kinsn_desc_tab {
+	struct bpf_kinsn_desc descs[MAX_KINSN_DESCS];
+	u32 nr_descs;
+};
 
-static bool bpf_kinsn_forbidden_flags(u32 flags)
-{
-	return flags & (KF_ACQUIRE | KF_RELEASE | KF_RET_NULL |
-			KF_ITER_NEW | KF_ITER_NEXT | KF_ITER_DESTROY |
-			KF_RCU | KF_RCU_PROTECTED | KF_SLEEPABLE |
-			KF_DESTRUCTIVE | KF_FASTCALL | KF_IMPLICIT_ARGS |
-			KF_ARENA_RET | KF_ARENA_ARG1 | KF_ARENA_ARG2);
-}
-
-static struct bpf_kinsn_ops_desc *
-__bpf_kinsn_find(const char *func_name)
-{
-	struct bpf_kinsn_ops_desc *desc;
-
-	list_for_each_entry(desc, &bpf_kinsn_list, list) {
-		if (!strcmp(desc->func_name, func_name))
-			return desc;
-	}
-
-	return NULL;
-}
-
-static const struct bpf_kinsn_ops *
-bpf_kinsn_lookup(const char *func_name)
-{
-	struct bpf_kinsn_ops_desc *desc;
-	const struct bpf_kinsn_ops *ops = NULL;
-
-	mutex_lock(&bpf_kinsn_mutex);
-	desc = __bpf_kinsn_find(func_name);
-	if (desc && try_module_get(desc->ops->owner))
-		ops = desc->ops;
-	mutex_unlock(&bpf_kinsn_mutex);
-
-	return ops;
-}
-
-int bpf_register_kinsn_ops(const char *func_name,
-			   const struct bpf_kinsn_ops *ops)
-{
-	struct bpf_kinsn_ops_desc *desc;
-
-	if (!func_name || !ops || !ops->owner || !ops->model_call ||
-	    (!ops->emit_x86 && !ops->emit_arm64) ||
-	    ops->max_emit_bytes <= 0 || !ops->supported_encodings)
-		return -EINVAL;
-
-	if ((ops->supported_encodings & BPF_KINSN_ENC_PACKED_CALL) &&
-	    !ops->decode_call)
-		return -EINVAL;
-
-	desc = kzalloc(sizeof(*desc), GFP_KERNEL);
-	if (!desc)
-		return -ENOMEM;
-
-	desc->func_name = kstrdup(func_name, GFP_KERNEL);
-	if (!desc->func_name) {
-		kfree(desc);
-		return -ENOMEM;
-	}
-
-	desc->ops = ops;
-
-	mutex_lock(&bpf_kinsn_mutex);
-	if (__bpf_kinsn_find(func_name)) {
-		mutex_unlock(&bpf_kinsn_mutex);
-		kfree(desc->func_name);
-		kfree(desc);
-		return -EEXIST;
-	}
-	list_add_tail(&desc->list, &bpf_kinsn_list);
-	mutex_unlock(&bpf_kinsn_mutex);
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(bpf_register_kinsn_ops);
-
-void bpf_unregister_kinsn_ops(const char *func_name)
-{
-	struct bpf_kinsn_ops_desc *desc;
-
-	mutex_lock(&bpf_kinsn_mutex);
-	desc = __bpf_kinsn_find(func_name);
-	if (desc)
-		list_del(&desc->list);
-	mutex_unlock(&bpf_kinsn_mutex);
-
-	if (!desc)
-		return;
-
-	kfree(desc->func_name);
-	kfree(desc);
-}
-EXPORT_SYMBOL_GPL(bpf_unregister_kinsn_ops);
+static int kinsn_desc_cmp_by_imm_off(const void *a, const void *b);
+static struct bpf_kinsn_desc *
+find_kinsn_desc(const struct bpf_prog *prog, s32 imm, u16 offset);
+static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
+					    const struct bpf_insn *patch, u32 len);
+static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
 
 static int specialize_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_desc *desc,
 			    int insn_idx);
@@ -3362,6 +3282,13 @@ static struct btf *__find_kfunc_desc_btf(struct bpf_verifier_env *env,
 	int btf_fd;
 
 	tab = env->prog->aux->kfunc_btf_tab;
+	if (!tab) {
+		tab = kzalloc_obj(*tab, GFP_KERNEL_ACCOUNT);
+		if (!tab)
+			return ERR_PTR(-ENOMEM);
+		env->prog->aux->kfunc_btf_tab = tab;
+	}
+
 	b = bsearch(&kf_btf, tab->descs, tab->nr_descs,
 		    sizeof(tab->descs[0]), kfunc_btf_cmp_by_off);
 	if (!b) {
@@ -3429,16 +3356,24 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
 
 void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 {
+	if (!tab)
+		return;
+
+	kfree(tab);
+}
+
+void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
+{
 	u32 i;
 
 	if (!tab)
 		return;
 
 	for (i = 0; i < tab->nr_descs; i++) {
-		const struct bpf_kinsn_ops *ops = tab->descs[i].kinsn_ops;
+		const struct bpf_kinsn *kinsn = tab->descs[i].kinsn;
 
-		if (ops)
-			module_put(ops->owner);
+		if (kinsn && kinsn->owner)
+			module_put(kinsn->owner);
 	}
 
 	kfree(tab);
@@ -3641,18 +3576,119 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	desc->offset = offset;
 	desc->addr = addr;
 	desc->func_model = func_model;
-	desc->kinsn_ops = kfunc.flags && (*kfunc.flags & KF_KINSN) ?
-			      bpf_kinsn_lookup(kfunc.name) : NULL;
-	if (kfunc.flags && (*kfunc.flags & KF_KINSN) && !desc->kinsn_ops) {
-		verbose(env, "kfunc %s kinsn ops unavailable\n", kfunc.name);
-		return -ENOENT;
-	}
-	if (desc->kinsn_ops && bpf_kinsn_forbidden_flags(*kfunc.flags)) {
-		verbose(env, "kfunc %s has incompatible KF_KINSN flags\n", kfunc.name);
-		return -EINVAL;
-	}
 	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
 	     kfunc_desc_cmp_by_id_off, NULL);
+	return 0;
+}
+
+static bool btf_type_is_kinsn_desc(struct btf *btf, u32 type_id)
+{
+	const struct btf_type *t;
+	const char *name;
+
+	t = btf_type_by_id(btf, type_id);
+	if (!t)
+		return false;
+
+	t = btf_type_skip_modifiers(btf, type_id, &type_id);
+	if (!t || !btf_type_is_struct(t))
+		return false;
+
+	name = btf_name_by_offset(btf, t->name_off);
+	return name && !strcmp(name, "bpf_kinsn");
+}
+
+static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 var_id,
+				 s16 offset, const struct bpf_kinsn **kinsn)
+{
+	const struct btf_type *t;
+	const char *sym_name;
+	struct btf *btf;
+	unsigned long addr;
+
+	if (var_id <= 0) {
+		verbose(env, "invalid kinsn descriptor btf_id %d\n", var_id);
+		return -EINVAL;
+	}
+
+	btf = find_kfunc_desc_btf(env, offset);
+	if (IS_ERR(btf)) {
+		verbose(env, "failed to find BTF for kinsn descriptor\n");
+		return PTR_ERR(btf);
+	}
+
+	t = btf_type_by_id(btf, var_id);
+	if (!t || !btf_type_is_var(t)) {
+		verbose(env, "kinsn btf_id %d is not a BTF_KIND_VAR\n", var_id);
+		return -EINVAL;
+	}
+
+	if (!btf_type_is_kinsn_desc(btf, t->type)) {
+		verbose(env, "kinsn btf_id %d does not describe struct bpf_kinsn\n",
+			var_id);
+		return -EINVAL;
+	}
+
+	sym_name = btf_name_by_offset(btf, t->name_off);
+	if (!sym_name || !sym_name[0]) {
+		verbose(env, "kinsn descriptor btf_id %d has no symbol name\n", var_id);
+		return -EINVAL;
+	}
+
+	addr = kallsyms_lookup_name(sym_name);
+	if (!addr) {
+		verbose(env, "cannot find address for kinsn descriptor %s\n", sym_name);
+		return -EINVAL;
+	}
+
+	*kinsn = (const struct bpf_kinsn *)addr;
+	if (!(*kinsn)->owner || !(*kinsn)->instantiate_insn ||
+	    !(*kinsn)->max_insn_cnt) {
+		verbose(env, "kinsn descriptor %s is incomplete\n", sym_name);
+		return -EINVAL;
+	}
+
+	if (!try_module_get((*kinsn)->owner))
+		return -ENXIO;
+
+	return 0;
+}
+
+static int add_kinsn_call(struct bpf_verifier_env *env, s32 imm, s16 offset)
+{
+	struct bpf_kinsn_desc_tab *tab;
+	struct bpf_prog_aux *prog_aux;
+	const struct bpf_kinsn *kinsn;
+	struct bpf_kinsn_desc *desc;
+	int err;
+
+	prog_aux = env->prog->aux;
+	tab = prog_aux->kinsn_tab;
+	if (!tab) {
+		tab = kzalloc_obj(*tab, GFP_KERNEL_ACCOUNT);
+		if (!tab)
+			return -ENOMEM;
+		prog_aux->kinsn_tab = tab;
+	}
+
+	if (find_kinsn_desc(env->prog, imm, offset))
+		return 0;
+
+	if (tab->nr_descs == MAX_KINSN_DESCS) {
+		verbose(env, "too many different kinsn calls\n");
+		return -E2BIG;
+	}
+
+	err = fetch_kinsn_desc_meta(env, imm, offset, &kinsn);
+	if (err)
+		return err;
+
+	desc = &tab->descs[tab->nr_descs++];
+	desc->imm = imm;
+	desc->offset = offset;
+	desc->kinsn = kinsn;
+	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
+	     kinsn_desc_cmp_by_imm_off, NULL);
 	return 0;
 }
 
@@ -3666,6 +3702,34 @@ static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
 	if (d0->offset != d1->offset)
 		return d0->offset < d1->offset ? -1 : 1;
 	return 0;
+}
+
+static int kinsn_desc_cmp_by_imm_off(const void *a, const void *b)
+{
+	const struct bpf_kinsn_desc *d0 = a;
+	const struct bpf_kinsn_desc *d1 = b;
+
+	if (d0->imm != d1->imm)
+		return d0->imm < d1->imm ? -1 : 1;
+	if (d0->offset != d1->offset)
+		return d0->offset < d1->offset ? -1 : 1;
+	return 0;
+}
+
+static struct bpf_kinsn_desc *
+find_kinsn_desc(const struct bpf_prog *prog, s32 imm, u16 offset)
+{
+	struct bpf_kinsn_desc key = {
+		.imm = imm,
+		.offset = offset,
+	};
+	struct bpf_kinsn_desc_tab *tab;
+
+	tab = prog->aux->kinsn_tab;
+	if (!tab)
+		return NULL;
+	return bsearch(&key, tab->descs, tab->nr_descs,
+		       sizeof(tab->descs[0]), kinsn_desc_cmp_by_imm_off);
 }
 
 static int set_kfunc_desc_imm(struct bpf_verifier_env *env, struct bpf_kfunc_desc *desc)
@@ -3712,6 +3776,19 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return !!prog->aux->kfunc_tab;
 }
 
+bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
+{
+	const struct bpf_insn *insn = prog->insnsi;
+	int i;
+
+	for (i = 0; i < prog->len; i++, insn++) {
+		if (bpf_pseudo_kinsn_call(insn))
+			return true;
+	}
+
+	return false;
+}
+
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
@@ -3730,24 +3807,14 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 	return res ? &res->func_model : NULL;
 }
 
-const struct bpf_kinsn_ops *
-bpf_jit_find_kinsn_ops(const struct bpf_prog *prog,
-		       const struct bpf_insn *insn)
+const struct bpf_kinsn *
+bpf_jit_find_kinsn_desc(const struct bpf_prog *prog,
+			const struct bpf_insn *insn)
 {
-	const struct bpf_kfunc_desc desc = {
-		.imm = insn->imm,
-		.offset = insn->off,
-	};
-	const struct bpf_kfunc_desc *res;
-	struct bpf_kfunc_desc_tab *tab;
+	struct bpf_kinsn_desc *desc;
 
-	tab = prog->aux->kfunc_tab;
-	if (!tab)
-		return NULL;
-	res = bsearch(&desc, tab->descs, tab->nr_descs,
-		      sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
-
-	return res ? res->kinsn_ops : NULL;
+	desc = find_kinsn_desc(prog, insn->imm, insn->off);
+	return desc ? desc->kinsn : NULL;
 }
 
 static bool bpf_kinsn_is_subprog_start(const struct bpf_verifier_env *env,
@@ -3786,82 +3853,236 @@ bpf_prog_find_kinsn_sidecar(const struct bpf_prog *prog,
 	return insn - 1;
 }
 
-static int bpf_build_legacy_kinsn_call(struct bpf_kinsn_call *call, u32 nargs)
+static int validate_kinsn_proof_seq(struct bpf_verifier_env *env,
+				    const struct bpf_kinsn *kinsn,
+				    const struct bpf_insn *insn_buf,
+				    u32 cnt)
 {
 	u32 i;
 
-	memset(call, 0, sizeof(*call));
-	call->encoding = BPF_KINSN_ENC_LEGACY_KFUNC;
-	call->dst_reg = BPF_REG_0;
-	call->nr_operands = min_t(u32, nargs, ARRAY_SIZE(call->operands));
-	for (i = 0; i < call->nr_operands; i++) {
-		call->operands[i].kind = BPF_KINSN_OPERAND_REG;
-		call->operands[i].regno = i + 1;
+	if (!cnt || cnt > kinsn->max_insn_cnt)
+		return -EINVAL;
+
+	for (i = 0; i < cnt; i++) {
+		const struct bpf_insn *insn = &insn_buf[i];
+		u8 class = BPF_CLASS(insn->code);
+
+		if (bpf_kinsn_is_sidecar_insn(insn)) {
+			verbose(env, "kinsn proof sequence cannot contain sidecar pseudo-insns\n");
+			return -EINVAL;
+		}
+
+		if (class == BPF_JMP || class == BPF_JMP32) {
+			u8 op = BPF_OP(insn->code);
+			int tgt;
+
+			if (op == BPF_CALL || op == BPF_EXIT) {
+				verbose(env, "kinsn proof sequence cannot contain calls or exits\n");
+				return -EINVAL;
+			}
+
+			if (op == BPF_JA || BPF_OP(insn->code) != BPF_CALL) {
+				tgt = i + 1 + insn->off;
+				if (tgt < 0 || tgt > cnt) {
+					verbose(env, "kinsn proof sequence jump escapes its region\n");
+					return -EINVAL;
+				}
+				if (tgt <= i) {
+					verbose(env, "kinsn proof sequence cannot contain back-edges\n");
+					return -EINVAL;
+				}
+			}
+		}
+
+		if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM &&
+		    insn->src_reg != 0) {
+			verbose(env, "kinsn proof sequence cannot contain pseudo ldimm64\n");
+			return -EINVAL;
+		}
 	}
 
 	return 0;
 }
 
-static int bpf_prepare_kinsn_call(const struct bpf_insn *insn,
-				  const struct bpf_insn *sidecar,
-				  u32 nargs,
-				  const struct bpf_kinsn_ops *ops,
-				  struct bpf_kinsn_call *call)
+static void scrub_restored_kinsn_aux(struct bpf_verifier_env *env, u32 start)
 {
+	struct bpf_insn_aux_data *aux = env->insn_aux_data;
+	struct bpf_insn_aux_data keep_sidecar = { };
+	struct bpf_insn_aux_data keep_call = { };
+	u32 seen = max(aux[start].seen, aux[start + 1].seen);
+
+	if (aux[start].jt) {
+		kvfree(aux[start].jt);
+		aux[start].jt = NULL;
+	}
+	if (aux[start + 1].jt) {
+		kvfree(aux[start + 1].jt);
+		aux[start + 1].jt = NULL;
+	}
+
+	keep_sidecar.seen = seen;
+	keep_call.seen = seen;
+	keep_sidecar.orig_idx = aux[start].orig_idx;
+	keep_call.orig_idx = aux[start + 1].orig_idx;
+	aux[start] = keep_sidecar;
+	aux[start + 1] = keep_call;
+}
+
+static __maybe_unused int lower_kinsn_proof_regions(struct bpf_verifier_env *env)
+{
+	int i;
+
+	env->kinsn_region_cnt = 0;
+
+	for (i = env->prog->len - 1; i >= 0; i--) {
+		struct bpf_prog *new_prog;
+		struct bpf_kinsn_region *region;
+		const struct bpf_kinsn *kinsn;
+		struct bpf_insn *call;
+		const struct bpf_insn *sidecar;
+		u32 cnt;
+		int err;
+
+		call = &env->prog->insnsi[i];
+		if (!bpf_pseudo_kinsn_call(call))
+			continue;
+
+		sidecar = bpf_verifier_find_kinsn_sidecar(env, i);
+		if (!sidecar) {
+			verbose(env, "kinsn call must be preceded by sidecar payload\n");
+			return -EINVAL;
+		}
+
+		kinsn = bpf_jit_find_kinsn_desc(env->prog, call);
+		if (!kinsn) {
+			verbose(env, "unresolved kinsn target for imm=%d off=%d\n",
+				call->imm, call->off);
+			return -ENOENT;
+		}
+
+		cnt = kinsn->instantiate_insn(bpf_kinsn_sidecar_payload(sidecar),
+					      env->insn_buf);
+		if ((int)cnt <= 0)
+			return cnt ? (int)cnt : -EINVAL;
+
+		err = validate_kinsn_proof_seq(env, kinsn, env->insn_buf, cnt);
+		if (err)
+			return err;
+
+		if (env->kinsn_region_cnt == MAX_KINSN_REGIONS) {
+			verbose(env, "too many kinsn proof regions\n");
+			return -E2BIG;
+		}
+
+		region = &env->kinsn_regions[env->kinsn_region_cnt++];
+		region->start = i - 1;
+		region->proof_len = cnt;
+		region->orig[0] = *sidecar;
+		region->orig[1] = *call;
+
+		err = verifier_remove_insns(env, i - 1, 1);
+		if (err)
+			return err;
+
+		new_prog = bpf_patch_insn_data(env, i - 1, env->insn_buf, cnt);
+		if (!new_prog)
+			return -ENOMEM;
+
+		env->prog = new_prog;
+	}
+
+	return 0;
+}
+
+static __maybe_unused int restore_kinsn_proof_regions(struct bpf_verifier_env *env)
+{
+	u32 i;
+
+	for (i = 0; i < env->kinsn_region_cnt; i++) {
+		struct bpf_prog *new_prog;
+		struct bpf_kinsn_region *region = &env->kinsn_regions[i];
+		int err;
+
+		new_prog = bpf_patch_insn_data(env, region->start, region->orig, 2);
+		if (!new_prog)
+			return -ENOMEM;
+		env->prog = new_prog;
+
+		if (region->proof_len > 1) {
+			err = verifier_remove_insns(env, region->start + 2,
+						    region->proof_len - 1);
+			if (err)
+				return err;
+		}
+
+		scrub_restored_kinsn_aux(env, region->start);
+	}
+
+	return 0;
+}
+
+static bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
+{
+#if defined(CONFIG_X86_64)
+	return !!kinsn->emit_x86;
+#elif defined(CONFIG_ARM64)
+	return !!kinsn->emit_arm64;
+#else
+	return false;
+#endif
+}
+
+static int build_kinsn_inst_seq(struct bpf_verifier_env *env,
+				const struct bpf_insn *sidecar,
+				const struct bpf_insn *call,
+				const struct bpf_kinsn **kinsn,
+				int *cnt)
+{
+	const struct bpf_kinsn *desc;
 	int err;
 
-	err = bpf_build_legacy_kinsn_call(call, nargs);
+	desc = bpf_jit_find_kinsn_desc(env->prog, call);
+	if (!desc) {
+		verbose(env, "unresolved kinsn target for imm=%d off=%d\n",
+			call->imm, call->off);
+		return -ENOENT;
+	}
+
+	*cnt = desc->instantiate_insn(bpf_kinsn_sidecar_payload(sidecar),
+				      env->insn_buf);
+	if (*cnt <= 0)
+		return *cnt ? *cnt : -EINVAL;
+
+	err = validate_kinsn_proof_seq(env, desc, env->insn_buf, *cnt);
 	if (err)
 		return err;
 
-	if (sidecar) {
-		memset(call, 0, sizeof(*call));
-		call->encoding = BPF_KINSN_ENC_PACKED_CALL;
-		call->payload = bpf_kinsn_sidecar_payload(sidecar);
-	}
-
-	if (ops->decode_call)
-		return ops->decode_call(insn, call);
+	if (kinsn)
+		*kinsn = desc;
 
 	return 0;
 }
 
-int bpf_jit_get_kinsn_call(const struct bpf_prog *prog,
-			   const struct bpf_insn *insn,
-			   struct bpf_kinsn_call *call)
+int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn,
+			      const struct bpf_kinsn **kinsn,
+			      u64 *payload)
 {
-	const struct bpf_kinsn_ops *ops;
 	const struct bpf_insn *sidecar;
-	const struct bpf_kfunc_desc desc_key = {
-		.imm = insn->imm,
-		.offset = insn->off,
-	};
-	const struct bpf_kfunc_desc *desc;
-	struct bpf_kfunc_desc_tab *tab;
-	int err;
+	const struct bpf_kinsn *desc;
 
-	tab = prog->aux->kfunc_tab;
-	if (!tab)
+	desc = bpf_jit_find_kinsn_desc(prog, insn);
+	if (!desc)
 		return -ENOENT;
 
-	desc = bsearch(&desc_key, tab->descs, tab->nr_descs,
-		       sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
-	if (!desc || !desc->kinsn_ops)
-		return -ENOENT;
-
-	ops = desc->kinsn_ops;
 	sidecar = bpf_prog_find_kinsn_sidecar(prog, insn);
-	err = bpf_prepare_kinsn_call(insn, sidecar, desc->func_model.nr_args,
-				     ops, call);
-	if (err)
-		return err;
+	if (!sidecar)
+		return -EINVAL;
 
-	if (!(ops->supported_encodings & call->encoding))
-		return -EOPNOTSUPP;
-
-	if (ops->validate_call)
-		return ops->validate_call(call, NULL);
-
+	if (kinsn)
+		*kinsn = desc;
+	if (payload)
+		*payload = bpf_kinsn_sidecar_payload(sidecar);
 	return 0;
 }
 
@@ -3893,7 +4114,8 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn) &&
-		    !bpf_pseudo_kfunc_call(insn))
+		    !bpf_pseudo_kfunc_call(insn) &&
+		    !bpf_pseudo_kinsn_call(insn))
 			continue;
 
 		if (!env->bpf_capable) {
@@ -3903,8 +4125,10 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 
 		if (bpf_pseudo_func(insn) || bpf_pseudo_call(insn))
 			ret = add_subprog(env, i + insn->imm + 1);
-		else
+		else if (bpf_pseudo_kfunc_call(insn))
 			ret = add_kfunc_call(env, insn->imm, insn->off);
+		else
+			ret = add_kinsn_call(env, insn->imm, insn->off);
 
 		if (ret < 0)
 			return ret;
@@ -4427,26 +4651,27 @@ static int get_prev_insn_idx(struct bpf_verifier_state *st, int i,
 	return i;
 }
 
-static const char *disasm_kfunc_name(void *data, const struct bpf_insn *insn)
+static const char *disasm_call_name(void *data, const struct bpf_insn *insn)
 {
-	const struct btf_type *func;
+	const struct btf_type *t;
 	struct btf *desc_btf;
 
-	if (insn->src_reg != BPF_PSEUDO_KFUNC_CALL)
+	if (insn->src_reg != BPF_PSEUDO_KFUNC_CALL &&
+	    insn->src_reg != BPF_PSEUDO_KINSN_CALL)
 		return NULL;
 
 	desc_btf = find_kfunc_desc_btf(data, insn->off);
 	if (IS_ERR(desc_btf))
 		return "<error>";
 
-	func = btf_type_by_id(desc_btf, insn->imm);
-	return btf_name_by_offset(desc_btf, func->name_off);
+	t = btf_type_by_id(desc_btf, insn->imm);
+	return t ? btf_name_by_offset(desc_btf, t->name_off) : "<invalid>";
 }
 
 static void verbose_insn(struct bpf_verifier_env *env, struct bpf_insn *insn)
 {
 	const struct bpf_insn_cbs cbs = {
-		.cb_call	= disasm_kfunc_name,
+		.cb_call	= disasm_call_name,
 		.cb_print	= verbose,
 		.private_data	= env,
 	};
@@ -4638,16 +4863,6 @@ static void bt_sync_linked_regs(struct backtrack_state *bt, struct bpf_jmp_histo
 	}
 }
 
-static void bt_clear_reg_mask(struct backtrack_state *bt, u32 mask)
-{
-	u32 regno;
-
-	for (regno = 0; regno < MAX_BPF_REG; regno++) {
-		if (mask & BIT(regno))
-			bt_clear_reg(bt, regno);
-	}
-}
-
 /* For given verifier state backtrack_insn() is called from the last insn to
  * the first insn. Its purpose is to compute a bitmask of registers and
  * stack slots that needs precision in the parent verifier state.
@@ -4661,7 +4876,6 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			  struct bpf_jmp_history_entry *hist, struct backtrack_state *bt)
 {
 	struct bpf_insn *insn = env->prog->insnsi + idx;
-	const struct bpf_insn_aux_data *aux = &env->insn_aux_data[idx];
 	u8 class = BPF_CLASS(insn->code);
 	u8 opcode = BPF_OP(insn->code);
 	u8 mode = BPF_MODE(insn->code);
@@ -4858,15 +5072,6 @@ static int backtrack_insn(struct bpf_verifier_env *env, int idx, int subseq_idx,
 			 */
 			if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL && insn->imm == 0)
 				return -ENOTSUPP;
-			if (aux->kinsn_call) {
-				/* Unlike helpers/kfuncs, kinsn calls can preserve
-				 * arbitrary caller registers. Stop backtracking at
-				 * registers defined or clobbered by this call site
-				 * and keep all other tracked registers live across it.
-				 */
-				bt_clear_reg_mask(bt, aux->kinsn_clobber_mask);
-				return 0;
-			}
 			/* regular helper call sets R0 */
 			bt_clear_reg(bt, BPF_REG_0);
 			if (bt_reg_mask(bt) & BPF_REGMASK_ARGS) {
@@ -12943,12 +13148,6 @@ static bool is_kfunc_pkt_changing(struct bpf_kfunc_call_arg_meta *meta)
 	return meta->func_id == special_kfunc_list[KF_bpf_xdp_pull_data];
 }
 
-static bool is_kinsn_unsized_mem_arg(struct bpf_kfunc_call_arg_meta *meta,
-				     const struct btf_type *ref_t)
-{
-	return (meta->kfunc_flags & KF_KINSN) && btf_type_is_void(ref_t);
-}
-
 static enum kfunc_ptr_arg_type
 get_kfunc_ptr_arg_type(struct bpf_verifier_env *env,
 		       struct bpf_kfunc_call_arg_meta *meta,
@@ -13046,7 +13245,6 @@ get_kfunc_ptr_arg_type(struct bpf_verifier_env *env,
 	 * arg_mem_size is true, the pointer can be void *.
 	 */
 	if (!btf_type_is_scalar(ref_t) && !__btf_type_is_scalar_struct(env, meta->btf, ref_t, 0) &&
-	    !is_kinsn_unsized_mem_arg(meta, ref_t) &&
 	    (arg_mem_size ? !btf_type_is_void(ref_t) : 1)) {
 		verbose(env, "arg#%d pointer type %s %s must point to %sscalar, or struct with scalar\n",
 			argno, btf_type_str(ref_t), ref_tname, arg_mem_size ? "void, " : "");
@@ -14024,9 +14222,6 @@ static int check_kfunc_args(struct bpf_verifier_env *env, struct bpf_kfunc_call_
 				return ret;
 			break;
 		case KF_ARG_PTR_TO_MEM:
-			if (is_kinsn_unsized_mem_arg(meta, ref_t))
-				break;
-
 			resolve_ret = btf_resolve_size(btf, ref_t, &type_size);
 			if (IS_ERR(resolve_ret)) {
 				verbose(env, "arg#%d reference type('%s %s') size cannot be determined: %ld\n",
@@ -14385,473 +14580,12 @@ static int check_special_kfunc(struct bpf_verifier_env *env, struct bpf_kfunc_ca
 
 static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name);
 
-static u32 bpf_kinsn_call_reg_mask(const struct bpf_kinsn_call *call)
-{
-	u32 i, mask = 0;
-
-	if (call->dst_reg < MAX_BPF_REG)
-		mask |= BIT(call->dst_reg);
-
-	for (i = 0; i < min_t(u32, call->nr_operands, ARRAY_SIZE(call->operands)); i++) {
-		if (call->operands[i].kind != BPF_KINSN_OPERAND_REG)
-			continue;
-		if (call->operands[i].regno >= MAX_BPF_REG)
-			continue;
-		mask |= BIT(call->operands[i].regno);
-	}
-
-	return mask;
-}
-
-static void bpf_kinsn_init_effect(struct bpf_kinsn_effect *effect)
-{
-	memset(effect, 0, sizeof(*effect));
-	effect->result_tnum = tnum_unknown;
-	effect->umin_value = 0;
-	effect->umax_value = U64_MAX;
-	effect->smin_value = S64_MIN;
-	effect->smax_value = S64_MAX;
-}
-
-static int bpf_collect_kinsn_scalar_inputs(struct bpf_verifier_env *env,
-					   const struct bpf_kinsn_call *call,
-					   struct bpf_kinsn_scalar_state *scalar_regs)
-{
-	u32 i;
-
-	memset(scalar_regs, 0, sizeof(*scalar_regs) * ARRAY_SIZE(call->operands));
-	for (i = 0; i < min_t(u32, call->nr_operands, ARRAY_SIZE(call->operands)); i++) {
-		const struct bpf_kinsn_operand *operand = &call->operands[i];
-		struct bpf_reg_state *reg;
-
-		if (operand->kind != BPF_KINSN_OPERAND_REG)
-			continue;
-		if (operand->regno >= MAX_BPF_REG) {
-			verbose(env, "kinsn operand %u references invalid register r%u\n",
-				i, operand->regno);
-			return -EINVAL;
-		}
-
-		reg = reg_state(env, operand->regno);
-		if (reg->type != SCALAR_VALUE)
-			continue;
-
-		scalar_regs[i].var_off = reg->var_off;
-		scalar_regs[i].umin_value = reg->umin_value;
-		scalar_regs[i].umax_value = reg->umax_value;
-		scalar_regs[i].smin_value = reg->smin_value;
-		scalar_regs[i].smax_value = reg->smax_value;
-		scalar_regs[i].subreg32 = reg->subreg_def != DEF_NOT_SUBREG;
-	}
-
-	return 0;
-}
-
-static int bpf_validate_kinsn_effect(struct bpf_verifier_env *env,
-				     const struct bpf_kinsn_call *call,
-				     const struct bpf_kinsn_effect *effect)
-{
-	u32 valid_mask = GENMASK(MAX_BPF_REG - 1, 0);
-	u32 explicit_mask = bpf_kinsn_call_reg_mask(call);
-	bool seen_result_mem = false;
-	u32 i;
-
-	if (effect->input_mask & ~valid_mask) {
-		verbose(env, "kinsn effect.input_mask references invalid registers\n");
-		return -EINVAL;
-	}
-
-	if (effect->clobber_mask & ~valid_mask) {
-		verbose(env, "kinsn effect.clobber_mask references invalid registers\n");
-		return -EINVAL;
-	}
-
-	if (effect->clobber_mask & BIT(BPF_REG_FP)) {
-		verbose(env, "kinsn effect.clobber_mask cannot clobber r10\n");
-		return -EINVAL;
-	}
-
-	switch (effect->result_type) {
-	case BPF_KINSN_RES_VOID:
-		if (effect->result_size) {
-			verbose(env, "void kinsn result cannot declare a result_size\n");
-			return -EINVAL;
-		}
-		break;
-	case BPF_KINSN_RES_SCALAR:
-		if (effect->result_reg >= MAX_BPF_REG || effect->result_reg == BPF_REG_FP) {
-			verbose(env, "kinsn effect.result_reg is invalid\n");
-			return -EINVAL;
-		}
-		if (!(effect->clobber_mask & BIT(effect->result_reg))) {
-			verbose(env, "kinsn effect.result_reg must be present in clobber_mask\n");
-			return -EINVAL;
-		}
-		if (effect->result_size != sizeof(u32) &&
-		    effect->result_size != sizeof(u64)) {
-			verbose(env, "kinsn effect.result_size must be 4 or 8\n");
-			return -EINVAL;
-		}
-		break;
-	default:
-		verbose(env, "kinsn effect.result_type is invalid\n");
-		return -EINVAL;
-	}
-
-	if (effect->nr_mem_accesses > ARRAY_SIZE(effect->mem_accesses)) {
-		verbose(env, "kinsn effect declares too many memory accesses\n");
-		return -EINVAL;
-	}
-
-	for (i = 0; i < effect->nr_mem_accesses; i++) {
-		const struct bpf_kinsn_mem_access *access = &effect->mem_accesses[i];
-
-		if (access->base_reg >= MAX_BPF_REG) {
-			verbose(env, "kinsn memory access %u references invalid base register\n",
-				i);
-			return -EINVAL;
-		}
-
-		if (effect->clobber_mask & BIT(access->base_reg)) {
-			verbose(env, "kinsn memory base register r%u cannot be clobbered\n",
-				access->base_reg);
-			return -EINVAL;
-		}
-
-		switch (access->size) {
-		case sizeof(u8):
-		case sizeof(u16):
-		case sizeof(u32):
-		case sizeof(u64):
-			break;
-		default:
-			verbose(env, "kinsn memory access %u has invalid size %u\n",
-				i, access->size);
-			return -EINVAL;
-		}
-
-		if (access->access_type != BPF_READ && access->access_type != BPF_WRITE) {
-			verbose(env, "kinsn memory access %u has invalid access type %u\n",
-				i, access->access_type);
-			return -EINVAL;
-		}
-
-		if (access->flags & ~BPF_KINSN_MEM_RESULT) {
-			verbose(env, "kinsn memory access %u has unsupported flags 0x%x\n",
-				i, access->flags);
-			return -EINVAL;
-		}
-
-		if (access->flags & BPF_KINSN_MEM_RESULT) {
-			if (access->access_type != BPF_READ) {
-				verbose(env, "kinsn result memory access must be a read\n");
-				return -EINVAL;
-			}
-			if (effect->result_type != BPF_KINSN_RES_SCALAR) {
-				verbose(env, "kinsn result memory access requires scalar result\n");
-				return -EINVAL;
-			}
-			if (seen_result_mem) {
-				verbose(env, "kinsn effect can only mark one memory read as result\n");
-				return -EINVAL;
-			}
-			seen_result_mem = true;
-		}
-
-		if (call->encoding == BPF_KINSN_ENC_PACKED_CALL &&
-		    !(explicit_mask & BIT(access->base_reg))) {
-			verbose(env, "packed kinsn memory base register r%u was not decoded explicitly\n",
-				access->base_reg);
-			return -EINVAL;
-		}
-	}
-
-	if (call->encoding == BPF_KINSN_ENC_PACKED_CALL) {
-		if (effect->input_mask & ~explicit_mask) {
-			verbose(env, "packed kinsn effect.input_mask must only use decoded registers\n");
-			return -EINVAL;
-		}
-		if (effect->clobber_mask & ~explicit_mask) {
-			verbose(env, "packed kinsn effect.clobber_mask must only use decoded registers\n");
-			return -EINVAL;
-		}
-		if (effect->result_type == BPF_KINSN_RES_SCALAR &&
-		    !(explicit_mask & BIT(effect->result_reg))) {
-			verbose(env, "packed kinsn result register r%u was not decoded explicitly\n",
-				effect->result_reg);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
-static int bpf_kinsn_check_mem_accesses(struct bpf_verifier_env *env,
-					const struct bpf_kinsn_effect *effect,
-					struct bpf_reg_state *load_state,
-					bool *have_load_state)
-{
-	struct bpf_reg_state *regs = cur_regs(env);
-	u32 i;
-	int err;
-
-	*have_load_state = false;
-	memset(load_state, 0, sizeof(*load_state));
-
-	for (i = 0; i < effect->nr_mem_accesses; i++) {
-		const struct bpf_kinsn_mem_access *access = &effect->mem_accesses[i];
-		int value_regno = -1;
-		int bpf_size = bytes_to_bpf_size(access->size);
-
-		if (access->flags & BPF_KINSN_MEM_RESULT)
-			value_regno = effect->result_reg;
-
-		err = check_mem_access(env, env->insn_idx, access->base_reg,
-				       access->off, bpf_size, access->access_type,
-				       value_regno, false, false);
-		if (err)
-			return err;
-
-		if (value_regno >= 0) {
-			copy_register_state(load_state, &regs[value_regno]);
-			*have_load_state = true;
-		}
-	}
-
-	return 0;
-}
-
-static void bpf_kinsn_apply_clobber_mask(struct bpf_verifier_env *env,
-					 struct bpf_reg_state *regs,
-					 u32 clobber_mask,
-					 u8 result_reg,
-					 enum bpf_kinsn_result_type result_type)
-{
-	u32 regno;
-
-	for (regno = 0; regno < MAX_BPF_REG; regno++) {
-		if (!(clobber_mask & BIT(regno)))
-			continue;
-		if (result_type == BPF_KINSN_RES_SCALAR && regno == result_reg)
-			continue;
-		mark_reg_not_init(env, regs, regno);
-		regs[regno].subreg_def = DEF_NOT_SUBREG;
-	}
-}
-
-static int bpf_kinsn_apply_result(struct bpf_verifier_env *env,
-				  struct bpf_reg_state *regs,
-				  const struct bpf_kinsn_effect *effect,
-				  const struct bpf_reg_state *load_state,
-				  bool have_load_state)
-{
-	struct bpf_reg_state *reg;
-
-	if (effect->result_type == BPF_KINSN_RES_VOID)
-		return 0;
-
-	if (have_load_state)
-		copy_register_state(&regs[effect->result_reg], load_state);
-	else
-		mark_reg_unknown(env, regs, effect->result_reg);
-
-	reg = &regs[effect->result_reg];
-	reg->type = SCALAR_VALUE;
-	reg->id = 0;
-	reg->ref_obj_id = 0;
-
-	if (effect->flags & BPF_KINSN_EFFECT_HAS_TNUM)
-		reg->var_off = tnum_intersect(reg->var_off, effect->result_tnum);
-
-	reg->umin_value = max_t(u64, reg->umin_value, effect->umin_value);
-	reg->umax_value = min_t(u64, reg->umax_value, effect->umax_value);
-	reg->smin_value = max_t(s64, reg->smin_value, effect->smin_value);
-	reg->smax_value = min_t(s64, reg->smax_value, effect->smax_value);
-
-	if (reg->umin_value > reg->umax_value || reg->smin_value > reg->smax_value) {
-		verbose(env, "kinsn effect result bounds are inconsistent\n");
-		return -EINVAL;
-	}
-
-	reg_bounds_sync(reg);
-	return reg_bounds_sanity_check(env, reg, "kinsn_result");
-}
-
-static void bpf_kinsn_apply_subreg_def(struct bpf_verifier_env *env,
-				       struct bpf_reg_state *regs,
-				       const struct bpf_kinsn_effect *effect)
-{
-	if (effect->result_type == BPF_KINSN_RES_VOID)
-		return;
-
-	regs[effect->result_reg].subreg_def =
-		effect->result_size == sizeof(u32) ?
-		env->insn_idx + 1 : DEF_NOT_SUBREG;
-}
-
-static int check_kinsn_encoded_operands(struct bpf_verifier_env *env,
-					const struct bpf_kinsn_call *call)
-{
-	u32 i;
-	int err;
-
-	if (call->dst_reg >= MAX_BPF_REG || call->dst_reg == BPF_REG_FP) {
-		verbose(env, "packed kinsn result register r%u is invalid\n",
-			call->dst_reg);
-		return -EINVAL;
-	}
-
-	for (i = 0; i < min_t(u32, call->nr_operands, ARRAY_SIZE(call->operands)); i++) {
-		const struct bpf_kinsn_operand *operand = &call->operands[i];
-
-		switch (operand->kind) {
-		case BPF_KINSN_OPERAND_REG:
-			if (operand->regno >= MAX_BPF_REG) {
-				verbose(env, "packed kinsn operand %u references invalid register r%u\n",
-					i, operand->regno);
-				return -EINVAL;
-			}
-			err = check_reg_arg(env, operand->regno, SRC_OP);
-			if (err)
-				return err;
-			break;
-		case BPF_KINSN_OPERAND_IMM16:
-		case BPF_KINSN_OPERAND_IMM32:
-			break;
-		default:
-			verbose(env, "packed kinsn operand %u has unsupported kind %u\n",
-				i, operand->kind);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
-static int bpf_kinsn_check_input_regs(struct bpf_verifier_env *env,
-				      const struct bpf_kinsn_effect *effect)
-{
-	u32 mem_base_mask = 0;
-	u32 regno, i;
-
-	for (i = 0; i < effect->nr_mem_accesses; i++)
-		mem_base_mask |= BIT(effect->mem_accesses[i].base_reg);
-
-	for (regno = 0; regno < MAX_BPF_REG; regno++) {
-		struct bpf_reg_state *reg;
-
-		if (!(effect->input_mask & BIT(regno)))
-			continue;
-		if (mem_base_mask & BIT(regno))
-			continue;
-
-		reg = reg_state(env, regno);
-		if (reg->type != SCALAR_VALUE) {
-			verbose(env, "kinsn input register r%u must be scalar\n",
-				regno);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
-static int check_kinsn_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
-			    int insn_idx,
-			    struct bpf_kfunc_call_arg_meta *meta,
-			    const struct bpf_kfunc_desc *desc)
-{
-	const struct bpf_kinsn_ops *ops = desc->kinsn_ops;
-	const struct bpf_insn *sidecar;
-	struct bpf_insn_aux_data *insn_aux = &env->insn_aux_data[insn_idx];
-	struct bpf_reg_state *regs = cur_regs(env);
-	struct bpf_kinsn_scalar_state scalar_regs[4];
-	struct bpf_kinsn_effect effect;
-	struct bpf_kinsn_call call;
-	struct bpf_reg_state load_state;
-	bool have_load_state;
-	int err;
-
-	sidecar = bpf_verifier_find_kinsn_sidecar(env, insn_idx);
-	err = bpf_prepare_kinsn_call(insn, sidecar, btf_type_vlen(meta->func_proto),
-				     ops, &call);
-	if (err)
-		return err;
-	if (sidecar && call.encoding != BPF_KINSN_ENC_PACKED_CALL) {
-		verbose(env, "kinsn sidecar must decode as packed call for %s\n",
-			meta->func_name);
-		return -EINVAL;
-	}
-
-	if (!(ops->supported_encodings & call.encoding)) {
-		if (call.encoding == BPF_KINSN_ENC_LEGACY_KFUNC)
-			return -EAGAIN;
-		verbose(env, "kinsn %s does not support encoding 0x%x\n",
-			meta->func_name, call.encoding);
-		return -EOPNOTSUPP;
-	}
-
-	if (ops->validate_call) {
-		err = ops->validate_call(&call, &env->log);
-		if (err)
-			return err;
-	}
-
-	if (call.encoding == BPF_KINSN_ENC_LEGACY_KFUNC) {
-		err = check_kfunc_args(env, meta, insn_idx);
-		if (err)
-			return err;
-	} else {
-		err = check_kinsn_encoded_operands(env, &call);
-		if (err)
-			return err;
-	}
-
-	err = bpf_collect_kinsn_scalar_inputs(env, &call, scalar_regs);
-	if (err)
-		return err;
-
-	bpf_kinsn_init_effect(&effect);
-	err = ops->model_call(&call, scalar_regs, &effect);
-	if (err)
-		return err;
-
-	err = bpf_validate_kinsn_effect(env, &call, &effect);
-	if (err)
-		return err;
-
-	err = bpf_kinsn_check_input_regs(env, &effect);
-	if (err)
-		return err;
-
-	err = bpf_kinsn_check_mem_accesses(env, &effect, &load_state,
-					   &have_load_state);
-	if (err)
-		return err;
-
-	insn_aux->kinsn_call = true;
-	insn_aux->kinsn_clobber_mask = effect.clobber_mask;
-
-	bpf_kinsn_apply_clobber_mask(env, regs, effect.clobber_mask,
-				     effect.result_reg, effect.result_type);
-
-	err = bpf_kinsn_apply_result(env, regs, &effect, &load_state,
-				     have_load_state);
-	if (err)
-		return err;
-
-	bpf_kinsn_apply_subreg_def(env, regs, &effect);
-	return 0;
-}
-
 static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 			    int *insn_idx_p)
 {
 	bool sleepable, rcu_lock, rcu_unlock, preempt_disable, preempt_enable;
-	const struct bpf_insn *sidecar;
 	u32 i, nargs, ptr_type_id, release_ref_obj_id;
 	struct bpf_reg_state *regs = cur_regs(env);
-	const struct bpf_kfunc_desc *desc;
 	const char *func_name, *ptr_type_name;
 	const struct btf_type *t, *ptr_type;
 	struct bpf_kfunc_call_arg_meta meta;
@@ -14872,19 +14606,8 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 	desc_btf = meta.btf;
 	func_name = meta.func_name;
 	insn_aux = &env->insn_aux_data[insn_idx];
-	desc = find_kfunc_desc(env->prog, meta.func_id, insn->off);
-	sidecar = bpf_verifier_find_kinsn_sidecar(env, insn_idx);
 
 	insn_aux->is_iter_next = is_iter_next_kfunc(&meta);
-
-	if ((meta.kfunc_flags & KF_KINSN) && desc && desc->kinsn_ops) {
-		err = check_kinsn_call(env, insn, insn_idx, &meta, desc);
-		if (err != -EAGAIN)
-			return err;
-	} else if (sidecar) {
-		verbose(env, "kinsn sidecar requires a registered KF_KINSN target\n");
-		return -EOPNOTSUPP;
-	}
 
 	if (!insn->off &&
 	    (insn->imm == special_kfunc_list[KF_bpf_res_spin_lock] ||
@@ -21807,13 +21530,13 @@ static int check_kinsn_sidecar_insn(struct bpf_verifier_env *env,
 	const struct bpf_insn *next;
 
 	if (env->insn_idx == env->prog->len - 1) {
-		verbose(env, "kinsn sidecar must be followed by a kfunc call\n");
+		verbose(env, "kinsn sidecar must be followed by a kinsn call\n");
 		return -EINVAL;
 	}
 
 	next = &env->prog->insnsi[env->insn_idx + 1];
-	if (!bpf_pseudo_kfunc_call(next)) {
-		verbose(env, "kinsn sidecar must be immediately followed by a kfunc call\n");
+	if (!bpf_pseudo_kinsn_call(next)) {
+		verbose(env, "kinsn sidecar must be immediately followed by a kinsn call\n");
 		return -EINVAL;
 	}
 
@@ -21893,10 +21616,12 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 		if (opcode == BPF_CALL) {
 			if (BPF_SRC(insn->code) != BPF_K ||
 			    (insn->src_reg != BPF_PSEUDO_KFUNC_CALL &&
+			     insn->src_reg != BPF_PSEUDO_KINSN_CALL &&
 			     insn->off != 0) ||
 			    (insn->src_reg != BPF_REG_0 &&
 			     insn->src_reg != BPF_PSEUDO_CALL &&
-			     insn->src_reg != BPF_PSEUDO_KFUNC_CALL) ||
+			     insn->src_reg != BPF_PSEUDO_KFUNC_CALL &&
+			     insn->src_reg != BPF_PSEUDO_KINSN_CALL) ||
 			    insn->dst_reg != BPF_REG_0 || class == BPF_JMP32) {
 				verbose(env, "BPF_CALL uses reserved fields\n");
 				return -EINVAL;
@@ -21918,6 +21643,9 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 				err = check_kfunc_call(env, insn, &env->insn_idx);
 				if (!err && is_bpf_throw_kfunc(insn))
 					return process_bpf_exit_full(env, do_print_state, true);
+			} else if (insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
+				verbose(env, "internal error: kinsn call reached verifier without proof lowering\n");
+				return -EFAULT;
 			} else {
 				err = check_helper_call(env, insn, &env->insn_idx);
 			}
@@ -23678,6 +23406,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->blinding_requested = prog->blinding_requested;
 		func[i]->aux->kfunc_tab = prog->aux->kfunc_tab;
 		func[i]->aux->kfunc_btf_tab = prog->aux->kfunc_btf_tab;
+		func[i]->aux->kinsn_tab = prog->aux->kinsn_tab;
 		func[i]->aux->linfo = prog->aux->linfo;
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;
@@ -23862,6 +23591,7 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 	struct bpf_prog *prog = env->prog;
 	struct bpf_insn *insn = prog->insnsi;
 	bool has_kfunc_call = bpf_prog_has_kfunc_call(prog);
+	bool has_kinsn_call = bpf_prog_has_kinsn_call(prog);
 	int i, depth;
 #endif
 	int err = 0;
@@ -23877,6 +23607,10 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
 	if (has_kfunc_call) {
 		verbose(env, "calling kernel functions are not allowed in non-JITed programs\n");
+		return -EINVAL;
+	}
+	if (has_kinsn_call) {
+		verbose(env, "kinsn calls are not allowed in non-JITed programs\n");
 		return -EINVAL;
 	}
 	if (env->subprog_cnt > 1 && env->prog->aux->tail_call_reachable) {
@@ -24181,6 +23915,34 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 	}
 
 	for (i = 0; i < insn_cnt;) {
+		if (bpf_kinsn_is_sidecar_insn(insn)) {
+			const struct bpf_kinsn *kinsn;
+
+			if (i + 1 >= insn_cnt || !bpf_pseudo_kinsn_call(insn + 1))
+				goto next_insn;
+
+			ret = build_kinsn_inst_seq(env, insn, insn + 1, &kinsn, &cnt);
+			if (ret)
+				return ret;
+
+			if (prog->jit_requested && bpf_kinsn_has_native_emit(kinsn))
+				goto next_insn;
+
+			ret = verifier_remove_insns(env, i + delta + 1, 1);
+			if (ret)
+				return ret;
+
+			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
+			if (!new_prog)
+				return -ENOMEM;
+
+			delta += cnt - 2;
+			env->prog = prog = new_prog;
+			insn = new_prog->insnsi + i + delta;
+			i++;
+			goto next_insn;
+		}
+
 		if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) && insn->imm) {
 			if ((insn->off == BPF_ADDR_SPACE_CAST && insn->imm == 1) ||
 			    (((struct bpf_map *)env->prog->aux->arena)->map_flags & BPF_F_NO_USER_CONV)) {
@@ -24489,6 +24251,8 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		if (insn->code != (BPF_JMP | BPF_CALL))
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_CALL)
+			goto next_insn;
+		if (insn->src_reg == BPF_PSEUDO_KINSN_CALL)
 			goto next_insn;
 		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
 			ret = fixup_kfunc_call(env, insn, insn_buf, i + delta, &cnt);
@@ -26783,6 +26547,18 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 
+	ret = check_btf_info_early(env, attr, uattr);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = add_subprog_and_kfunc(env);
+	if (ret < 0)
+		goto skip_full_check;
+
+	ret = lower_kinsn_proof_regions(env);
+	if (ret < 0)
+		goto skip_full_check;
+
 	env->explored_states = kvzalloc_objs(struct list_head,
 					     state_htab_size(env),
 					     GFP_KERNEL_ACCOUNT);
@@ -26793,14 +26569,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 	for (i = 0; i < state_htab_size(env); i++)
 		INIT_LIST_HEAD(&env->explored_states[i]);
 	INIT_LIST_HEAD(&env->free_list);
-
-	ret = check_btf_info_early(env, attr, uattr);
-	if (ret < 0)
-		goto skip_full_check;
-
-	ret = add_subprog_and_kfunc(env);
-	if (ret < 0)
-		goto skip_full_check;
 
 	ret = check_subprogs(env);
 	if (ret < 0)
@@ -26855,7 +26623,11 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
 		ret = bpf_prog_offload_finalize(env);
 
 skip_full_check:
-	kvfree(env->explored_states);
+		kvfree(env->explored_states);
+		env->explored_states = NULL;
+
+		if (ret == 0)
+			ret = restore_kinsn_proof_regions(env);
 
 	/* might decrease stack depth, keep it before passes that
 	 * allocate additional slots.
