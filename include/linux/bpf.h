@@ -1664,7 +1664,6 @@ struct btf_mod_pair {
 };
 
 struct bpf_kfunc_desc_tab;
-struct bpf_kinsn_desc_tab;
 
 enum bpf_stream_id {
 	BPF_STDOUT = 1,
@@ -1755,7 +1754,6 @@ struct bpf_prog_aux {
 	struct bpf_jit_poke_descriptor *poke_tab;
 	struct bpf_kfunc_desc_tab *kfunc_tab;
 	struct bpf_kfunc_btf_tab *kfunc_btf_tab;
-	struct bpf_kinsn_desc_tab *kinsn_tab;
 	u32 size_poke_tab;
 #ifdef CONFIG_FINEIBT
 	struct bpf_ksym ksym_prefix;
@@ -3082,7 +3080,6 @@ const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id,
 void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
 void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
-void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog);
 const struct btf_func_model *
@@ -3375,10 +3372,6 @@ static inline void bpf_task_storage_free(struct task_struct *task)
 }
 
 static inline void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
-{
-}
-
-static inline void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
 {
 }
 

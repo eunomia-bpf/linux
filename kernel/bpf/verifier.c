@@ -307,6 +307,7 @@ struct bpf_call_arg_meta {
 struct bpf_kfunc_meta {
 	struct btf *btf;
 	const struct btf_type *proto;
+	const struct bpf_kinsn *kinsn;
 	const char *name;
 	const u32 *flags;
 	s32 id;
@@ -3178,6 +3179,7 @@ static int bpf_find_exception_callback_insn_off(struct bpf_verifier_env *env)
 
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
+	const struct bpf_kinsn *kinsn;
 	u32 func_id;
 	s32 imm;
 	u16 offset;
@@ -3205,49 +3207,6 @@ struct bpf_kfunc_btf_tab {
 	u32 nr_descs;
 };
 
-struct bpf_kinsn_desc {
-	const struct bpf_kinsn *kinsn;
-	s32 imm;
-	u16 offset;
-};
-
-struct bpf_kinsn_desc_tab {
-	struct bpf_kinsn_desc *descs;
-	u32 nr_descs;
-	u32 desc_cap;
-};
-
-static int ensure_desc_capacity(void **descs, u32 *cap, size_t elem_size, u32 need)
-{
-	u32 new_cap = *cap;
-	void *new_descs;
-
-	if (*cap >= need)
-		return 0;
-
-	if (!new_cap)
-		new_cap = 16;
-	while (new_cap < need) {
-		if (new_cap > U32_MAX / 2) {
-			new_cap = need;
-			break;
-		}
-		new_cap *= 2;
-	}
-
-	new_descs = kvrealloc(*descs, array_size(new_cap, elem_size),
-			      GFP_KERNEL_ACCOUNT);
-	if (!new_descs)
-		return -ENOMEM;
-
-	*descs = new_descs;
-	*cap = new_cap;
-	return 0;
-}
-
-static int kinsn_desc_cmp_by_imm_off(const void *a, const void *b);
-static struct bpf_kinsn_desc *
-find_kinsn_desc(const struct bpf_prog *prog, s32 imm, u16 offset);
 static struct bpf_prog *bpf_patch_insn_data(struct bpf_verifier_env *env, u32 off,
 					    const struct bpf_insn *patch, u32 len);
 static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
@@ -3264,31 +3223,14 @@ static int kfunc_desc_cmp_by_id_off(const void *a, const void *b)
 	return d0->func_id - d1->func_id ?: d0->offset - d1->offset;
 }
 
+static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b);
+
 static int kfunc_btf_cmp_by_off(const void *a, const void *b)
 {
 	const struct bpf_kfunc_btf *d0 = a;
 	const struct bpf_kfunc_btf *d1 = b;
 
 	return d0->offset - d1->offset;
-}
-
-static struct module *find_kfunc_desc_module(const struct bpf_prog *prog,
-					     u16 offset)
-{
-	struct bpf_kfunc_btf key = { .offset = offset };
-	struct bpf_kfunc_btf_tab *tab;
-	struct bpf_kfunc_btf *desc;
-
-	if (!offset)
-		return NULL;
-
-	tab = prog->aux->kfunc_btf_tab;
-	if (!tab)
-		return NULL;
-
-	desc = bsearch(&key, tab->descs, tab->nr_descs,
-		       sizeof(tab->descs[0]), kfunc_btf_cmp_by_off);
-	return desc ? desc->module : NULL;
 }
 
 static struct bpf_kfunc_desc *
@@ -3303,6 +3245,22 @@ find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
 	tab = prog->aux->kfunc_tab;
 	return bsearch(&desc, tab->descs, tab->nr_descs,
 		       sizeof(tab->descs[0]), kfunc_desc_cmp_by_id_off);
+}
+
+static struct bpf_kfunc_desc *
+find_kfunc_desc_by_imm_off(const struct bpf_prog *prog, s32 imm, u16 offset)
+{
+	struct bpf_kfunc_desc desc = {
+		.imm = imm,
+		.offset = offset,
+	};
+	struct bpf_kfunc_desc_tab *tab;
+
+	tab = prog->aux->kfunc_tab;
+	if (!tab)
+		return NULL;
+	return bsearch(&desc, tab->descs, tab->nr_descs,
+		       sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
 }
 
 int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
@@ -3411,15 +3369,6 @@ void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 	kfree(tab);
 }
 
-void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
-{
-	if (!tab)
-		return;
-
-	kvfree(tab->descs);
-	kfree(tab);
-}
-
 static struct btf *find_kfunc_desc_btf(struct bpf_verifier_env *env, s16 offset)
 {
 	if (offset) {
@@ -3436,7 +3385,6 @@ static struct btf *find_kfunc_desc_btf(struct bpf_verifier_env *env, s16 offset)
 	return btf_vmlinux ?: ERR_PTR(-ENOENT);
 }
 
-#define KINSN_DESC_SUFFIX "_desc"
 #define KF_IMPL_SUFFIX "_impl"
 
 static const struct btf_type *find_kfunc_impl_proto(struct bpf_verifier_env *env,
@@ -3521,6 +3469,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 	memset(kfunc, 0, sizeof(*kfunc));
 	kfunc->btf = btf;
 	kfunc->id = func_id;
+	kfunc->kinsn = btf_kfunc_kinsn_desc(btf, func_id, env->prog);
 	kfunc->name = func_name;
 	kfunc->proto = func_proto;
 	kfunc->flags = kfunc_flags;
@@ -3528,21 +3477,20 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 	return 0;
 }
 
-static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
+static int ensure_kfunc_desc_tab(struct bpf_verifier_env *env, bool kfunc_call,
+				 struct bpf_kfunc_desc_tab **tabp)
 {
-	struct bpf_kfunc_btf_tab *btf_tab;
-	struct btf_func_model func_model;
-	struct bpf_kfunc_desc_tab *tab;
 	struct bpf_prog_aux *prog_aux;
-	struct bpf_kfunc_meta kfunc;
-	struct bpf_kfunc_desc *desc;
-	unsigned long addr;
-	int err;
+	struct bpf_kfunc_desc_tab *tab;
 
 	prog_aux = env->prog->aux;
 	tab = prog_aux->kfunc_tab;
-	btf_tab = prog_aux->kfunc_btf_tab;
-	if (!tab) {
+	if (tab) {
+		*tabp = tab;
+		return 0;
+	}
+
+	if (kfunc_call) {
 		if (!btf_vmlinux) {
 			verbose(env, "calling kernel function is not supported without CONFIG_DEBUG_INFO_BTF\n");
 			return -ENOTSUPP;
@@ -3562,134 +3510,27 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 			verbose(env, "cannot call kernel function from non-GPL compatible program\n");
 			return -EINVAL;
 		}
-
-		tab = kzalloc_obj(*tab, GFP_KERNEL_ACCOUNT);
-		if (!tab)
-			return -ENOMEM;
-		prog_aux->kfunc_tab = tab;
 	}
 
-	/* func_id == 0 is always invalid, but instead of returning an error, be
-	 * conservative and wait until the code elimination pass before returning
-	 * error, so that invalid calls that get pruned out can be in BPF programs
-	 * loaded from userspace.  It is also required that offset be untouched
-	 * for such calls.
-	 */
-	if (!func_id && !offset)
-		return 0;
+	tab = kzalloc_obj(*tab, GFP_KERNEL_ACCOUNT);
+	if (!tab)
+		return -ENOMEM;
 
-	if (!btf_tab && offset) {
-		btf_tab = kzalloc_obj(*btf_tab, GFP_KERNEL_ACCOUNT);
-		if (!btf_tab)
-			return -ENOMEM;
-		prog_aux->kfunc_btf_tab = btf_tab;
-	}
-
-	if (find_kfunc_desc(env->prog, func_id, offset))
-		return 0;
-
-	if (tab->nr_descs == MAX_KFUNC_DESCS) {
-		verbose(env, "too many different kernel function calls\n");
-		return -E2BIG;
-	}
-
-	err = fetch_kfunc_meta(env, func_id, offset, &kfunc);
-	if (err)
-		return err;
-
-	addr = kallsyms_lookup_name(kfunc.name);
-	if (!addr) {
-		verbose(env, "cannot find address for kernel function %s\n", kfunc.name);
-		return -EINVAL;
-	}
-
-	if (bpf_dev_bound_kfunc_id(func_id)) {
-		err = bpf_dev_bound_kfunc_check(&env->log, prog_aux);
-		if (err)
-			return err;
-	}
-
-	err = btf_distill_func_proto(&env->log, kfunc.btf, kfunc.proto, kfunc.name, &func_model);
-	if (err)
-		return err;
-
-	desc = &tab->descs[tab->nr_descs++];
-	desc->func_id = func_id;
-	desc->offset = offset;
-	desc->addr = addr;
-	desc->func_model = func_model;
-	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
-	     kfunc_desc_cmp_by_id_off, NULL);
+	prog_aux->kfunc_tab = tab;
+	*tabp = tab;
 	return 0;
 }
 
-static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 func_id,
-				 s16 offset, const struct bpf_kinsn **kinsn)
+static int validate_kinsn_meta(struct bpf_verifier_env *env, s32 func_id,
+			       const struct bpf_kfunc_meta *kfunc)
 {
-	struct module *mod;
-	const char *func_name;
-	const struct btf_type *func;
-	struct btf *btf;
-	unsigned long addr;
-	char *desc_name;
-	int len;
-
-	if (func_id <= 0) {
-		verbose(env, "invalid kinsn function btf_id %d\n", func_id);
-		return -EINVAL;
-	}
-
-	btf = find_kfunc_desc_btf(env, offset);
-	if (IS_ERR(btf)) {
-		verbose(env, "failed to find BTF for kinsn function\n");
-		return PTR_ERR(btf);
-	}
-
-	func = btf_type_by_id(btf, func_id);
-	if (!func || !btf_type_is_func(func)) {
-		verbose(env, "kinsn function btf_id %d is not a BTF_KIND_FUNC\n",
-			func_id);
-		return -EINVAL;
-	}
-
-	func_name = btf_name_by_offset(btf, func->name_off);
-	if (!func_name || !*func_name) {
-		verbose(env, "failed to resolve kinsn function name for btf_id %d\n",
-			func_id);
-		return -EINVAL;
-	}
-
-	mod = find_kfunc_desc_module(env->prog, offset);
-	if (offset && !mod) {
-		verbose(env, "failed to find module for kinsn function btf_id %d\n",
+	if (!kfunc->kinsn) {
+		verbose(env, "kfunc btf_id %d is not registered as kinsn\n",
 			func_id);
 		return -ENOENT;
 	}
 
-	desc_name = env->tmp_str_buf;
-	len = snprintf(desc_name, TMP_STR_BUF_LEN, "%s%s",
-		       func_name, KINSN_DESC_SUFFIX);
-	if (len < 0 || len >= TMP_STR_BUF_LEN) {
-		verbose(env, "kinsn descriptor symbol name %s%s is too long\n",
-			func_name, KINSN_DESC_SUFFIX);
-		return -EINVAL;
-	}
-
-	addr = mod ? find_kallsyms_symbol_value(mod, desc_name)
-		   : kallsyms_lookup_name(desc_name);
-	if (!addr) {
-		verbose(env, "failed to find kinsn descriptor symbol %s\n",
-			desc_name);
-		return -ENOENT;
-	}
-
-	*kinsn = (const struct bpf_kinsn *)addr;
-	if ((*kinsn)->owner != mod) {
-		verbose(env, "kinsn descriptor %s owner mismatch\n", desc_name);
-		return -EINVAL;
-	}
-
-	if (!(*kinsn)->instantiate_insn || !(*kinsn)->max_insn_cnt) {
+	if (!kfunc->kinsn->instantiate_insn || !kfunc->kinsn->max_insn_cnt) {
 		verbose(env, "kinsn function btf_id %d is incomplete\n", func_id);
 		return -EINVAL;
 	}
@@ -3697,42 +3538,97 @@ static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 func_id,
 	return 0;
 }
 
-static int add_kinsn_call(struct bpf_verifier_env *env, s32 imm, s16 offset)
+static int add_kfunc_desc(struct bpf_verifier_env *env, u32 func_id, s16 offset,
+			  bool kinsn_call)
 {
-	struct bpf_kinsn_desc_tab *tab;
+	struct btf_func_model func_model;
+	struct bpf_kfunc_desc_tab *tab;
 	struct bpf_prog_aux *prog_aux;
-	const struct bpf_kinsn *kinsn;
-	struct bpf_kinsn_desc *desc;
+	struct bpf_kfunc_meta kfunc;
+	struct bpf_kfunc_desc *desc;
+	unsigned long addr;
 	int err;
 
 	prog_aux = env->prog->aux;
-	tab = prog_aux->kinsn_tab;
-	if (!tab) {
-		tab = kzalloc_obj(*tab, GFP_KERNEL_ACCOUNT);
-		if (!tab)
-			return -ENOMEM;
-		prog_aux->kinsn_tab = tab;
-	}
 
-	if (find_kinsn_desc(env->prog, imm, offset))
+	/* func_id == 0 is always invalid, but instead of returning an error, be
+	 * conservative and wait until the code elimination pass before returning
+	 * error, so that invalid calls that get pruned out can be in BPF programs
+	 * loaded from userspace. It is also required that offset be untouched
+	 * for such calls.
+	 */
+	if (!kinsn_call && !func_id && !offset)
 		return 0;
 
-	err = fetch_kinsn_desc_meta(env, imm, offset, &kinsn);
+	err = ensure_kfunc_desc_tab(env, !kinsn_call, &tab);
 	if (err)
 		return err;
 
-	err = ensure_desc_capacity((void **)&tab->descs, &tab->desc_cap,
-				   sizeof(tab->descs[0]), tab->nr_descs + 1);
+	if (find_kfunc_desc(env->prog, func_id, offset))
+		return 0;
+
+	if (tab->nr_descs == MAX_KFUNC_DESCS) {
+		verbose(env, "too many different kernel/%s calls\n",
+			kinsn_call ? "kinsn" : "function");
+		return -E2BIG;
+	}
+
+	err = fetch_kfunc_meta(env, func_id, offset, &kfunc);
 	if (err)
 		return err;
 
 	desc = &tab->descs[tab->nr_descs++];
-	desc->imm = imm;
+	desc->func_id = func_id;
 	desc->offset = offset;
-	desc->kinsn = kinsn;
+	if (kinsn_call) {
+		err = validate_kinsn_meta(env, func_id, &kfunc);
+		if (err) {
+			tab->nr_descs--;
+			return err;
+		}
+		desc->imm = func_id;
+		desc->kinsn = kfunc.kinsn;
+	} else {
+		addr = kallsyms_lookup_name(kfunc.name);
+		if (!addr) {
+			verbose(env, "cannot find address for kernel function %s\n",
+				kfunc.name);
+			tab->nr_descs--;
+			return -EINVAL;
+		}
+
+		if (bpf_dev_bound_kfunc_id(func_id)) {
+			err = bpf_dev_bound_kfunc_check(&env->log, prog_aux);
+			if (err) {
+				tab->nr_descs--;
+				return err;
+			}
+		}
+
+		err = btf_distill_func_proto(&env->log, kfunc.btf, kfunc.proto,
+					     kfunc.name, &func_model);
+		if (err) {
+			tab->nr_descs--;
+			return err;
+		}
+
+		desc->addr = addr;
+		desc->func_model = func_model;
+	}
+
 	sort(tab->descs, tab->nr_descs, sizeof(tab->descs[0]),
-	     kinsn_desc_cmp_by_imm_off, NULL);
+	     kfunc_desc_cmp_by_id_off, NULL);
 	return 0;
+}
+
+static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
+{
+	return add_kfunc_desc(env, func_id, offset, false);
+}
+
+static int add_kinsn_call(struct bpf_verifier_env *env, s32 imm, s16 offset)
+{
+	return add_kfunc_desc(env, imm, offset, true);
 }
 
 static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
@@ -3747,37 +3643,14 @@ static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
 	return 0;
 }
 
-static int kinsn_desc_cmp_by_imm_off(const void *a, const void *b)
-{
-	const struct bpf_kinsn_desc *d0 = a;
-	const struct bpf_kinsn_desc *d1 = b;
-
-	if (d0->imm != d1->imm)
-		return d0->imm < d1->imm ? -1 : 1;
-	if (d0->offset != d1->offset)
-		return d0->offset < d1->offset ? -1 : 1;
-	return 0;
-}
-
-static struct bpf_kinsn_desc *
-find_kinsn_desc(const struct bpf_prog *prog, s32 imm, u16 offset)
-{
-	struct bpf_kinsn_desc key = {
-		.imm = imm,
-		.offset = offset,
-	};
-	struct bpf_kinsn_desc_tab *tab;
-
-	tab = prog->aux->kinsn_tab;
-	if (!tab)
-		return NULL;
-	return bsearch(&key, tab->descs, tab->nr_descs,
-		       sizeof(tab->descs[0]), kinsn_desc_cmp_by_imm_off);
-}
-
 static int set_kfunc_desc_imm(struct bpf_verifier_env *env, struct bpf_kfunc_desc *desc)
 {
 	unsigned long call_imm;
+
+	if (desc->kinsn) {
+		desc->imm = desc->func_id;
+		return 0;
+	}
 
 	if (bpf_jit_supports_far_kfunc_call()) {
 		call_imm = desc->func_id;
@@ -3816,7 +3689,18 @@ static int sort_kfunc_descs_by_imm_off(struct bpf_verifier_env *env)
 
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 {
-	return !!prog->aux->kfunc_tab;
+	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
+	u32 i;
+
+	if (!tab)
+		return false;
+
+	for (i = 0; i < tab->nr_descs; i++) {
+		if (!tab->descs[i].kinsn)
+			return true;
+	}
+
+	return false;
 }
 
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
@@ -3836,28 +3720,31 @@ const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
 {
-	const struct bpf_kfunc_desc desc = {
-		.imm = insn->imm,
-		.offset = insn->off,
-	};
-	const struct bpf_kfunc_desc *res;
-	struct bpf_kfunc_desc_tab *tab;
+	const struct bpf_kfunc_desc *desc;
 
-	tab = prog->aux->kfunc_tab;
-	res = bsearch(&desc, tab->descs, tab->nr_descs,
-		      sizeof(tab->descs[0]), kfunc_desc_cmp_by_imm_off);
-
-	return res ? &res->func_model : NULL;
+	desc = find_kfunc_desc_by_imm_off(prog, insn->imm, insn->off);
+	return desc && !desc->kinsn ? &desc->func_model : NULL;
 }
 
 const struct bpf_kinsn *
 bpf_jit_find_kinsn_desc(const struct bpf_prog *prog,
 			const struct bpf_insn *insn)
 {
-	struct bpf_kinsn_desc *desc;
+	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
+	u32 i;
 
-	desc = find_kinsn_desc(prog, insn->imm, insn->off);
-	return desc ? desc->kinsn : NULL;
+	if (!tab)
+		return NULL;
+
+	for (i = 0; i < tab->nr_descs; i++) {
+		struct bpf_kfunc_desc *desc = &tab->descs[i];
+
+		if (desc->kinsn && desc->func_id == insn->imm &&
+		    desc->offset == insn->off)
+			return desc->kinsn;
+	}
+
+	return NULL;
 }
 
 static bool bpf_kinsn_is_subprog_start(const struct bpf_verifier_env *env,
@@ -23512,7 +23399,6 @@ static int jit_subprogs(struct bpf_verifier_env *env)
 		func[i]->blinding_requested = prog->blinding_requested;
 		func[i]->aux->kfunc_tab = prog->aux->kfunc_tab;
 		func[i]->aux->kfunc_btf_tab = prog->aux->kfunc_btf_tab;
-		func[i]->aux->kinsn_tab = prog->aux->kinsn_tab;
 		func[i]->aux->linfo = prog->aux->linfo;
 		func[i]->aux->nr_linfo = prog->aux->nr_linfo;
 		func[i]->aux->jited_linfo = prog->aux->jited_linfo;

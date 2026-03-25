@@ -2382,7 +2382,6 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
 	kvfree(prog->aux->linfo);
 	kvfree(prog->aux->orig_insns);
 	bpf_free_kfunc_desc_tab(prog->aux->kfunc_tab);
-	bpf_free_kinsn_desc_tab(prog->aux->kinsn_tab);
 	kfree(prog->aux->ctx_arg_info);
 	if (prog->aux->attach_btf)
 		btf_put(prog->aux->attach_btf);
@@ -3385,7 +3384,6 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->used_map_cnt, tmp->aux->used_map_cnt);
 	swap(prog->aux->kfunc_tab, tmp->aux->kfunc_tab);
 	swap(prog->aux->kfunc_btf_tab, tmp->aux->kfunc_btf_tab);
-	swap(prog->aux->kinsn_tab, tmp->aux->kinsn_tab);
 
 #ifdef CONFIG_SECURITY
 	swap(prog->aux->security, tmp->aux->security);
