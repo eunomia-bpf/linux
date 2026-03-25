@@ -1518,10 +1518,10 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 {
 	struct bpf_struct_ops_map *st_map;
+	void **call_sites = NULL;
 	struct bpf_map *map;
-	void *call_site;
 	u32 i;
-	int err;
+	int err = 0;
 
 	guard(mutex)(&prog->aux->st_ops_assoc_mutex);
 
@@ -1531,6 +1531,9 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		return 0;
 
 	st_map = (struct bpf_struct_ops_map *)map;
+	call_sites = kcalloc(st_map->funcs_cnt, sizeof(*call_sites), GFP_KERNEL);
+	if (!call_sites)
+		return -ENOMEM;
 
 	for (i = 0; i < st_map->funcs_cnt; i++) {
 		struct bpf_ksym *ksym;
@@ -1544,26 +1547,38 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		if (!ksym)
 			continue;
 
-		call_site = find_call_site((void *)ksym->start,
-					   ksym->end - ksym->start,
-					   (void *)old_bpf_func);
-		if (!call_site) {
+		call_sites[i] = find_call_site((void *)ksym->start,
+					       ksym->end - ksym->start,
+					       (void *)old_bpf_func);
+		if (!call_sites[i]) {
 			pr_warn("struct_ops rejit: CALL site not found in trampoline %s\n",
 				ksym->name);
-			return -ENOENT;
+			err = -ENOENT;
+			goto out;
 		}
+	}
 
-		err = bpf_arch_text_poke(call_site, BPF_MOD_CALL,
+	for (i = 0; i < st_map->funcs_cnt; i++) {
+		struct bpf_ksym *ksym;
+
+		if (!call_sites[i])
+			continue;
+
+		ksym = st_map->ksyms[i];
+
+		err = bpf_arch_text_poke(call_sites[i], BPF_MOD_CALL,
 					 BPF_MOD_CALL,
 					 (void *)old_bpf_func,
 					 (void *)prog->bpf_func);
 		if (err) {
 			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
-			return err;
+			goto out;
 		}
 	}
 
-	return 0;
+out:
+	kfree(call_sites);
+	return err;
 }
 
 /*

@@ -7842,8 +7842,13 @@ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog)
 		verifier_bug(env, "unreliable BTF for function %s()", tname);
 		return -EFAULT;
 	}
-	if (prog_type == BPF_PROG_TYPE_EXT)
+	if (prog_type == BPF_PROG_TYPE_EXT) {
+		if (!prog->aux->dst_prog) {
+			bpf_log(log, "extension program missing dst_prog\n");
+			return -EINVAL;
+		}
 		prog_type = prog->aux->dst_prog->type;
+	}
 
 	t = btf_type_by_id(btf, fn_t->type);
 	if (!t || !btf_type_is_func_proto(t)) {

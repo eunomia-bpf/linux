@@ -1385,12 +1385,6 @@ struct bpf_trampoline {
 	struct bpf_tramp_image *cur_image;
 };
 
-/* Reverse index: prog -> trampolines using its bpf_func. Protected by rejit_mutex. */
-struct bpf_tramp_user {
-	struct list_head list;
-	struct bpf_trampoline *tr;
-};
-
 struct bpf_attach_target_info {
 	struct btf_func_model fmodel;
 	long tgt_addr;
@@ -1575,7 +1569,7 @@ bool bpf_has_frame_pointer(unsigned long ip);
 int bpf_jit_charge_modmem(u32 size);
 void bpf_jit_uncharge_modmem(u32 size);
 bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
-int bpf_trampoline_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func);
+int bpf_trampoline_refresh_prog(struct bpf_prog *prog);
 #else
 static inline int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 					   struct bpf_trampoline *tr,
@@ -1604,8 +1598,7 @@ static inline void bpf_dispatcher_change_prog(struct bpf_dispatcher *d,
 					      struct bpf_prog *to) {}
 static inline void bpf_dispatcher_refresh_prog(struct bpf_dispatcher *d,
 					       struct bpf_prog *prog) {}
-static inline int bpf_trampoline_refresh_prog(struct bpf_prog *prog,
-					      bpf_func_t old_bpf_func)
+static inline int bpf_trampoline_refresh_prog(struct bpf_prog *prog)
 {
 	return 0;
 }
@@ -1768,6 +1761,7 @@ struct bpf_prog_aux {
 	struct user_struct *user;
 	u64 load_time; /* ns since boottime */
 	u32 verified_insns;
+	u32 prog_flags; /* semantic load flags to replay during BPF_PROG_REJIT */
 	struct bpf_insn *orig_insns;
 	u32 orig_prog_len;
 	int cgroup_atype; /* enum cgroup_bpf_attach_type */

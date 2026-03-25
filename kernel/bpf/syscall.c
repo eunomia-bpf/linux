@@ -3008,6 +3008,7 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	prog->aux->dst_prog = dst_prog;
 	prog->aux->dev_bound = !!attr->prog_ifindex;
 	prog->aux->xdp_has_frags = attr->prog_flags & BPF_F_XDP_HAS_FRAGS;
+	prog->aux->prog_flags = attr->prog_flags & ~BPF_F_TOKEN_FD;
 
 	/* move token into prog->aux, reuse taken refcnt */
 	prog->aux->token = token;
@@ -3346,6 +3347,10 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 				continue;
 
 			mutex_lock(&array->aux->poke_mutex);
+			if (array->ptrs[key] != prog) {
+				mutex_unlock(&array->aux->poke_mutex);
+				continue;
+			}
 			if (is_insert)
 				map->ops->map_poke_run(map, key, NULL, prog);
 			else
@@ -3440,11 +3445,9 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
 	prog->len = tmp->len;
 
-	/* Publish the replacement image after metadata is in place.
-	 * Pairs with readers that fetch prog->bpf_func after observing the
-	 * rest of prog metadata.
-	 */
-	smp_store_release(&prog->bpf_func, tmp->bpf_func);
+	/* Publish the replacement image after metadata is in place. */
+	smp_wmb();
+	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
 	tmp->jited = old_jited;
 	tmp->jited_len = old_jited_len;
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
@@ -3481,7 +3484,7 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 
 	bpf_prog_rejit_poke_target_phase(prog, true);
 
-	err = bpf_trampoline_refresh_prog(prog, new_bpf_func);
+	err = bpf_trampoline_refresh_prog(prog);
 	if (err)
 		rollback_err = err;
 
@@ -3545,8 +3548,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	load_attr.log_level = attr->rejit.log_level;
 	load_attr.log_size = attr->rejit.log_size;
 	load_attr.log_buf = attr->rejit.log_buf;
-	load_attr.prog_flags = (prog->sleepable ? BPF_F_SLEEPABLE : 0) |
-			       (prog->aux->xdp_has_frags ? BPF_F_XDP_HAS_FRAGS : 0);
+	load_attr.prog_flags = prog->aux->prog_flags;
 	load_attr.fd_array_cnt = attr->rejit.fd_array_cnt;
 
 	/* Copy fd_array into kernel buffer for KERNEL_BPFPTR semantics. */
@@ -3610,6 +3612,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	tmp->gpl_compatible = prog->gpl_compatible;
 	tmp->orig_prog = NULL;
 	tmp->jited = 0;
+	tmp->aux->prog_flags = prog->aux->prog_flags;
 
 	atomic64_set(&tmp->aux->refcnt, 1);
 
@@ -3729,7 +3732,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		bpf_prog_rejit_poke_target_phase(prog, true);
 		new_bpf_func = prog->bpf_func;
 
-		err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
+		err = bpf_trampoline_refresh_prog(prog);
 		if (err) {
 			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
 				err);

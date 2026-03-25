@@ -3631,7 +3631,7 @@ static int sort_kfunc_descs_by_imm_off(struct bpf_verifier_env *env)
 	return 0;
 }
 
-static bool bpf_prog_has_desc_kind(const struct bpf_prog *prog, bool kinsn)
+bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 {
 	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
 	u32 i;
@@ -3640,21 +3640,11 @@ static bool bpf_prog_has_desc_kind(const struct bpf_prog *prog, bool kinsn)
 		return false;
 
 	for (i = 0; i < tab->nr_descs; i++) {
-		if (!!tab->descs[i].kinsn == kinsn)
+		if (!tab->descs[i].kinsn)
 			return true;
 	}
 
 	return false;
-}
-
-bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
-{
-	return bpf_prog_has_desc_kind(prog, false);
-}
-
-static bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
-{
-	return bpf_prog_has_desc_kind(prog, true);
 }
 
 const struct btf_func_model *
@@ -3889,17 +3879,6 @@ static int restore_kinsn_proof_regions(struct bpf_verifier_env *env)
 	return 0;
 }
 
-static bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
-{
-#if defined(CONFIG_X86_64)
-	return !!kinsn->emit_x86;
-#elif defined(CONFIG_ARM64)
-	return !!kinsn->emit_arm64;
-#else
-	return false;
-#endif
-}
-
 int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
 			      const struct bpf_insn *insn,
 			      const struct bpf_kinsn **kinsn,
@@ -3925,7 +3904,7 @@ int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
 		return -EINVAL;
 
 	if (kinsn)
-		*kinsn = desc;
+		*kinsn = desc->kinsn;
 	if (payload)
 		*payload = bpf_kinsn_sidecar_payload(insn - 1);
 	return 0;
@@ -23438,8 +23417,8 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
 	struct bpf_prog *prog = env->prog;
 	struct bpf_insn *insn = prog->insnsi;
-	bool has_kfunc_call = bpf_prog_has_kfunc_call(prog);
-	bool has_kinsn_call = bpf_prog_has_kinsn_call(prog);
+	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
+	bool has_kfunc_call = false, has_kinsn_call = false;
 	int i, depth;
 #endif
 	int err = 0;
@@ -23453,6 +23432,17 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 			return err;
 	}
 #ifndef CONFIG_BPF_JIT_ALWAYS_ON
+	if (tab) {
+		for (i = 0; i < tab->nr_descs; i++) {
+			if (tab->descs[i].kinsn)
+				has_kinsn_call = true;
+			else
+				has_kfunc_call = true;
+			if (has_kfunc_call && has_kinsn_call)
+				break;
+		}
+	}
+
 	if (has_kfunc_call) {
 		verbose(env, "calling kernel functions are not allowed in non-JITed programs\n");
 		return -EINVAL;
@@ -23783,12 +23773,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 
-			if (prog->jit_requested && bpf_kinsn_has_native_emit(kinsn))
-				goto next_insn;
+				if (prog->jit_requested && bpf_kinsn_has_native_emit(kinsn))
+					goto next_insn;
 
-			ret = verifier_remove_insns(env, i + delta + 1, 1);
-			if (ret)
-				return ret;
+				ret = verifier_remove_insns(env, i + delta + 1, 1);
+				if (ret)
+					return ret;
 
 			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
 			if (!new_prog)

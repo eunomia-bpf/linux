@@ -838,6 +838,11 @@ static int __bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 	return err;
 }
 
+struct bpf_tramp_user {
+	struct list_head list;
+	struct bpf_trampoline *tr;
+};
+
 int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 			     struct bpf_trampoline *tr,
 			     struct bpf_prog *tgt_prog)
@@ -921,7 +926,7 @@ int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 }
 
 /* Called after bpf_func update, before old image free. Caller holds rejit_mutex. */
-int bpf_trampoline_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
+int bpf_trampoline_refresh_prog(struct bpf_prog *prog)
 {
 	struct bpf_tramp_user *tu;
 	int err = 0;
