@@ -199,7 +199,7 @@ void bpf_prog_jit_attempt_done(struct bpf_prog *prog)
 		prog->aux->jited_linfo = NULL;
 	}
 
-	bpf_free_kfunc_desc_tab(prog->aux->kfunc_tab);
+	kfree(prog->aux->kfunc_tab);
 	prog->aux->kfunc_tab = NULL;
 }
 

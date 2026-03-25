@@ -3359,14 +3359,6 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
 	kfree(tab);
 }
 
-void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
-{
-	if (!tab)
-		return;
-
-	kfree(tab);
-}
-
 static struct btf *find_kfunc_desc_btf(struct bpf_verifier_env *env, s16 offset)
 {
 	if (offset) {
@@ -3610,7 +3602,7 @@ static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
 static int sort_kfunc_descs_by_imm_off(struct bpf_verifier_env *env)
 {
 	struct bpf_kfunc_desc_tab *tab;
-	int i, err;
+	int i;
 
 	tab = env->prog->aux->kfunc_tab;
 	if (!tab)

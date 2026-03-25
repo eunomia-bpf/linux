@@ -3079,7 +3079,6 @@ const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id,
 						 const struct bpf_prog *prog);
 void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
-void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
@@ -3364,10 +3363,6 @@ bpf_base_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
 }
 
 static inline void bpf_task_storage_free(struct task_struct *task)
-{
-}
-
-static inline void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 {
 }
 
