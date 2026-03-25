@@ -3167,9 +3167,18 @@ static bool bpf_prog_rejit_supported(const struct bpf_prog *prog)
 	if (bpf_prog_is_offloaded(aux) || bpf_prog_is_dev_bound(aux))
 		return false;
 
+	/* Attached freplace/EXT programs clear dst_prog after link setup.
+	 * REJIT's verifier path still needs a live dst_prog to resolve the
+	 * replacement target, so reject the attached case until that state
+	 * can be reconstructed safely.
+	 */
+	if (prog->type == BPF_PROG_TYPE_EXT && !aux->dst_prog)
+		return false;
+
 	/* dst_prog / dst_trampoline are cleared to NULL after attach (in
 	 * bpf_tracing_link_init); the existing trampoline_users refresh
-	 * path handles the attached case.  Safe to allow REJIT.
+	 * path handles the attached tracing case.  EXT/freplace still needs
+	 * dst_prog during verification and is rejected above once attached.
 	 *
 	 * struct_ops trampolines bake bpf_func into a direct CALL;
 	 * bpf_struct_ops_refresh_prog() patches them via text_poke.
@@ -3353,6 +3362,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	bool old_jited = prog->jited;
 	u32 old_jited_len = prog->jited_len;
 	bpf_func_t old_bpf_func = prog->bpf_func;
+	u32 i;
 
 	swap(prog->aux->orig_insns, tmp->aux->orig_insns);
 	swap(prog->aux->orig_prog_len, tmp->aux->orig_prog_len);
@@ -3388,6 +3398,12 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->real_func_cnt, tmp->aux->real_func_cnt);
 	swap(prog->aux->bpf_exception_cb, tmp->aux->bpf_exception_cb);
 	swap(prog->aux->exception_boundary, tmp->aux->exception_boundary);
+
+	for (i = 0; i < prog->aux->real_func_cnt; i++) {
+		prog->aux->func[i]->aux->main_prog_aux = prog->aux;
+		prog->aux->func[i]->aux->poke_tab = prog->aux->poke_tab;
+		prog->aux->func[i]->aux->size_poke_tab = prog->aux->size_poke_tab;
+	}
 
 	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
 	prog->jited = tmp->jited;
@@ -3442,6 +3458,44 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	 */
 }
 
+static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
+				    bpf_func_t new_bpf_func,
+				    struct bpf_jit_poke_descriptor *saved_poke_tab,
+				    u32 saved_poke_cnt)
+{
+	int err, rollback_err = 0;
+
+	/* Callers currently jump to the replacement image. Remove those edges
+	 * before restoring the old bpf_func address, then republish the old
+	 * target after the swap-back.
+	 */
+	bpf_prog_rejit_poke_target_phase(prog, false);
+
+	bpf_prog_rejit_swap(prog, tmp);
+
+	if (saved_poke_tab && prog->aux->poke_tab &&
+	    prog->aux->size_poke_tab == saved_poke_cnt)
+		memcpy(prog->aux->poke_tab, saved_poke_tab,
+		       saved_poke_cnt * sizeof(*saved_poke_tab));
+
+	bpf_prog_rejit_poke_target_phase(prog, true);
+
+	err = bpf_trampoline_refresh_prog(prog, new_bpf_func);
+	if (err)
+		rollback_err = err;
+
+	if (rcu_access_pointer(prog->aux->st_ops_assoc)) {
+		err = bpf_struct_ops_refresh_prog(prog, new_bpf_func);
+		if (err && !rollback_err)
+			rollback_err = err;
+	}
+
+	if (prog->type == BPF_PROG_TYPE_XDP)
+		bpf_prog_refresh_xdp(prog);
+
+	return rollback_err;
+}
+
 /* last field in 'union bpf_attr' used by this command */
 #define BPF_PROG_REJIT_LAST_FIELD rejit.flags
 #define BPF_PROG_REJIT_MAX_FD_ARRAY 64
@@ -3451,7 +3505,11 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	union bpf_attr load_attr = {};
 	bpfptr_t load_uattr = KERNEL_BPFPTR(&load_attr);
 	int *kfd_array = NULL;
+	struct bpf_jit_poke_descriptor *saved_poke_tab = NULL;
 	struct bpf_prog *prog, *tmp = NULL;
+	u32 saved_poke_cnt = 0;
+	bool retain_old_image = false;
+	int ret = 0;
 	int err;
 
 	if (CHECK_ATTR(BPF_PROG_REJIT))
@@ -3528,9 +3586,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 
 	/* Propagate dst_prog for EXT (freplace) programs.
 	 * The verifier needs dst_prog to resolve the target function.
-	 * After the EXT prog is attached, dst_prog is cleared to NULL
-	 * by bpf_tracing_link_init(); in that case REJIT falls back to
-	 * the trampoline refresh path which doesn't need dst_prog.
+	 * Attached EXT progs clear dst_prog in link setup and are rejected
+	 * earlier by bpf_prog_rejit_supported().
 	 */
 	if (prog->aux->dst_prog) {
 		bpf_prog_inc(prog->aux->dst_prog);
@@ -3624,9 +3681,20 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		err = -E2BIG;
 		goto free_tmp_noref;
 	}
+	if (prog->aux->size_poke_tab) {
+		saved_poke_cnt = prog->aux->size_poke_tab;
+		saved_poke_tab = kvmemdup(prog->aux->poke_tab,
+					  saved_poke_cnt * sizeof(*saved_poke_tab),
+					  GFP_KERNEL);
+		if (!saved_poke_tab) {
+			err = -ENOMEM;
+			goto free_tmp_noref;
+		}
+	}
 
 	{
 		bpf_func_t old_bpf_func = prog->bpf_func;
+		bpf_func_t new_bpf_func;
 
 		/* Update poke_tab (tail_call direct jumps) BEFORE swapping
 		 * the JIT image.  This patches the NEW image's direct-jump
@@ -3658,12 +3726,22 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		 * new bpf_func address (NOP -> jmp new_addr).
 		 */
 		bpf_prog_rejit_poke_target_phase(prog, true);
+		new_bpf_func = prog->bpf_func;
 
 		err = bpf_trampoline_refresh_prog(prog, old_bpf_func);
 		if (err) {
 			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
 				err);
-			err = 0;
+			ret = err;
+			err = bpf_prog_rejit_rollback(prog, tmp, new_bpf_func,
+						      saved_poke_tab,
+						      saved_poke_cnt);
+			if (err) {
+				pr_warn("bpf_rejit: rollback after trampoline refresh failure failed: %d\n",
+					err);
+				retain_old_image = true;
+			}
+			goto post_swap_sync;
 		}
 
 		/* Refresh struct_ops trampoline if this prog is associated */
@@ -3672,7 +3750,17 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 			if (err) {
 				pr_warn("bpf_rejit: struct_ops refresh failed: %d\n",
 					err);
-				err = 0;
+				ret = err;
+				err = bpf_prog_rejit_rollback(prog, tmp,
+						      new_bpf_func,
+						      saved_poke_tab,
+						      saved_poke_cnt);
+				if (err) {
+					pr_warn("bpf_rejit: rollback after struct_ops refresh failure failed: %d\n",
+						err);
+					retain_old_image = true;
+				}
+				goto post_swap_sync;
 			}
 		}
 
@@ -3681,6 +3769,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 			bpf_prog_refresh_xdp(prog);
 	}
 
+post_swap_sync:
 	if (prog->sleepable)
 		synchronize_rcu_tasks_trace();
 	else
@@ -3691,11 +3780,16 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		bpf_prog_put(tmp->aux->dst_prog);
 		tmp->aux->dst_prog = NULL;
 	}
-	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	if (retain_old_image) {
+		pr_warn("bpf_rejit: retaining old JIT image after refresh failure\n");
+	} else {
+		__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	}
+	kvfree(saved_poke_tab);
 	kvfree(kfd_array);
 	mutex_unlock(&prog->aux->rejit_mutex);
 	bpf_prog_put(prog);
-	return 0;
+	return ret;
 
 free_tmp_noref:
 	if (tmp->aux->dst_prog) {
@@ -3721,6 +3815,7 @@ free_tmp:
 	kvfree(tmp->aux->orig_insns);
 	bpf_prog_free(tmp);
 out_unlock:
+	kvfree(saved_poke_tab);
 	kvfree(kfd_array);
 	mutex_unlock(&prog->aux->rejit_mutex);
 out_put_prog:

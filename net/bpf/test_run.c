@@ -1390,9 +1390,6 @@ int bpf_prog_test_run_xdp(struct bpf_prog *prog, const union bpf_attr *kattr,
 		xdp_buff_set_frags_flag(&xdp);
 	}
 
-	if (repeat > 1)
-		bpf_prog_change_xdp(NULL, prog);
-
 	if (do_live)
 		ret = bpf_test_run_xdp_live(prog, &xdp, repeat, batch_size, &duration);
 	else
@@ -1414,8 +1411,6 @@ out_put_dev:
 				     sizeof(struct xdp_md));
 
 out:
-	if (repeat > 1)
-		bpf_prog_change_xdp(prog, NULL);
 free_data:
 	for (i = 0; i < sinfo->nr_frags; i++)
 		__free_page(skb_frag_page(&sinfo->frags[i]));

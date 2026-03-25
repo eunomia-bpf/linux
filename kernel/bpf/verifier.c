@@ -3764,7 +3764,15 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
 {
-	return !!prog->aux->kinsn_tab;
+	const struct bpf_insn *insn = prog->insnsi;
+	int i;
+
+	for (i = 0; i < prog->len; i++, insn++) {
+		if (bpf_pseudo_kinsn_call(insn))
+			return true;
+	}
+
+	return false;
 }
 
 const struct btf_func_model *

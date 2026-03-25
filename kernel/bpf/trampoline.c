@@ -850,21 +850,18 @@ int bpf_trampoline_link_prog(struct bpf_tramp_link *link,
 	if (!tu)
 		return -ENOMEM;
 
-	mutex_lock(&tr->mutex);
-	err = __bpf_trampoline_link_prog(link, tr, tgt_prog);
-	if (err) {
-		mutex_unlock(&tr->mutex);
-		kfree(tu);
-		return err;
-	}
-	mutex_unlock(&tr->mutex);
-
 	tu->tr = tr;
 	mutex_lock(&link->link.prog->aux->rejit_mutex);
-	list_add(&tu->list, &link->link.prog->aux->trampoline_users);
+	mutex_lock(&tr->mutex);
+	err = __bpf_trampoline_link_prog(link, tr, tgt_prog);
+	if (!err)
+		list_add(&tu->list, &link->link.prog->aux->trampoline_users);
+	mutex_unlock(&tr->mutex);
 	mutex_unlock(&link->link.prog->aux->rejit_mutex);
+	if (err)
+		kfree(tu);
 
-	return 0;
+	return err;
 }
 
 static int __bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
@@ -905,11 +902,9 @@ int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 	struct bpf_tramp_user *tu, *tmp;
 	int err;
 
+	mutex_lock(&link->link.prog->aux->rejit_mutex);
 	mutex_lock(&tr->mutex);
 	err = __bpf_trampoline_unlink_prog(link, tr, tgt_prog);
-	mutex_unlock(&tr->mutex);
-
-	mutex_lock(&link->link.prog->aux->rejit_mutex);
 	list_for_each_entry_safe(tu, tmp,
 				 &link->link.prog->aux->trampoline_users,
 				 list) {
@@ -919,6 +914,7 @@ int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 			break;
 		}
 	}
+	mutex_unlock(&tr->mutex);
 	mutex_unlock(&link->link.prog->aux->rejit_mutex);
 
 	return err;
