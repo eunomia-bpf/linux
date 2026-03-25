@@ -240,6 +240,16 @@ struct btf_kfunc_set_tab {
 	struct btf_kfunc_hook_filter hook_filters[BTF_KFUNC_HOOK_MAX];
 };
 
+struct btf_kinsn_desc {
+	u32 var_id;
+	const struct bpf_kinsn *desc;
+};
+
+struct btf_kinsn_tab {
+	u32 cnt;
+	struct btf_kinsn_desc descs[];
+};
+
 struct btf_id_dtor_kfunc_tab {
 	u32 cnt;
 	struct btf_id_dtor_kfunc dtors[];
@@ -267,6 +277,7 @@ struct btf {
 	u32 id;
 	struct rcu_head rcu;
 	struct btf_kfunc_set_tab *kfunc_set_tab;
+	struct btf_kinsn_tab *kinsn_tab;
 	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
 	struct btf_struct_metas *struct_meta_tab;
 	struct btf_struct_ops_tab *struct_ops_tab;
@@ -1804,6 +1815,12 @@ static void btf_free_kfunc_set_tab(struct btf *btf)
 	btf->kfunc_set_tab = NULL;
 }
 
+static void btf_free_kinsn_tab(struct btf *btf)
+{
+	kfree(btf->kinsn_tab);
+	btf->kinsn_tab = NULL;
+}
+
 static void btf_free_dtor_kfunc_tab(struct btf *btf)
 {
 	struct btf_id_dtor_kfunc_tab *tab = btf->dtor_kfunc_tab;
@@ -1852,6 +1869,7 @@ static void btf_free(struct btf *btf)
 {
 	btf_free_struct_meta_tab(btf);
 	btf_free_dtor_kfunc_tab(btf);
+	btf_free_kinsn_tab(btf);
 	btf_free_kfunc_set_tab(btf);
 	btf_free_struct_ops_tab(btf);
 	kvfree(btf->types);
@@ -8951,6 +8969,221 @@ int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset)
 	return __register_btf_kfunc_id_set(BTF_KFUNC_HOOK_FMODRET, kset);
 }
 EXPORT_SYMBOL_GPL(register_btf_fmodret_id_set);
+
+static int btf_kinsn_desc_cmp(const void *a, const void *b)
+{
+	const struct btf_kinsn_desc *d0 = a;
+	const struct btf_kinsn_desc *d1 = b;
+
+	if (d0->var_id != d1->var_id)
+		return d0->var_id < d1->var_id ? -1 : 1;
+	return 0;
+}
+
+static bool btf_type_is_kinsn_desc(const struct btf *btf, u32 type_id)
+{
+	const struct btf_type *t;
+	const char *name;
+
+	t = btf_type_skip_modifiers(btf, type_id, &type_id);
+	if (!t || !btf_type_is_struct(t))
+		return false;
+
+	name = btf_name_by_offset(btf, t->name_off);
+	return name && !strcmp(name, "bpf_kinsn");
+}
+
+static int btf_resolve_kinsn_desc_id(const struct btf *btf,
+				     const struct bpf_kinsn_set *set,
+				     const struct bpf_kinsn_id *id,
+				     u32 *var_id)
+{
+	const struct btf_type *t;
+	s32 resolved_id;
+
+	if (!id->name || !id->name[0] || !id->desc)
+		return -EINVAL;
+	if (id->desc->owner != set->owner || !id->desc->instantiate_insn ||
+	    !id->desc->max_insn_cnt)
+		return -EINVAL;
+
+	resolved_id = btf_find_by_name_kind(btf, id->name, BTF_KIND_VAR);
+	if (resolved_id <= 0)
+		return resolved_id ? resolved_id : -ENOENT;
+
+	t = btf_type_by_id(btf, resolved_id);
+	if (!t || !btf_type_is_var(t))
+		return -EINVAL;
+	if (!btf_type_is_kinsn_desc(btf, t->type))
+		return -EINVAL;
+
+	*var_id = resolved_id;
+	return 0;
+}
+
+int register_bpf_kinsn_set(const struct bpf_kinsn_set *set)
+{
+	struct btf_kinsn_tab *new_tab, *old_tab;
+	struct btf_kinsn_desc *res, key = {};
+	struct btf *btf;
+	u32 i, old_cnt;
+	int ret = 0;
+
+	if (!set || !set->cnt || !set->ids)
+		return -EINVAL;
+
+	btf = btf_get_module_btf(set->owner);
+	if (!btf)
+		return check_btf_kconfigs(set->owner, "kinsn");
+	if (IS_ERR(btf))
+		return PTR_ERR(btf);
+
+	old_tab = btf->kinsn_tab;
+	old_cnt = old_tab ? old_tab->cnt : 0;
+	new_tab = kmalloc(struct_size(new_tab, descs, old_cnt + set->cnt),
+			  GFP_KERNEL | __GFP_NOWARN);
+	if (!new_tab) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	new_tab->cnt = old_cnt;
+	if (old_cnt)
+		memcpy(new_tab->descs, old_tab->descs,
+		       array_size(old_cnt, sizeof(new_tab->descs[0])));
+
+	for (i = 0; i < set->cnt; i++) {
+		ret = btf_resolve_kinsn_desc_id(btf, set, &set->ids[i], &key.var_id);
+		if (ret)
+			goto out_free;
+
+		res = bsearch(&key, new_tab->descs, new_tab->cnt,
+			      sizeof(new_tab->descs[0]), btf_kinsn_desc_cmp);
+		if (res) {
+			ret = -EEXIST;
+			goto out_free;
+		}
+
+		new_tab->descs[new_tab->cnt].var_id = key.var_id;
+		new_tab->descs[new_tab->cnt].desc = set->ids[i].desc;
+		new_tab->cnt++;
+	}
+
+	sort(new_tab->descs, new_tab->cnt, sizeof(new_tab->descs[0]),
+	     btf_kinsn_desc_cmp, NULL);
+
+	kfree(old_tab);
+	btf->kinsn_tab = new_tab;
+	goto out;
+
+out_free:
+	kfree(new_tab);
+out:
+	btf_put(btf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(register_bpf_kinsn_set);
+
+void unregister_bpf_kinsn_set(const struct bpf_kinsn_set *set)
+{
+	struct btf_kinsn_tab *new_tab, *old_tab;
+	u32 *var_ids = NULL;
+	struct btf *btf;
+	u32 i, j, keep_cnt;
+
+	if (!set || !set->cnt || !set->ids)
+		return;
+
+	btf = btf_get_module_btf(set->owner);
+	if (IS_ERR_OR_NULL(btf))
+		return;
+
+	old_tab = btf->kinsn_tab;
+	if (!old_tab)
+		goto out_put_btf;
+
+	var_ids = kcalloc(set->cnt, sizeof(*var_ids), GFP_KERNEL | __GFP_NOWARN);
+	if (!var_ids)
+		goto out_put_btf;
+
+	for (i = 0; i < set->cnt; i++) {
+		if (btf_resolve_kinsn_desc_id(btf, set, &set->ids[i], &var_ids[i]))
+			goto out_put_var_ids;
+	}
+
+	keep_cnt = 0;
+	for (i = 0; i < old_tab->cnt; i++) {
+		bool remove = false;
+
+		for (j = 0; j < set->cnt; j++) {
+			if (old_tab->descs[i].var_id == var_ids[j]) {
+				remove = true;
+				break;
+			}
+		}
+		if (!remove)
+			keep_cnt++;
+	}
+
+	if (keep_cnt == old_tab->cnt)
+		goto out_put_var_ids;
+
+	if (!keep_cnt) {
+		btf_free_kinsn_tab(btf);
+		goto out_put_var_ids;
+	}
+
+	new_tab = kmalloc(struct_size(new_tab, descs, keep_cnt),
+			  GFP_KERNEL | __GFP_NOWARN);
+	if (!new_tab)
+		goto out_put_var_ids;
+
+	new_tab->cnt = 0;
+	for (i = 0; i < old_tab->cnt; i++) {
+		bool remove = false;
+
+		for (j = 0; j < set->cnt; j++) {
+			if (old_tab->descs[i].var_id == var_ids[j]) {
+				remove = true;
+				break;
+			}
+		}
+		if (!remove)
+			new_tab->descs[new_tab->cnt++] = old_tab->descs[i];
+	}
+
+	kfree(old_tab);
+	btf->kinsn_tab = new_tab;
+
+out_put_var_ids:
+	kfree(var_ids);
+out_put_btf:
+	btf_put(btf);
+}
+EXPORT_SYMBOL_GPL(unregister_bpf_kinsn_set);
+
+/* Caller must keep the namespace that owns @btf alive. Verifier-side module
+ * BTF lookups already do this by stashing module refs in kfunc_btf_tab.
+ * register_bpf_kinsn_set() also enforces desc->owner == set->owner, so there
+ * is no second descriptor-specific module lifetime to pin here.
+ */
+int btf_try_get_kinsn_desc(const struct btf *btf, u32 var_id,
+			   const struct bpf_kinsn **desc)
+{
+	struct btf_kinsn_desc key = { .var_id = var_id };
+	struct btf_kinsn_desc *res;
+
+	if (!btf || !btf->kinsn_tab || !var_id)
+		return -ENOENT;
+
+	res = bsearch(&key, btf->kinsn_tab->descs, btf->kinsn_tab->cnt,
+		      sizeof(btf->kinsn_tab->descs[0]), btf_kinsn_desc_cmp);
+	if (!res || !res->desc)
+		return -ENOENT;
+
+	*desc = res->desc;
+	return 0;
+}
 
 s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
 {

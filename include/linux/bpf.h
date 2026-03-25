@@ -966,7 +966,7 @@ struct bpf_func_proto {
 };
 
 struct bpf_kinsn {
-	struct module *owner;
+	struct module *owner; /* NULL for built-in/vmlinux descriptors */
 	u16 max_insn_cnt;
 	u16 max_emit_bytes;
 
@@ -978,7 +978,16 @@ struct bpf_kinsn {
 			  u64 payload, const struct bpf_prog *prog);
 };
 
-#define BPF_KINSN_SIDECAR_PAYLOAD_BITS 52
+struct bpf_kinsn_id {
+	const char *name;
+	const struct bpf_kinsn *desc;
+};
+
+struct bpf_kinsn_set {
+	struct module *owner;
+	u32 cnt;
+	const struct bpf_kinsn_id *ids;
+};
 
 static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
 {
@@ -3085,6 +3094,8 @@ void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
 void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
 void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab);
+int register_bpf_kinsn_set(const struct bpf_kinsn_set *set);
+void unregister_bpf_kinsn_set(const struct bpf_kinsn_set *set);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog);
 const struct btf_func_model *
@@ -3381,6 +3392,15 @@ static inline void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 }
 
 static inline void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
+{
+}
+
+static inline int register_bpf_kinsn_set(const struct bpf_kinsn_set *set)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void unregister_bpf_kinsn_set(const struct bpf_kinsn_set *set)
 {
 }
 

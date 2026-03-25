@@ -858,6 +858,7 @@ struct bpf_verifier_env {
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
 	struct bpf_kinsn_region *kinsn_regions;
+	u32 kinsn_call_cnt;
 	u32 kinsn_region_cnt;
 	u32 kinsn_region_cap;
 };

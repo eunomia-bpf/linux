@@ -3395,17 +3395,8 @@ void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 
 void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
 {
-	u32 i;
-
 	if (!tab)
 		return;
-
-	for (i = 0; i < tab->nr_descs; i++) {
-		const struct bpf_kinsn *kinsn = tab->descs[i].kinsn;
-
-		if (kinsn && kinsn->owner)
-			module_put(kinsn->owner);
-	}
 
 	kvfree(tab->descs);
 	kfree(tab);
@@ -3613,30 +3604,11 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	return 0;
 }
 
-static bool btf_type_is_kinsn_desc(struct btf *btf, u32 type_id)
-{
-	const struct btf_type *t;
-	const char *name;
-
-	t = btf_type_by_id(btf, type_id);
-	if (!t)
-		return false;
-
-	t = btf_type_skip_modifiers(btf, type_id, &type_id);
-	if (!t || !btf_type_is_struct(t))
-		return false;
-
-	name = btf_name_by_offset(btf, t->name_off);
-	return name && !strcmp(name, "bpf_kinsn");
-}
-
 static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 var_id,
 				 s16 offset, const struct bpf_kinsn **kinsn)
 {
-	const struct btf_type *t;
-	const char *sym_name;
 	struct btf *btf;
-	unsigned long addr;
+	int err;
 
 	if (var_id <= 0) {
 		verbose(env, "invalid kinsn descriptor btf_id %d\n", var_id);
@@ -3649,39 +3621,21 @@ static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 var_id,
 		return PTR_ERR(btf);
 	}
 
-	t = btf_type_by_id(btf, var_id);
-	if (!t || !btf_type_is_var(t)) {
-		verbose(env, "kinsn btf_id %d is not a BTF_KIND_VAR\n", var_id);
-		return -EINVAL;
+	err = btf_try_get_kinsn_desc(btf, var_id, kinsn);
+	if (err) {
+		if (err == -ENOENT)
+			verbose(env, "kinsn descriptor btf_id %d is not registered\n",
+				var_id);
+		else
+			verbose(env, "failed to acquire kinsn descriptor btf_id %d\n",
+				var_id);
+		return err;
 	}
 
-	if (!btf_type_is_kinsn_desc(btf, t->type)) {
-		verbose(env, "kinsn btf_id %d does not describe struct bpf_kinsn\n",
-			var_id);
+	if (!(*kinsn)->instantiate_insn || !(*kinsn)->max_insn_cnt) {
+		verbose(env, "kinsn descriptor btf_id %d is incomplete\n", var_id);
 		return -EINVAL;
 	}
-
-	sym_name = btf_name_by_offset(btf, t->name_off);
-	if (!sym_name || !sym_name[0]) {
-		verbose(env, "kinsn descriptor btf_id %d has no symbol name\n", var_id);
-		return -EINVAL;
-	}
-
-	addr = kallsyms_lookup_name(sym_name);
-	if (!addr) {
-		verbose(env, "cannot find address for kinsn descriptor %s\n", sym_name);
-		return -EINVAL;
-	}
-
-	*kinsn = (const struct bpf_kinsn *)addr;
-	if (!(*kinsn)->owner || !(*kinsn)->instantiate_insn ||
-	    !(*kinsn)->max_insn_cnt) {
-		verbose(env, "kinsn descriptor %s is incomplete\n", sym_name);
-		return -EINVAL;
-	}
-
-	if (!try_module_get((*kinsn)->owner))
-		return -ENXIO;
 
 	return 0;
 }
@@ -3810,15 +3764,7 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
 {
-	const struct bpf_insn *insn = prog->insnsi;
-	int i;
-
-	for (i = 0; i < prog->len; i++, insn++) {
-		if (bpf_pseudo_kinsn_call(insn))
-			return true;
-	}
-
-	return false;
+	return !!prog->aux->kinsn_tab;
 }
 
 const struct btf_func_model *
@@ -3963,23 +3909,9 @@ static void scrub_restored_kinsn_aux(struct bpf_verifier_env *env, u32 start)
 	aux[start + 1] = keep_call;
 }
 
-static u32 count_kinsn_calls(const struct bpf_prog *prog)
-{
-	const struct bpf_insn *insn = prog->insnsi;
-	u32 cnt = 0;
-	u32 i;
-
-	for (i = 0; i < prog->len; i++, insn++) {
-		if (bpf_pseudo_kinsn_call(insn))
-			cnt++;
-	}
-
-	return cnt;
-}
-
 static int alloc_kinsn_proof_regions(struct bpf_verifier_env *env)
 {
-	u32 cap = count_kinsn_calls(env->prog);
+	u32 cap = env->kinsn_call_cnt;
 
 	kvfree(env->kinsn_regions);
 	env->kinsn_regions = NULL;
@@ -4213,6 +4145,8 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 	struct bpf_insn *insn = env->prog->insnsi;
 
 	/* Add entry function. */
+	env->kinsn_call_cnt = 0;
+
 	ret = add_subprog(env, 0);
 	if (ret)
 		return ret;
@@ -4232,8 +4166,10 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 			ret = add_subprog(env, i + insn->imm + 1);
 		else if (bpf_pseudo_kfunc_call(insn))
 			ret = add_kfunc_call(env, insn->imm, insn->off);
-		else
+		else {
+			env->kinsn_call_cnt++;
 			ret = add_kinsn_call(env, insn->imm, insn->off);
+		}
 
 		if (ret < 0)
 			return ret;
