@@ -3297,6 +3297,11 @@ static struct btf *__find_kfunc_desc_btf(struct bpf_verifier_env *env,
 	b = bsearch(&kf_btf, tab->descs, tab->nr_descs,
 		    sizeof(tab->descs[0]), kfunc_btf_cmp_by_off);
 	if (!b) {
+		if (tab->nr_descs == MAX_KFUNC_BTFS) {
+			verbose(env, "too many different module BTFs\n");
+			return ERR_PTR(-E2BIG);
+		}
+
 		if (bpfptr_is_null(env->fd_array)) {
 			verbose(env, "kfunc offset > 0 without fd_array is invalid\n");
 			return ERR_PTR(-EPROTO);
@@ -3323,13 +3328,6 @@ static struct btf *__find_kfunc_desc_btf(struct bpf_verifier_env *env,
 		if (!mod) {
 			btf_put(btf);
 			return ERR_PTR(-ENXIO);
-		}
-
-		if (tab->nr_descs == MAX_KFUNC_BTFS) {
-			module_put(mod);
-			btf_put(btf);
-			verbose(env, "too many different module BTFs\n");
-			return ERR_PTR(-E2BIG);
 		}
 
 		b = &tab->descs[tab->nr_descs++];

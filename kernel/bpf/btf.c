@@ -8940,18 +8940,20 @@ bool btf_kfunc_is_allowed(const struct btf *btf,
 			  u32 kfunc_btf_id,
 			  const struct bpf_prog *prog)
 {
-	enum bpf_prog_type prog_type = resolve_prog_type(prog);
-	enum btf_kfunc_hook hook;
+	enum btf_kfunc_hook hook = BTF_KFUNC_HOOK_COMMON;
 	u32 *kfunc_flags;
 
-	kfunc_flags = btf_kfunc_id_set_contains(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id);
-	if (kfunc_flags && __btf_kfunc_is_allowed(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id, prog))
+again:
+	kfunc_flags = btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id);
+	if (kfunc_flags &&
+	    __btf_kfunc_is_allowed(btf, hook, kfunc_btf_id, prog))
 		return true;
 
-	hook = bpf_prog_type_to_kfunc_hook(prog_type);
-	kfunc_flags = btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id);
-	if (kfunc_flags && __btf_kfunc_is_allowed(btf, hook, kfunc_btf_id, prog))
-		return true;
+	if (hook == BTF_KFUNC_HOOK_COMMON) {
+		hook = bpf_prog_type_to_kfunc_hook(resolve_prog_type(prog));
+		if (hook != BTF_KFUNC_HOOK_COMMON)
+			goto again;
+	}
 
 	return false;
 }
@@ -8965,34 +8967,39 @@ bool btf_kfunc_is_allowed(const struct btf *btf,
  */
 u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog)
 {
-	enum bpf_prog_type prog_type = resolve_prog_type(prog);
-	enum btf_kfunc_hook hook;
-
+	enum btf_kfunc_hook hook = BTF_KFUNC_HOOK_COMMON;
 	u32 *kfunc_flags;
 
-	kfunc_flags = btf_kfunc_id_set_contains(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id);
+again:
+	kfunc_flags = btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id);
 	if (kfunc_flags)
 		return kfunc_flags;
 
-	hook = bpf_prog_type_to_kfunc_hook(prog_type);
-	return btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id);
+	if (hook == BTF_KFUNC_HOOK_COMMON) {
+		hook = bpf_prog_type_to_kfunc_hook(resolve_prog_type(prog));
+		if (hook != BTF_KFUNC_HOOK_COMMON)
+			goto again;
+	}
+
+	return NULL;
 }
 
 const struct bpf_kinsn *btf_kfunc_kinsn_desc(const struct btf *btf, u32 kfunc_btf_id,
 					     const struct bpf_prog *prog)
 {
-	enum bpf_prog_type prog_type = resolve_prog_type(prog);
-	enum btf_kfunc_hook hook;
+	enum btf_kfunc_hook hook = BTF_KFUNC_HOOK_COMMON;
 	const struct bpf_kinsn *kinsn;
 
-	kinsn = btf_kfunc_kinsn_set_contains(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id);
-	if (kinsn && __btf_kfunc_is_allowed(btf, BTF_KFUNC_HOOK_COMMON, kfunc_btf_id, prog))
-		return kinsn;
-
-	hook = bpf_prog_type_to_kfunc_hook(prog_type);
+again:
 	kinsn = btf_kfunc_kinsn_set_contains(btf, hook, kfunc_btf_id);
 	if (kinsn && __btf_kfunc_is_allowed(btf, hook, kfunc_btf_id, prog))
 		return kinsn;
+
+	if (hook == BTF_KFUNC_HOOK_COMMON) {
+		hook = bpf_prog_type_to_kfunc_hook(resolve_prog_type(prog));
+		if (hook != BTF_KFUNC_HOOK_COMMON)
+			goto again;
+	}
 
 	return NULL;
 }
