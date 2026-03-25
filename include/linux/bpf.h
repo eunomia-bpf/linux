@@ -27,7 +27,6 @@
 #include <linux/stddef.h>
 #include <linux/bpfptr.h>
 #include <linux/btf.h>
-#include <linux/tnum.h>
 #include <linux/rcupdate_trace.h>
 #include <linux/static_call.h>
 #include <linux/memcontrol.h>
@@ -968,17 +967,15 @@ struct bpf_func_proto {
 
 struct bpf_kinsn {
 	struct module *owner;
-	u16 api_version;
 	u16 max_insn_cnt;
 	u16 max_emit_bytes;
-	u16 flags;
 
 	int (*instantiate_insn)(u64 payload, struct bpf_insn *insn_buf);
 
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
-			u64 payload, struct bpf_prog *prog);
+			u64 payload, const struct bpf_prog *prog);
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
-			  u64 payload, struct bpf_prog *prog);
+			  u64 payload, const struct bpf_prog *prog);
 };
 
 #define BPF_KINSN_SIDECAR_PAYLOAD_BITS 52
@@ -991,7 +988,7 @@ static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
 
 static inline u64 bpf_kinsn_sidecar_payload(const struct bpf_insn *insn)
 {
-	return (u64)insn->dst_reg |
+	return (u64)(insn->dst_reg & 0xf) |
 	       ((u64)(u16)insn->off << 4) |
 	       ((u64)(u32)insn->imm << 20);
 }

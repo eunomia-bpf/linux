@@ -935,16 +935,11 @@ int bpf_trampoline_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 
 		mutex_lock(&tr->mutex);
 
-		if (tr->extension_prog == prog) {
-			/* freplace: re-poke jump target */
-			err = bpf_arch_text_poke(tr->func.addr,
-						 BPF_MOD_JUMP, BPF_MOD_JUMP,
-						 (void *)old_bpf_func,
-						 (void *)prog->bpf_func);
-		} else {
-			/* fentry/fexit/fmod_ret/LSM: rebuild trampoline image */
-			err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
-		}
+		/* Rebuild the trampoline image for every user instead of trying
+		 * to text-poke freplace callsites in place. This keeps refresh
+		 * semantics aligned with the normal trampoline update path.
+		 */
+		err = bpf_trampoline_update(tr, true /* lock_direct_mutex */);
 
 		mutex_unlock(&tr->mutex);
 

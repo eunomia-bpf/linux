@@ -3326,6 +3326,13 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 		array = container_of(map, struct bpf_array, map);
 
 		for (key = 0; key < array->map.max_entries; key++) {
+			/*
+			 * This is an intentionally lockless pre-check. A slot can
+			 * change between this read and map_poke_run(), but both
+			 * directions are benign: delete phase can leave a stale
+			 * NOP until the updater repokes, and insert phase can miss
+			 * a newly added slot until that update path repokes it.
+			 */
 			if (array->ptrs[key] != prog)
 				continue;
 
@@ -3367,6 +3374,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->used_map_cnt, tmp->aux->used_map_cnt);
 	swap(prog->aux->kfunc_tab, tmp->aux->kfunc_tab);
 	swap(prog->aux->kfunc_btf_tab, tmp->aux->kfunc_btf_tab);
+	swap(prog->aux->kinsn_tab, tmp->aux->kinsn_tab);
 
 #ifdef CONFIG_SECURITY
 	swap(prog->aux->security, tmp->aux->security);
@@ -3414,10 +3422,8 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	 * bpf_prog, so we can only copy if the new insns fit within the
 	 * original allocation.
 	 */
-	if (bpf_prog_size(tmp->len) <= prog->pages * PAGE_SIZE) {
-		memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
-		prog->len = tmp->len;
-	}
+	memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
+	prog->len = tmp->len;
 
 	/* Publish the replacement image after metadata is in place. */
 	smp_wmb();
@@ -3614,6 +3620,10 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	err = -EOPNOTSUPP;
 	if (!bpf_prog_rejit_supported(tmp) || !tmp->jited)
 		goto free_tmp_noref;
+	if (bpf_prog_size(tmp->len) > prog->pages * PAGE_SIZE) {
+		err = -E2BIG;
+		goto free_tmp_noref;
+	}
 
 	{
 		bpf_func_t old_bpf_func = prog->bpf_func;

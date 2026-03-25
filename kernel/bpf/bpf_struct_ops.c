@@ -14,6 +14,7 @@
 #include <linux/rcupdate_wait.h>
 #include <linux/poll.h>
 #ifdef CONFIG_X86
+#include <asm/insn.h>
 #include <asm/text-patching.h>
 #endif
 #ifdef CONFIG_ARM64
@@ -1473,8 +1474,15 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 	unsigned long end = start + image_size;
 
 #ifdef CONFIG_X86
-	for (; start + CALL_INSN_SIZE <= end; start++) {
+	for (; start + CALL_INSN_SIZE <= end;) {
+		struct insn insn;
 		u8 *p = (u8 *)start;
+		int len;
+
+		insn_init(&insn, p, end - start, 1);
+		if (insn_get_length(&insn) || !insn.length)
+			break;
+		len = insn.length;
 
 		if (*p == CALL_INSN_OPCODE) {
 			s32 disp = *(s32 *)(p + 1);
@@ -1483,6 +1491,8 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 			if (target == old_target)
 				return p;
 		}
+
+		start += len;
 	}
 #elif defined(CONFIG_ARM64)
 	for (; start + sizeof(u32) <= end; start += sizeof(u32)) {

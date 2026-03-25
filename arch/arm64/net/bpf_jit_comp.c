@@ -1193,16 +1193,16 @@ static int add_exception_handler(const struct bpf_insn *insn,
 }
 
 static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
-				      struct bpf_prog *bpf_prog,
+				      const struct bpf_prog *bpf_prog,
 				      const struct bpf_insn *insn)
 {
 	const struct bpf_kinsn *kinsn;
 	u64 payload;
-	int saved_idx, n_insns;
+	int ret, saved_idx, n_insns;
 
-	n_insns = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
-	if (n_insns)
-		return n_insns;
+	ret = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
+	if (ret)
+		return ret;
 	if (!kinsn || !kinsn->emit_arm64)
 		return -EOPNOTSUPP;
 
@@ -1626,9 +1626,7 @@ emit_cond_jmp:
 
 		/* Try to inline a kinsn call via module-provided ARM64 emit */
 		if (insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
-			ret = emit_kinsn_desc_call_arm64(ctx,
-							 (struct bpf_prog *)ctx->prog,
-							 insn);
+			ret = emit_kinsn_desc_call_arm64(ctx, ctx->prog, insn);
 			if (ret)
 				return ret;
 			break;

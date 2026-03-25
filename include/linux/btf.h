@@ -79,8 +79,6 @@
 #define KF_ARENA_ARG1   (1 << 14) /* kfunc takes an arena pointer as its first argument */
 #define KF_ARENA_ARG2   (1 << 15) /* kfunc takes an arena pointer as its second argument */
 #define KF_IMPLICIT_ARGS (1 << 16) /* kfunc has implicit arguments supplied by the verifier */
-#define KF_KINSN       (1 << 17) /* kfunc is modeled/emitted as a BPF kernel instruction */
-
 /*
  * Tag marking a kernel function as a kfunc. This is meant to minimize the
  * amount of copy-paste that kfunc authors have to include for correctness so

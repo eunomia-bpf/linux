@@ -742,8 +742,6 @@ struct bpf_scc_info {
 
 struct bpf_liveness;
 
-#define MAX_KINSN_REGIONS 256
-
 struct bpf_kinsn_region {
 	u32 start;
 	u16 proof_len;
@@ -859,8 +857,9 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
-	struct bpf_kinsn_region kinsn_regions[MAX_KINSN_REGIONS];
+	struct bpf_kinsn_region *kinsn_regions;
 	u32 kinsn_region_cnt;
+	u32 kinsn_region_cap;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)

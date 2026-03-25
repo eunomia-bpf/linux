@@ -576,10 +576,11 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
-static int emit_kinsn_desc_call(u8 **pprog, struct bpf_prog *bpf_prog,
+static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
 				const struct bpf_insn *insn, bool emit)
 {
 	const struct bpf_kinsn *kinsn;
+	u8 scratch[BPF_MAX_INSN_SIZE];
 	u8 *prog = *pprog;
 	u32 off = 0;
 	u64 payload;
@@ -590,12 +591,16 @@ static int emit_kinsn_desc_call(u8 **pprog, struct bpf_prog *bpf_prog,
 		return ret;
 	if (!kinsn || !kinsn->emit_x86)
 		return -EOPNOTSUPP;
+	if (kinsn->max_emit_bytes > BPF_MAX_INSN_SIZE)
+		return -E2BIG;
 
-	ret = kinsn->emit_x86(prog, &off, emit, payload, bpf_prog);
+	ret = kinsn->emit_x86(scratch, &off, emit, payload, bpf_prog);
 	if (ret < 0)
 		return ret;
 	if (ret != off || ret > kinsn->max_emit_bytes)
 		return -EFAULT;
+	if (emit)
+		memcpy(prog, scratch, off);
 
 	*pprog = prog + off;
 	return 0;
@@ -2799,7 +2804,9 @@ emit_jmp:
 			 * to the interpreter, but not to the JIT, or if there is
 			 * junk in bpf_prog.
 			 */
-			pr_err("bpf_jit: unknown opcode %02x\n", insn->code);
+			pr_err("bpf_jit: unknown opcode %02x at insn %d (dst=%u src=%u off=%d imm=%d)\n",
+			       insn->code, i, insn->dst_reg, insn->src_reg,
+			       insn->off, insn->imm);
 			return -EINVAL;
 		}
 
