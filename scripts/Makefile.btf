@@ -2,8 +2,6 @@
 
 pahole-ver := $(CONFIG_PAHOLE_VERSION)
 pahole-flags-y :=
-extmod-btf-global-var-y :=
-extmod-btf-global-var-$(if $(KBUILD_EXTMOD),y) := ,global_var
 
 JOBS := $(patsubst -j%,%,$(filter -j%,$(MAKEFLAGS)))
 
@@ -16,7 +14,7 @@ pahole-flags-$(call test-ge, $(pahole-ver), 125)	+= --skip_encoding_btf_inconsis
 else
 
 # Switch to using --btf_features for v1.26 and later.
-pahole-flags-$(call test-ge, $(pahole-ver), 126)  = -j$(JOBS) --btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs$(extmod-btf-global-var-y)
+pahole-flags-$(call test-ge, $(pahole-ver), 126)  = -j$(JOBS) --btf_features=encode_force,var,float,enum64,decl_tag,type_tag,optimized_func,consistent_func,decl_tag_kfuncs
 
 pahole-flags-$(call test-ge, $(pahole-ver), 130) += --btf_features=attributes
 

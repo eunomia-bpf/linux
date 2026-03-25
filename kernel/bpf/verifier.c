@@ -3271,6 +3271,25 @@ static int kfunc_btf_cmp_by_off(const void *a, const void *b)
 	return d0->offset - d1->offset;
 }
 
+static struct module *find_kfunc_desc_module(const struct bpf_prog *prog,
+					     u16 offset)
+{
+	struct bpf_kfunc_btf key = { .offset = offset };
+	struct bpf_kfunc_btf_tab *tab;
+	struct bpf_kfunc_btf *desc;
+
+	if (!offset)
+		return NULL;
+
+	tab = prog->aux->kfunc_btf_tab;
+	if (!tab)
+		return NULL;
+
+	desc = bsearch(&key, tab->descs, tab->nr_descs,
+		       sizeof(tab->descs[0]), kfunc_btf_cmp_by_off);
+	return desc ? desc->module : NULL;
+}
+
 static struct bpf_kfunc_desc *
 find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
 {
@@ -3418,6 +3437,7 @@ static struct btf *find_kfunc_desc_btf(struct bpf_verifier_env *env, s16 offset)
 	return btf_vmlinux ?: ERR_PTR(-ENOENT);
 }
 
+#define KINSN_DESC_SUFFIX "_desc"
 #define KF_IMPL_SUFFIX "_impl"
 
 static const struct btf_type *find_kfunc_impl_proto(struct bpf_verifier_env *env,
@@ -3604,36 +3624,74 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	return 0;
 }
 
-static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 var_id,
+static int fetch_kinsn_desc_meta(struct bpf_verifier_env *env, s32 func_id,
 				 s16 offset, const struct bpf_kinsn **kinsn)
 {
+	struct module *mod;
+	const char *func_name;
+	const struct btf_type *func;
 	struct btf *btf;
-	int err;
+	unsigned long addr;
+	char *desc_name;
+	int len;
 
-	if (var_id <= 0) {
-		verbose(env, "invalid kinsn descriptor btf_id %d\n", var_id);
+	if (func_id <= 0) {
+		verbose(env, "invalid kinsn function btf_id %d\n", func_id);
 		return -EINVAL;
 	}
 
 	btf = find_kfunc_desc_btf(env, offset);
 	if (IS_ERR(btf)) {
-		verbose(env, "failed to find BTF for kinsn descriptor\n");
+		verbose(env, "failed to find BTF for kinsn function\n");
 		return PTR_ERR(btf);
 	}
 
-	err = btf_try_get_kinsn_desc(btf, var_id, kinsn);
-	if (err) {
-		if (err == -ENOENT)
-			verbose(env, "kinsn descriptor btf_id %d is not registered\n",
-				var_id);
-		else
-			verbose(env, "failed to acquire kinsn descriptor btf_id %d\n",
-				var_id);
-		return err;
+	func = btf_type_by_id(btf, func_id);
+	if (!func || !btf_type_is_func(func)) {
+		verbose(env, "kinsn function btf_id %d is not a BTF_KIND_FUNC\n",
+			func_id);
+		return -EINVAL;
+	}
+
+	func_name = btf_name_by_offset(btf, func->name_off);
+	if (!func_name || !*func_name) {
+		verbose(env, "failed to resolve kinsn function name for btf_id %d\n",
+			func_id);
+		return -EINVAL;
+	}
+
+	mod = find_kfunc_desc_module(env->prog, offset);
+	if (offset && !mod) {
+		verbose(env, "failed to find module for kinsn function btf_id %d\n",
+			func_id);
+		return -ENOENT;
+	}
+
+	desc_name = env->tmp_str_buf;
+	len = snprintf(desc_name, TMP_STR_BUF_LEN, "%s%s",
+		       func_name, KINSN_DESC_SUFFIX);
+	if (len < 0 || len >= TMP_STR_BUF_LEN) {
+		verbose(env, "kinsn descriptor symbol name %s%s is too long\n",
+			func_name, KINSN_DESC_SUFFIX);
+		return -EINVAL;
+	}
+
+	addr = mod ? find_kallsyms_symbol_value(mod, desc_name)
+		   : kallsyms_lookup_name(desc_name);
+	if (!addr) {
+		verbose(env, "failed to find kinsn descriptor symbol %s\n",
+			desc_name);
+		return -ENOENT;
+	}
+
+	*kinsn = (const struct bpf_kinsn *)addr;
+	if ((*kinsn)->owner != mod) {
+		verbose(env, "kinsn descriptor %s owner mismatch\n", desc_name);
+		return -EINVAL;
 	}
 
 	if (!(*kinsn)->instantiate_insn || !(*kinsn)->max_insn_cnt) {
-		verbose(env, "kinsn descriptor btf_id %d is incomplete\n", var_id);
+		verbose(env, "kinsn function btf_id %d is incomplete\n", func_id);
 		return -EINVAL;
 	}
 

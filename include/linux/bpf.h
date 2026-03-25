@@ -978,17 +978,6 @@ struct bpf_kinsn {
 			  u64 payload, const struct bpf_prog *prog);
 };
 
-struct bpf_kinsn_id {
-	const char *name;
-	const struct bpf_kinsn *desc;
-};
-
-struct bpf_kinsn_set {
-	struct module *owner;
-	u32 cnt;
-	const struct bpf_kinsn_id *ids;
-};
-
 static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
@@ -3094,8 +3083,6 @@ void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
 void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
 void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab);
-int register_bpf_kinsn_set(const struct bpf_kinsn_set *set);
-void unregister_bpf_kinsn_set(const struct bpf_kinsn_set *set);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog);
 const struct btf_func_model *
@@ -3392,15 +3379,6 @@ static inline void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 }
 
 static inline void bpf_free_kinsn_desc_tab(struct bpf_kinsn_desc_tab *tab)
-{
-}
-
-static inline int register_bpf_kinsn_set(const struct bpf_kinsn_set *set)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline void unregister_bpf_kinsn_set(const struct bpf_kinsn_set *set)
 {
 }
 

@@ -37,7 +37,7 @@ static const char *__func_get_name(const struct bpf_insn_cbs *cbs,
 	else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
 		snprintf(buff, len, "kernel-function");
 	else if (insn->src_reg == BPF_PSEUDO_KINSN_CALL)
-		snprintf(buff, len, "kinsn-descriptor");
+		snprintf(buff, len, "kinsn-function");
 
 	return buff;
 }

@@ -115,7 +115,6 @@ union bpf_attr;
 struct btf_show;
 struct btf_id_set;
 struct bpf_prog;
-struct bpf_kinsn;
 
 typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
 
@@ -584,8 +583,6 @@ u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
 int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 			      const struct btf_kfunc_id_set *s);
 int register_btf_fmodret_id_set(const struct btf_kfunc_id_set *kset);
-int btf_try_get_kinsn_desc(const struct btf *btf, u32 var_id,
-			   const struct bpf_kinsn **desc);
 s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id);
 int register_btf_id_dtor_kfuncs(const struct btf_id_dtor_kfunc *dtors, u32 add_cnt,
 				struct module *owner);
@@ -652,14 +649,6 @@ static inline int register_btf_kfunc_id_set(enum bpf_prog_type prog_type,
 					    const struct btf_kfunc_id_set *s)
 {
 	return 0;
-}
-static inline int btf_try_get_kinsn_desc(const struct btf *btf, u32 var_id,
-					 const struct bpf_kinsn **desc)
-{
-	(void)btf;
-	(void)var_id;
-	(void)desc;
-	return -ENOENT;
 }
 static inline s32 btf_find_dtor_kfunc(struct btf *btf, u32 btf_id)
 {

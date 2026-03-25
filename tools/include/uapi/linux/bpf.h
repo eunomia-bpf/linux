@@ -1385,11 +1385,11 @@ enum {
 #define BPF_PSEUDO_KFUNC_CALL	2
 /* when bpf_mov->src_reg == BPF_PSEUDO_KINSN_SIDECAR,
  * the instruction carries packed kinsn metadata for the immediately
- * following kfunc call.
+ * following kinsn call.
  */
 #define BPF_PSEUDO_KINSN_SIDECAR 3
 /* when bpf_call->src_reg == BPF_PSEUDO_KINSN_CALL,
- * bpf_call->imm == btf_id of a BTF_KIND_VAR describing struct bpf_kinsn
+ * bpf_call->imm == btf_id of a BTF_KIND_FUNC kinsn stub
  */
 #define BPF_PSEUDO_KINSN_CALL	4
 
