@@ -3081,13 +3081,9 @@ void bpf_task_storage_free(struct task_struct *task);
 void bpf_cgrp_storage_free(struct cgroup *cgroup);
 void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab);
 bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
-bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
-const struct bpf_kinsn *
-bpf_jit_find_kinsn_desc(const struct bpf_prog *prog,
-			const struct bpf_insn *insn);
 int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
 			      const struct bpf_insn *insn,
 			      const struct bpf_kinsn **kinsn,
@@ -3380,21 +3376,9 @@ static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 	return false;
 }
 
-static inline bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
-{
-	return false;
-}
-
 static inline const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
-{
-	return NULL;
-}
-
-static inline const struct bpf_kinsn *
-bpf_jit_find_kinsn_desc(const struct bpf_prog *prog,
-			const struct bpf_insn *insn)
 {
 	return NULL;
 }

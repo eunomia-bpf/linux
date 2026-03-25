@@ -3440,9 +3440,11 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	memcpy(prog->insnsi, tmp->insnsi, bpf_prog_insn_size(tmp));
 	prog->len = tmp->len;
 
-	/* Publish the replacement image after metadata is in place. */
-	smp_wmb();
-	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
+	/* Publish the replacement image after metadata is in place.
+	 * Pairs with readers that fetch prog->bpf_func after observing the
+	 * rest of prog metadata.
+	 */
+	smp_store_release(&prog->bpf_func, tmp->bpf_func);
 	tmp->jited = old_jited;
 	tmp->jited_len = old_jited_len;
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
