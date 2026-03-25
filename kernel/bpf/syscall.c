@@ -3226,6 +3226,7 @@ static int bpf_prog_rejit_update_poke_tab(struct bpf_prog *prog,
 		new_poke = &tmp->aux->poke_tab[i];
 
 		if (old_poke->reason != new_poke->reason ||
+		    old_poke->insn_idx != new_poke->insn_idx ||
 		    old_poke->tail_call.map != new_poke->tail_call.map ||
 		    old_poke->tail_call.key != new_poke->tail_call.key)
 			return -EINVAL;

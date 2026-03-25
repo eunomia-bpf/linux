@@ -1010,10 +1010,6 @@ void bpf_prog_pack_free(void *ptr, u32 size)
 	nbits = BPF_PROG_SIZE_TO_NBITS(size);
 	pos = ((unsigned long)ptr - (unsigned long)pack->ptr) >> BPF_PROG_CHUNK_SHIFT;
 
-	/* Poison freed JIT text so stale instructions do not remain executable.
-	 * Live patching already handles I-cache coherency for rewritten text;
-	 * this hardens pack chunks that are about to be recycled.
-	 */
 	WARN_ONCE(bpf_arch_text_invalidate(ptr, size),
 		  "bpf_prog_pack bug: missing bpf_arch_text_invalidate?\n");
 

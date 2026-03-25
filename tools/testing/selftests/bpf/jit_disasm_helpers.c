@@ -10,8 +10,6 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 
-#include <stdlib.h>
-
 /* The intent is to use get_jited_program_text() for small test
  * programs written in BPF assembly, thus assume that 32 local labels
  * would be sufficient.
@@ -90,33 +88,6 @@ static int cmp_u32(const void *_a, const void *_b)
 	return 0;
 }
 
-static void normalize_movabs_imm_hex(char *buf, size_t buf_sz)
-{
-	char tmp[64];
-	char *mnem;
-	char *imm, *digits, *end;
-	unsigned long long mag;
-	size_t prefix_len;
-
-	mnem = strstr(buf, "movabsq");
-	if (!mnem)
-		return;
-
-	imm = strstr(buf, "$-0x");
-	if (!imm || imm < mnem)
-		return;
-
-	digits = imm + strlen("$-0x");
-	mag = strtoull(digits, &end, 16);
-	if (end == digits || *end != ',')
-		return;
-
-	prefix_len = imm - buf;
-	snprintf(tmp, sizeof(tmp), "%.*s$0x%llx%s",
-		 (int)prefix_len, buf, 0ULL - mag, end);
-	snprintf(buf, buf_sz, "%s", tmp);
-}
-
 static int disasm_one_func(FILE *text_out, uint8_t *image, __u32 len)
 {
 	char *label, *colon, *triple = NULL;
@@ -170,7 +141,6 @@ static int disasm_one_func(FILE *text_out, uint8_t *image, __u32 len)
 			err = cnt;
 			goto out;
 		}
-		normalize_movabs_imm_hex(buf, sizeof(buf));
 		label_pc = bsearch(&pc, labels.pcs, labels.cnt, sizeof(*labels.pcs), cmp_u32);
 		label = "";
 		colon = "";

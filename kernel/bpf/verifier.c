@@ -3173,6 +3173,9 @@ static int bpf_find_exception_callback_insn_off(struct bpf_verifier_env *env)
 	return ret;
 }
 
+#define MAX_KFUNC_DESCS 256
+#define MAX_KFUNC_BTFS	256
+
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
 	u32 func_id;
@@ -3193,15 +3196,13 @@ struct bpf_kfunc_desc_tab {
 	 * available, therefore at the end of verification do_misc_fixups()
 	 * sorts this by imm and offset.
 	 */
-	struct bpf_kfunc_desc *descs;
+	struct bpf_kfunc_desc descs[MAX_KFUNC_DESCS];
 	u32 nr_descs;
-	u32 desc_cap;
 };
 
 struct bpf_kfunc_btf_tab {
-	struct bpf_kfunc_btf *descs;
+	struct bpf_kfunc_btf descs[MAX_KFUNC_BTFS];
 	u32 nr_descs;
-	u32 desc_cap;
 };
 
 struct bpf_kinsn_desc {
@@ -3366,11 +3367,11 @@ static struct btf *__find_kfunc_desc_btf(struct bpf_verifier_env *env,
 			return ERR_PTR(-ENXIO);
 		}
 
-		if (ensure_desc_capacity((void **)&tab->descs, &tab->desc_cap,
-					 sizeof(tab->descs[0]), tab->nr_descs + 1)) {
+		if (tab->nr_descs == MAX_KFUNC_BTFS) {
 			module_put(mod);
 			btf_put(btf);
-			return ERR_PTR(-ENOMEM);
+			verbose(env, "too many different module BTFs\n");
+			return ERR_PTR(-E2BIG);
 		}
 
 		b = &tab->descs[tab->nr_descs++];
@@ -3399,7 +3400,6 @@ void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab)
 		module_put(tab->descs[tab->nr_descs].module);
 		btf_put(tab->descs[tab->nr_descs].btf);
 	}
-	kvfree(tab->descs);
 	kfree(tab);
 }
 
@@ -3408,7 +3408,6 @@ void bpf_free_kfunc_desc_tab(struct bpf_kfunc_desc_tab *tab)
 	if (!tab)
 		return;
 
-	kvfree(tab->descs);
 	kfree(tab);
 }
 
@@ -3589,6 +3588,11 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	if (find_kfunc_desc(env->prog, func_id, offset))
 		return 0;
 
+	if (tab->nr_descs == MAX_KFUNC_DESCS) {
+		verbose(env, "too many different kernel function calls\n");
+		return -E2BIG;
+	}
+
 	err = fetch_kfunc_meta(env, func_id, offset, &kfunc);
 	if (err)
 		return err;
@@ -3606,11 +3610,6 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	}
 
 	err = btf_distill_func_proto(&env->log, kfunc.btf, kfunc.proto, kfunc.name, &func_model);
-	if (err)
-		return err;
-
-	err = ensure_desc_capacity((void **)&tab->descs, &tab->desc_cap,
-				   sizeof(tab->descs[0]), tab->nr_descs + 1);
 	if (err)
 		return err;
 

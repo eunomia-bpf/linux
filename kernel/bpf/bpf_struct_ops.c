@@ -1536,13 +1536,13 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		struct bpf_ksym *ksym;
 
 		if (!st_map->links[i])
-			break;
+			continue;
 		if (st_map->links[i]->prog != prog)
 			continue;
 
 		ksym = st_map->ksyms[i];
 		if (!ksym)
-			break;
+			continue;
 
 		call_site = find_call_site((void *)ksym->start,
 					   ksym->end - ksym->start,

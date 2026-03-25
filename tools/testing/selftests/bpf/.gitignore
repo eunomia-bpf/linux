@@ -47,8 +47,3 @@ verification_cert.h
 *.BTF
 *.BTF_ids
 *.BTF.base
-/rejit_poc
-/rejit_safety_tests
-/rejit_prog_types
-/rejit_tail_call
-/get_original_poc

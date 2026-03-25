@@ -1002,17 +1002,6 @@ static void emit_mov_imm64(u8 **pprog, u32 dst_reg,
 	*pprog = prog;
 }
 
-static void emit_movabs_imm64(u8 **pprog, u32 dst_reg, u64 imm64)
-{
-	u8 *prog = *pprog;
-
-	EMIT2(add_1mod(0x48, dst_reg), add_1reg(0xB8, dst_reg));
-	EMIT((u32)imm64, 4);
-	EMIT((u32)(imm64 >> 32), 4);
-
-	*pprog = prog;
-}
-
 static void emit_mov_reg(u8 **pprog, bool is64, u32 dst_reg, u32 src_reg)
 {
 	u8 *prog = *pprog;
@@ -1623,7 +1612,8 @@ static void emit_priv_frame_ptr(u8 **pprog, void __percpu *priv_frame_ptr)
 	u8 *prog = *pprog;
 
 	/* movabs r9, priv_frame_ptr */
-	emit_movabs_imm64(&prog, X86_REG_R9, (u64)(__force long)priv_frame_ptr);
+	emit_mov_imm64(&prog, X86_REG_R9, (__force long) priv_frame_ptr >> 32,
+		       (u32) (__force long) priv_frame_ptr);
 
 #ifdef CONFIG_SMP
 	/* add <r9>, gs:[<off>] */
@@ -2804,9 +2794,7 @@ emit_jmp:
 			 * to the interpreter, but not to the JIT, or if there is
 			 * junk in bpf_prog.
 			 */
-			pr_err("bpf_jit: unknown opcode %02x at insn %d (dst=%u src=%u off=%d imm=%d)\n",
-			       insn->code, i, insn->dst_reg, insn->src_reg,
-			       insn->off, insn->imm);
+			pr_err("bpf_jit: unknown opcode %02x\n", insn->code);
 			return -EINVAL;
 		}
 
