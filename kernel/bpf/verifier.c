@@ -3626,11 +3626,6 @@ static int add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, s16 offset)
 	return add_kfunc_desc(env, func_id, offset, false);
 }
 
-static int add_kinsn_call(struct bpf_verifier_env *env, s32 imm, s16 offset)
-{
-	return add_kfunc_desc(env, imm, offset, true);
-}
-
 static int kfunc_desc_cmp_by_imm_off(const void *a, const void *b)
 {
 	const struct bpf_kfunc_desc *d0 = a;
@@ -3687,7 +3682,7 @@ static int sort_kfunc_descs_by_imm_off(struct bpf_verifier_env *env)
 	return 0;
 }
 
-bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+static bool bpf_prog_has_desc_kind(const struct bpf_prog *prog, bool kinsn)
 {
 	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
 	u32 i;
@@ -3696,24 +3691,21 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
 		return false;
 
 	for (i = 0; i < tab->nr_descs; i++) {
-		if (!tab->descs[i].kinsn)
+		if (!!tab->descs[i].kinsn == kinsn)
 			return true;
 	}
 
 	return false;
 }
 
+bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
+{
+	return bpf_prog_has_desc_kind(prog, false);
+}
+
 bool bpf_prog_has_kinsn_call(const struct bpf_prog *prog)
 {
-	const struct bpf_insn *insn = prog->insnsi;
-	int i;
-
-	for (i = 0; i < prog->len; i++, insn++) {
-		if (bpf_pseudo_kinsn_call(insn))
-			return true;
-	}
-
-	return false;
+	return bpf_prog_has_desc_kind(prog, true);
 }
 
 const struct btf_func_model *
@@ -3730,21 +3722,10 @@ const struct bpf_kinsn *
 bpf_jit_find_kinsn_desc(const struct bpf_prog *prog,
 			const struct bpf_insn *insn)
 {
-	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
-	u32 i;
+	const struct bpf_kfunc_desc *desc;
 
-	if (!tab)
-		return NULL;
-
-	for (i = 0; i < tab->nr_descs; i++) {
-		struct bpf_kfunc_desc *desc = &tab->descs[i];
-
-		if (desc->kinsn && desc->func_id == insn->imm &&
-		    desc->offset == insn->off)
-			return desc->kinsn;
-	}
-
-	return NULL;
+	desc = find_kfunc_desc_by_imm_off(prog, insn->imm, insn->off);
+	return desc ? desc->kinsn : NULL;
 }
 
 static bool bpf_kinsn_is_subprog_start(const struct bpf_verifier_env *env,
@@ -4120,7 +4101,7 @@ static int add_subprog_and_kfunc(struct bpf_verifier_env *env)
 			ret = add_kfunc_call(env, insn->imm, insn->off);
 		else {
 			env->kinsn_call_cnt++;
-			ret = add_kinsn_call(env, insn->imm, insn->off);
+			ret = add_kfunc_desc(env, insn->imm, insn->off, true);
 		}
 
 		if (ret < 0)
