@@ -978,6 +978,21 @@ struct bpf_kinsn {
 			  u64 payload, const struct bpf_prog *prog);
 };
 
+static inline bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
+{
+	if (!kinsn)
+		return false;
+#ifdef CONFIG_X86
+	if (kinsn->emit_x86)
+		return true;
+#endif
+#ifdef CONFIG_ARM64
+	if (kinsn->emit_arm64)
+		return true;
+#endif
+	return false;
+}
+
 static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&

@@ -23773,12 +23773,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 
-				if (prog->jit_requested && bpf_kinsn_has_native_emit(kinsn))
-					goto next_insn;
+			if (prog->jit_requested && bpf_kinsn_has_native_emit(kinsn))
+				goto next_insn;
 
-				ret = verifier_remove_insns(env, i + delta + 1, 1);
-				if (ret)
-					return ret;
+			ret = verifier_remove_insns(env, i + delta + 1, 1);
+			if (ret)
+				return ret;
 
 			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
 			if (!new_prog)

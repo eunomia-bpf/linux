@@ -2463,6 +2463,13 @@ static void bpf_prog_get_stats(const struct bpf_prog *prog,
 	u64 nsecs = 0, cnt = 0, misses = 0;
 	int cpu;
 
+	if (unlikely(!prog->stats)) {
+		stats->nsecs = 0;
+		stats->cnt = 0;
+		stats->misses = 0;
+		return;
+	}
+
 	for_each_possible_cpu(cpu) {
 		const struct bpf_prog_stats *st;
 		unsigned int start;
@@ -3365,10 +3372,13 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 {
 	bool old_jited = prog->jited;
+	bool old_jit_requested = prog->jit_requested;
 	u32 old_jited_len = prog->jited_len;
 	bpf_func_t old_bpf_func = prog->bpf_func;
 	u32 i;
 
+	swap(prog->aux->ctx_arg_info, tmp->aux->ctx_arg_info);
+	swap(prog->aux->ctx_arg_info_size, tmp->aux->ctx_arg_info_size);
 	swap(prog->aux->orig_insns, tmp->aux->orig_insns);
 	swap(prog->aux->orig_prog_len, tmp->aux->orig_prog_len);
 	swap(prog->aux->used_btfs, tmp->aux->used_btfs);
@@ -3381,14 +3391,23 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	swap(prog->aux->jited_linfo, tmp->aux->jited_linfo);
 	swap(prog->aux->nr_linfo, tmp->aux->nr_linfo);
 	swap(prog->aux->linfo_idx, tmp->aux->linfo_idx);
+	swap(prog->aux->mod, tmp->aux->mod);
 	swap(prog->aux->num_exentries, tmp->aux->num_exentries);
 	swap(prog->aux->extable, tmp->aux->extable);
 	swap(prog->aux->priv_stack_ptr, tmp->aux->priv_stack_ptr);
+	swap(prog->aux->saved_dst_prog_type, tmp->aux->saved_dst_prog_type);
+	swap(prog->aux->saved_dst_attach_type, tmp->aux->saved_dst_attach_type);
+	swap(prog->aux->tail_call_reachable, tmp->aux->tail_call_reachable);
+	swap(prog->aux->exception_cb, tmp->aux->exception_cb);
 	swap(prog->aux->jit_data, tmp->aux->jit_data);
 	swap(prog->aux->used_maps, tmp->aux->used_maps);
 	swap(prog->aux->used_map_cnt, tmp->aux->used_map_cnt);
 	swap(prog->aux->kfunc_tab, tmp->aux->kfunc_tab);
 	swap(prog->aux->kfunc_btf_tab, tmp->aux->kfunc_btf_tab);
+	swap(prog->aux->might_sleep, tmp->aux->might_sleep);
+	swap(prog->aux->arena, tmp->aux->arena);
+	swap(prog->aux->attach_func_proto, tmp->aux->attach_func_proto);
+	swap(prog->aux->attach_func_name, tmp->aux->attach_func_name);
 
 #ifdef CONFIG_SECURITY
 	swap(prog->aux->security, tmp->aux->security);
@@ -3411,6 +3430,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 
 	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
 	prog->jited = tmp->jited;
+	prog->jit_requested = tmp->jit_requested;
 	prog->jited_len = tmp->jited_len;
 	prog->gpl_compatible = tmp->gpl_compatible;
 	prog->cb_access = tmp->cb_access;
@@ -3446,9 +3466,9 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	prog->len = tmp->len;
 
 	/* Publish the replacement image after metadata is in place. */
-	smp_wmb();
-	WRITE_ONCE(prog->bpf_func, tmp->bpf_func);
+	smp_store_release(&prog->bpf_func, tmp->bpf_func);
 	tmp->jited = old_jited;
+	tmp->jit_requested = old_jit_requested;
 	tmp->jited_len = old_jited_len;
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
 
@@ -5492,6 +5512,16 @@ struct bpf_prog *bpf_prog_by_id(u32 id)
 	return prog;
 }
 
+static void rejit_scx_debug_prog(const char *phase, const struct bpf_prog *prog, u32 req_id)
+{
+	if (!prog || prog->type != BPF_PROG_TYPE_STRUCT_OPS)
+		return;
+
+	pr_info("rejit-scx-debug: %s req_id=%u prog_id=%u name=%s func=%px jited_len=%u aux=%px\n",
+		phase, req_id, prog->aux->id, prog->aux->name,
+		prog->bpf_func, prog->jited_len, prog->aux);
+}
+
 static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 {
 	struct bpf_prog *prog;
@@ -5507,10 +5537,15 @@ static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 	prog = bpf_prog_by_id(id);
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
+	rejit_scx_debug_prog("get_fd_by_id.enter", prog, id);
 
 	fd = bpf_prog_new_fd(prog);
-	if (fd < 0)
+	if (fd < 0) {
+		rejit_scx_debug_prog("get_fd_by_id.fd_fail", prog, id);
 		bpf_prog_put(prog);
+	} else {
+		rejit_scx_debug_prog("get_fd_by_id.fd_ok", prog, id);
+	}
 
 	return fd;
 }
@@ -5676,7 +5711,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 				   union bpf_attr __user *uattr)
 {
 	struct bpf_prog_info __user *uinfo = u64_to_user_ptr(attr->info.info);
-	struct btf *attach_btf = bpf_prog_get_target_btf(prog);
+	struct btf *attach_btf;
 	struct bpf_prog_info info;
 	u32 info_len = attr->info.info_len;
 	struct bpf_prog_kstats stats;
@@ -5692,6 +5727,13 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	memset(&info, 0, sizeof(info));
 	if (copy_from_user(&info, uinfo, info_len))
 		return -EFAULT;
+
+	/* Snapshot prog metadata under rejit_mutex so prog show sees a
+	 * self-consistent image while BPF_PROG_REJIT swaps it in place.
+	 */
+	guard(mutex)(&prog->aux->rejit_mutex);
+	attach_btf = bpf_prog_get_target_btf(prog);
+	rejit_scx_debug_prog("get_info.enter", prog, prog->aux->id);
 
 	info.type = prog->type;
 	info.id = prog->aux->id;
@@ -5719,6 +5761,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 			}
 	}
 	mutex_unlock(&prog->aux->used_maps_mutex);
+	rejit_scx_debug_prog("get_info.after_maps", prog, prog->aux->id);
 
 	err = set_info_rec_size(&info);
 	if (err)
@@ -5728,6 +5771,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	info.run_time_ns = stats.nsecs;
 	info.run_cnt = stats.cnt;
 	info.recursion_misses = stats.misses;
+	rejit_scx_debug_prog("get_info.after_stats", prog, prog->aux->id);
 
 	info.verified_insns = prog->aux->verified_insns;
 	if (prog->aux->btf)
@@ -5966,6 +6010,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 done:
+	rejit_scx_debug_prog("get_info.done", prog, prog->aux->id);
 	if (copy_to_user(uinfo, &info, info_len) ||
 	    put_user(info_len, &uattr->info.info_len))
 		return -EFAULT;

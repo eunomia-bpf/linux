@@ -1518,6 +1518,7 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 {
 	struct bpf_struct_ops_map *st_map;
+	void *new_bpf_func = (void *)prog->bpf_func;
 	void **call_sites = NULL;
 	struct bpf_map *map;
 	u32 i;
@@ -1551,6 +1552,15 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 					       ksym->end - ksym->start,
 					       (void *)old_bpf_func);
 		if (!call_sites[i]) {
+			void *current_site;
+
+			current_site = find_call_site((void *)ksym->start,
+						      ksym->end - ksym->start,
+						      new_bpf_func);
+			if (current_site)
+				continue;
+		}
+		if (!call_sites[i]) {
 			pr_warn("struct_ops rejit: CALL site not found in trampoline %s\n",
 				ksym->name);
 			err = -ENOENT;
@@ -1569,9 +1579,22 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		err = bpf_arch_text_poke(call_sites[i], BPF_MOD_CALL,
 					 BPF_MOD_CALL,
 					 (void *)old_bpf_func,
-					 (void *)prog->bpf_func);
+					 new_bpf_func);
 		if (err) {
+			u32 rollback_i;
+
 			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
+			for (rollback_i = i; rollback_i > 0; rollback_i--) {
+				void **patched_site = call_sites[rollback_i - 1];
+
+				if (!patched_site)
+					continue;
+				if (bpf_arch_text_poke(patched_site, BPF_MOD_CALL,
+						      BPF_MOD_CALL,
+						      new_bpf_func,
+						      (void *)old_bpf_func))
+					pr_warn("struct_ops rejit: rollback text_poke failed\n");
+			}
 			goto out;
 		}
 	}
