@@ -910,13 +910,15 @@ int bpf_trampoline_unlink_prog(struct bpf_tramp_link *link,
 	mutex_lock(&link->link.prog->aux->rejit_mutex);
 	mutex_lock(&tr->mutex);
 	err = __bpf_trampoline_unlink_prog(link, tr, tgt_prog);
-	list_for_each_entry_safe(tu, tmp,
-				 &link->link.prog->aux->trampoline_users,
-				 list) {
-		if (tu->tr == tr) {
-			list_del(&tu->list);
-			kfree(tu);
-			break;
+	if (!err) {
+		list_for_each_entry_safe(tu, tmp,
+					 &link->link.prog->aux->trampoline_users,
+					 list) {
+			if (tu->tr == tr) {
+				list_del(&tu->list);
+				kfree(tu);
+				break;
+			}
 		}
 	}
 	mutex_unlock(&tr->mutex);

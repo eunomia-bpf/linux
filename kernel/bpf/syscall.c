@@ -3529,6 +3529,7 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 				    const struct bpf_prog_rejit_rollback_state *state)
 {
 	int err, rollback_err = 0;
+	u32 i;
 
 	/* Callers currently jump to the replacement image. Remove those edges
 	 * before restoring the old bpf_func address, then republish the old
@@ -3540,9 +3541,28 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 	bpf_prog_rejit_restore_rollback(prog, state);
 
 	if (saved_poke_tab && prog->aux->poke_tab &&
-	    prog->aux->size_poke_tab == saved_poke_cnt)
-		memcpy(prog->aux->poke_tab, saved_poke_tab,
-		       saved_poke_cnt * sizeof(*saved_poke_tab));
+	    prog->aux->size_poke_tab == saved_poke_cnt) {
+		for (i = 0; i < saved_poke_cnt; i++) {
+			struct bpf_jit_poke_descriptor *poke = &prog->aux->poke_tab[i];
+			struct bpf_jit_poke_descriptor *saved_poke = &saved_poke_tab[i];
+			struct bpf_array *array;
+
+			if (poke->reason != BPF_POKE_REASON_TAIL_CALL)
+				continue;
+
+			array = container_of(poke->tail_call.map, struct bpf_array, map);
+			mutex_lock(&array->aux->poke_mutex);
+
+			WRITE_ONCE(poke->tailcall_target_stable, false);
+			poke->tailcall_target = saved_poke->tailcall_target;
+			poke->tailcall_bypass = saved_poke->tailcall_bypass;
+			poke->bypass_addr = saved_poke->bypass_addr;
+			poke->adj_off = saved_poke->adj_off;
+			WRITE_ONCE(poke->tailcall_target_stable, true);
+
+			mutex_unlock(&array->aux->poke_mutex);
+		}
+	}
 
 	bpf_prog_rejit_poke_target_phase(prog, true);
 
@@ -3804,15 +3824,11 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
 				err);
 			ret = err;
-			err = bpf_prog_rejit_rollback(prog, tmp, new_bpf_func,
-						      saved_poke_tab,
-						      saved_poke_cnt,
-						      &rollback_state);
-			if (err) {
-				pr_warn("bpf_rejit: rollback after trampoline refresh failure failed: %d\n",
-					err);
-				retain_old_image = true;
-			}
+			/* Refresh may have rebuilt some trampoline images already.
+			 * Keep both JIT images alive rather than attempting a
+			 * rollback that refreshes trampolines again.
+			 */
+			retain_old_image = true;
 			goto post_swap_sync;
 		}
 
