@@ -21,6 +21,8 @@
 #include <asm/insn.h>
 #endif
 
+#include "rejit_test.h"
+
 struct bpf_struct_ops_value {
 	struct bpf_struct_ops_common_value common;
 	char data[] ____cacheline_aligned_in_smp;
@@ -1465,13 +1467,15 @@ void bpf_prog_disassoc_struct_ops(struct bpf_prog *prog)
 	RCU_INIT_POINTER(prog->aux->st_ops_assoc, NULL);
 }
 
-/* Scan a struct_ops trampoline image for a direct call to old_target.
+/* Scan a struct_ops trampoline image for the next direct call to target.
+ * cursor is updated to the next instruction boundary after a match.
  * Returns the IP of the call opcode, or NULL.
  */
-static void *find_call_site(void *image, u32 image_size, void *old_target)
+static void *find_next_call_site(void *image, u32 image_size, void *target,
+				 unsigned long *cursor)
 {
-	unsigned long start = (unsigned long)image;
-	unsigned long end = start + image_size;
+	unsigned long start = *cursor ?: (unsigned long)image;
+	unsigned long end = (unsigned long)image + image_size;
 
 #ifdef CONFIG_X86
 	for (; start + CALL_INSN_SIZE <= end;) {
@@ -1486,10 +1490,12 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 
 		if (*p == CALL_INSN_OPCODE) {
 			s32 disp = *(s32 *)(p + 1);
-			void *target = (void *)((unsigned long)(p + CALL_INSN_SIZE) + disp);
+			void *call_target = (void *)((unsigned long)(p + CALL_INSN_SIZE) + disp);
 
-			if (target == old_target)
+			if (call_target == target) {
+				*cursor = start + len;
 				return p;
+			}
 		}
 
 		start += len;
@@ -1500,14 +1506,17 @@ static void *find_call_site(void *image, u32 image_size, void *old_target)
 		u32 insn = *p;
 
 		if (aarch64_insn_is_bl(insn)) {
-			void *target = (void *)(start + aarch64_get_branch_offset(insn));
+			void *call_target = (void *)(start + aarch64_get_branch_offset(insn));
 
-			if (target == old_target)
+			if (call_target == target) {
+				*cursor = start + sizeof(u32);
 				return p;
+			}
 		}
 	}
 #endif
 
+	*cursor = (unsigned long)image + image_size;
 	return NULL;
 }
 
@@ -1520,7 +1529,9 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 	struct bpf_struct_ops_map *st_map;
 	void *new_bpf_func = (void *)prog->bpf_func;
 	void **call_sites = NULL;
+	u32 patched_cnt = 0;
 	struct bpf_map *map;
+	u32 call_site_cnt = 0;
 	u32 i;
 	int err = 0;
 
@@ -1532,12 +1543,10 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		return 0;
 
 	st_map = (struct bpf_struct_ops_map *)map;
-	call_sites = kcalloc(st_map->funcs_cnt, sizeof(*call_sites), GFP_KERNEL);
-	if (!call_sites)
-		return -ENOMEM;
-
 	for (i = 0; i < st_map->funcs_cnt; i++) {
 		struct bpf_ksym *ksym;
+		unsigned long cursor;
+		bool found_old = false;
 
 		if (!st_map->links[i])
 			continue;
@@ -1548,19 +1557,37 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		if (!ksym)
 			continue;
 
-		call_sites[i] = find_call_site((void *)ksym->start,
-					       ksym->end - ksym->start,
-					       (void *)old_bpf_func);
-		if (!call_sites[i]) {
-			void *current_site;
+		cursor = ksym->start;
+		while (true) {
+			void **grown;
+			void *site;
 
-			current_site = find_call_site((void *)ksym->start,
-						      ksym->end - ksym->start,
-						      new_bpf_func);
-			if (current_site)
-				continue;
+			site = find_next_call_site((void *)ksym->start,
+						   ksym->end - ksym->start,
+						   (void *)old_bpf_func,
+						   &cursor);
+			if (!site)
+				break;
+
+			grown = krealloc_array(call_sites, call_site_cnt + 1,
+					       sizeof(*call_sites), GFP_KERNEL);
+			if (!grown) {
+				err = -ENOMEM;
+				goto out;
+			}
+
+			call_sites = grown;
+			call_sites[call_site_cnt++] = site;
+			found_old = true;
 		}
-		if (!call_sites[i]) {
+
+		if (!found_old) {
+			cursor = ksym->start;
+			if (find_next_call_site((void *)ksym->start,
+						ksym->end - ksym->start,
+						new_bpf_func, &cursor))
+				continue;
+
 			pr_warn("struct_ops rejit: CALL site not found in trampoline %s\n",
 				ksym->name);
 			err = -ENOENT;
@@ -1568,27 +1595,16 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		}
 	}
 
-	for (i = 0; i < st_map->funcs_cnt; i++) {
-		struct bpf_ksym *ksym;
+	bpf_rejit_test_note_struct_ops_refresh(prog, call_site_cnt);
 
-		if (!call_sites[i])
-			continue;
+	for (i = 0; i < call_site_cnt; i++) {
+		if (bpf_rejit_test_should_fail_struct_ops_patch(patched_cnt)) {
+			err = -EIO;
+			pr_warn("struct_ops rejit: injected failure after %u patch(es)\n",
+				patched_cnt);
+			while (patched_cnt > 0) {
+				void *patched_site = call_sites[--patched_cnt];
 
-		ksym = st_map->ksyms[i];
-
-		err = bpf_arch_text_poke(call_sites[i], BPF_MOD_CALL,
-					 BPF_MOD_CALL,
-					 (void *)old_bpf_func,
-					 new_bpf_func);
-		if (err) {
-			u32 rollback_i;
-
-			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
-			for (rollback_i = i; rollback_i > 0; rollback_i--) {
-				void **patched_site = call_sites[rollback_i - 1];
-
-				if (!patched_site)
-					continue;
 				if (bpf_arch_text_poke(patched_site, BPF_MOD_CALL,
 						      BPF_MOD_CALL,
 						      new_bpf_func,
@@ -1597,6 +1613,23 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 			}
 			goto out;
 		}
+		err = bpf_arch_text_poke(call_sites[i], BPF_MOD_CALL,
+					 BPF_MOD_CALL,
+					 (void *)old_bpf_func,
+					 new_bpf_func);
+		if (err) {
+			pr_warn("struct_ops rejit: text_poke failed: %d\n", err);
+			while (patched_cnt > 0) {
+				void *patched_site = call_sites[--patched_cnt];
+				if (bpf_arch_text_poke(patched_site, BPF_MOD_CALL,
+						      BPF_MOD_CALL,
+						      new_bpf_func,
+						      (void *)old_bpf_func))
+					pr_warn("struct_ops rejit: rollback text_poke failed\n");
+			}
+			goto out;
+		}
+		patched_cnt++;
 	}
 
 out:
