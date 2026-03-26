@@ -42,6 +42,8 @@
 #include <linux/cookie.h>
 #include <linux/verification.h>
 
+#include "rejit_test.h"
+
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
 #include <net/tcx.h>
@@ -3371,10 +3373,18 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 
 static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 {
+#define SWAP_PROG_BITFIELD(a, b)			\
+	do {						\
+		unsigned int __tmp = (a);		\
+		(a) = (b);				\
+		(b) = __tmp;				\
+	} while (0)
+
 	bool old_jited = prog->jited;
 	bool old_jit_requested = prog->jit_requested;
 	u32 old_jited_len = prog->jited_len;
 	bpf_func_t old_bpf_func = prog->bpf_func;
+	u8 old_digest[sizeof(prog->digest)];
 	u32 i;
 
 	swap(prog->aux->ctx_arg_info, tmp->aux->ctx_arg_info);
@@ -3428,32 +3438,35 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 		prog->aux->func[i]->aux->size_poke_tab = prog->aux->size_poke_tab;
 	}
 
+	memcpy(old_digest, prog->digest, sizeof(old_digest));
 	memcpy(prog->digest, tmp->digest, sizeof(prog->digest));
+	memcpy(tmp->digest, old_digest, sizeof(tmp->digest));
 	prog->jited = tmp->jited;
 	prog->jit_requested = tmp->jit_requested;
 	prog->jited_len = tmp->jited_len;
-	prog->gpl_compatible = tmp->gpl_compatible;
-	prog->cb_access = tmp->cb_access;
-	prog->dst_needed = tmp->dst_needed;
-	prog->blinding_requested = tmp->blinding_requested;
-	prog->blinded = tmp->blinded;
-	prog->kprobe_override = tmp->kprobe_override;
-	prog->enforce_expected_attach_type = tmp->enforce_expected_attach_type;
-	prog->call_get_stack = tmp->call_get_stack;
-	prog->call_get_func_ip = tmp->call_get_func_ip;
-	prog->call_session_cookie = tmp->call_session_cookie;
-	prog->tstamp_type_access = tmp->tstamp_type_access;
+	SWAP_PROG_BITFIELD(prog->gpl_compatible, tmp->gpl_compatible);
+	SWAP_PROG_BITFIELD(prog->cb_access, tmp->cb_access);
+	SWAP_PROG_BITFIELD(prog->dst_needed, tmp->dst_needed);
+	SWAP_PROG_BITFIELD(prog->blinding_requested, tmp->blinding_requested);
+	SWAP_PROG_BITFIELD(prog->blinded, tmp->blinded);
+	SWAP_PROG_BITFIELD(prog->kprobe_override, tmp->kprobe_override);
+	SWAP_PROG_BITFIELD(prog->enforce_expected_attach_type,
+			   tmp->enforce_expected_attach_type);
+	SWAP_PROG_BITFIELD(prog->call_get_stack, tmp->call_get_stack);
+	SWAP_PROG_BITFIELD(prog->call_get_func_ip, tmp->call_get_func_ip);
+	SWAP_PROG_BITFIELD(prog->call_session_cookie, tmp->call_session_cookie);
+	SWAP_PROG_BITFIELD(prog->tstamp_type_access, tmp->tstamp_type_access);
 
-	prog->aux->max_ctx_offset = tmp->aux->max_ctx_offset;
-	prog->aux->max_pkt_offset = tmp->aux->max_pkt_offset;
-	prog->aux->max_tp_access = tmp->aux->max_tp_access;
-	prog->aux->stack_depth = tmp->aux->stack_depth;
-	prog->aux->max_rdonly_access = tmp->aux->max_rdonly_access;
-	prog->aux->max_rdwr_access = tmp->aux->max_rdwr_access;
-	prog->aux->verifier_zext = tmp->aux->verifier_zext;
-	prog->aux->changes_pkt_data = tmp->aux->changes_pkt_data;
-	prog->aux->kprobe_write_ctx = tmp->aux->kprobe_write_ctx;
-	prog->aux->verified_insns = tmp->aux->verified_insns;
+	swap(prog->aux->max_ctx_offset, tmp->aux->max_ctx_offset);
+	swap(prog->aux->max_pkt_offset, tmp->aux->max_pkt_offset);
+	swap(prog->aux->max_tp_access, tmp->aux->max_tp_access);
+	swap(prog->aux->stack_depth, tmp->aux->stack_depth);
+	swap(prog->aux->max_rdonly_access, tmp->aux->max_rdonly_access);
+	swap(prog->aux->max_rdwr_access, tmp->aux->max_rdwr_access);
+	swap(prog->aux->verifier_zext, tmp->aux->verifier_zext);
+	swap(prog->aux->changes_pkt_data, tmp->aux->changes_pkt_data);
+	swap(prog->aux->kprobe_write_ctx, tmp->aux->kprobe_write_ctx);
+	swap(prog->aux->verified_insns, tmp->aux->verified_insns);
 	prog->aux->load_time = ktime_get_boottime_ns();
 
 	/* Copy the verified/rewritten BPF insns from tmp into prog so that
@@ -3472,12 +3485,49 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	tmp->jited_len = old_jited_len;
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
 
+#undef SWAP_PROG_BITFIELD
+}
+
+struct bpf_prog_rejit_rollback_state {
+	struct bpf_insn *insnsi;
+	u32 len;
+	u64 load_time;
+};
+
+static int bpf_prog_rejit_prepare_rollback(struct bpf_prog *prog,
+					   struct bpf_prog_rejit_rollback_state *state)
+{
+	state->len = prog->len;
+	state->load_time = prog->aux->load_time;
+	state->insnsi = kvmemdup(prog->insnsi, bpf_prog_insn_size(prog), GFP_KERNEL);
+	if (!state->insnsi)
+		return -ENOMEM;
+
+	return 0;
+}
+
+static void bpf_prog_rejit_restore_rollback(struct bpf_prog *prog,
+					    const struct bpf_prog_rejit_rollback_state *state)
+{
+	if (!state->insnsi)
+		return;
+
+	memcpy(prog->insnsi, state->insnsi, state->len * sizeof(struct bpf_insn));
+	prog->len = state->len;
+	prog->aux->load_time = state->load_time;
+}
+
+static void bpf_prog_rejit_release_rollback(struct bpf_prog_rejit_rollback_state *state)
+{
+	kvfree(state->insnsi);
+	state->insnsi = NULL;
 }
 
 static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 				    bpf_func_t new_bpf_func,
 				    struct bpf_jit_poke_descriptor *saved_poke_tab,
-				    u32 saved_poke_cnt)
+				    u32 saved_poke_cnt,
+				    const struct bpf_prog_rejit_rollback_state *state)
 {
 	int err, rollback_err = 0;
 
@@ -3488,6 +3538,7 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 	bpf_prog_rejit_poke_target_phase(prog, false);
 
 	bpf_prog_rejit_swap(prog, tmp);
+	bpf_prog_rejit_restore_rollback(prog, state);
 
 	if (saved_poke_tab && prog->aux->poke_tab &&
 	    prog->aux->size_poke_tab == saved_poke_cnt)
@@ -3523,6 +3574,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	int *kfd_array = NULL;
 	struct bpf_jit_poke_descriptor *saved_poke_tab = NULL;
 	struct bpf_prog *prog, *tmp = NULL;
+	struct bpf_prog_rejit_rollback_state rollback_state = {};
 	u32 saved_poke_cnt = 0;
 	bool retain_old_image = false;
 	int ret = 0;
@@ -3708,6 +3760,10 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		}
 	}
 
+	err = bpf_prog_rejit_prepare_rollback(prog, &rollback_state);
+	if (err)
+		goto free_tmp_noref;
+
 	{
 		bpf_func_t old_bpf_func = prog->bpf_func;
 		bpf_func_t new_bpf_func;
@@ -3744,6 +3800,21 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		bpf_prog_rejit_poke_target_phase(prog, true);
 		new_bpf_func = prog->bpf_func;
 
+		err = bpf_rejit_test_maybe_fail_refresh_after_swap();
+		if (err) {
+			ret = err;
+			err = bpf_prog_rejit_rollback(prog, tmp, new_bpf_func,
+						      saved_poke_tab,
+						      saved_poke_cnt,
+						      &rollback_state);
+			if (err) {
+				pr_warn("bpf_rejit: rollback after injected refresh failure failed: %d\n",
+					err);
+				retain_old_image = true;
+			}
+			goto post_swap_sync;
+		}
+
 		err = bpf_trampoline_refresh_prog(prog);
 		if (err) {
 			pr_warn("bpf_rejit: trampoline refresh failed: %d\n",
@@ -3751,7 +3822,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 			ret = err;
 			err = bpf_prog_rejit_rollback(prog, tmp, new_bpf_func,
 						      saved_poke_tab,
-						      saved_poke_cnt);
+						      saved_poke_cnt,
+						      &rollback_state);
 			if (err) {
 				pr_warn("bpf_rejit: rollback after trampoline refresh failure failed: %d\n",
 					err);
@@ -3770,7 +3842,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 				err = bpf_prog_rejit_rollback(prog, tmp,
 						      new_bpf_func,
 						      saved_poke_tab,
-						      saved_poke_cnt);
+						      saved_poke_cnt,
+						      &rollback_state);
 				if (err) {
 					pr_warn("bpf_rejit: rollback after struct_ops refresh failure failed: %d\n",
 						err);
@@ -3786,6 +3859,8 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	}
 
 post_swap_sync:
+	bpf_prog_rejit_release_rollback(&rollback_state);
+
 	if (prog->sleepable)
 		synchronize_rcu_tasks_trace();
 	else
@@ -3809,10 +3884,28 @@ post_swap_sync:
 		bpf_prog_put(tmp->aux->dst_prog);
 		tmp->aux->dst_prog = NULL;
 	}
+	/* Reset the ksym list nodes on tmp's (old) subprogs.  The swap in
+	 * bpf_prog_rejit_swap() first called bpf_prog_kallsyms_del_all(prog)
+	 * which poisoned the old subprogs' lnodes via list_del_rcu(), then
+	 * swapped func[] so those poisoned entries now live on tmp.  Without
+	 * this reset, __bpf_prog_put_noref(tmp) → bpf_prog_kallsyms_del_all()
+	 * would try to list_del_rcu() the already-poisoned nodes, triggering a
+	 * GPF on LIST_POISON2.
+	 */
+	{
+	u32 i;
+	for (i = 0; i < tmp->aux->real_func_cnt; i++) {
+		INIT_LIST_HEAD_RCU(&tmp->aux->func[i]->aux->ksym.lnode);
+#ifdef CONFIG_FINEIBT
+		INIT_LIST_HEAD_RCU(&tmp->aux->func[i]->aux->ksym_prefix.lnode);
+#endif
+	}
+	}
+
 	if (retain_old_image) {
 		pr_warn("bpf_rejit: retaining old JIT image after refresh failure\n");
 	} else {
-		__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+		__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt > 0);
 	}
 	kvfree(saved_poke_tab);
 	kvfree(kfd_array);
@@ -3825,7 +3918,8 @@ free_tmp_noref:
 		bpf_prog_put(tmp->aux->dst_prog);
 		tmp->aux->dst_prog = NULL;
 	}
-	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt);
+	bpf_prog_rejit_release_rollback(&rollback_state);
+	__bpf_prog_put_noref(tmp, tmp->aux->real_func_cnt > 0);
 	goto out_unlock;
 free_tmp_sec:
 	security_bpf_prog_free(tmp);
