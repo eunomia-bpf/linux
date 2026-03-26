@@ -21,8 +21,6 @@
 #include <asm/insn.h>
 #endif
 
-#include "rejit_test.h"
-
 struct bpf_struct_ops_value {
 	struct bpf_struct_ops_common_value common;
 	char data[] ____cacheline_aligned_in_smp;
@@ -1595,24 +1593,7 @@ int bpf_struct_ops_refresh_prog(struct bpf_prog *prog, bpf_func_t old_bpf_func)
 		}
 	}
 
-	bpf_rejit_test_note_struct_ops_refresh(prog, call_site_cnt);
-
 	for (i = 0; i < call_site_cnt; i++) {
-		if (bpf_rejit_test_should_fail_struct_ops_patch(patched_cnt)) {
-			err = -EIO;
-			pr_warn("struct_ops rejit: injected failure after %u patch(es)\n",
-				patched_cnt);
-			while (patched_cnt > 0) {
-				void *patched_site = call_sites[--patched_cnt];
-
-				if (bpf_arch_text_poke(patched_site, BPF_MOD_CALL,
-						      BPF_MOD_CALL,
-						      new_bpf_func,
-						      (void *)old_bpf_func))
-					pr_warn("struct_ops rejit: rollback text_poke failed\n");
-			}
-			goto out;
-		}
 		err = bpf_arch_text_poke(call_sites[i], BPF_MOD_CALL,
 					 BPF_MOD_CALL,
 					 (void *)old_bpf_func,

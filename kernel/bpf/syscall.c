@@ -42,8 +42,6 @@
 #include <linux/cookie.h>
 #include <linux/verification.h>
 
-#include "rejit_test.h"
-
 #include <net/netfilter/nf_bpf_link.h>
 #include <net/netkit.h>
 #include <net/tcx.h>
@@ -3799,21 +3797,6 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		 */
 		bpf_prog_rejit_poke_target_phase(prog, true);
 		new_bpf_func = prog->bpf_func;
-
-		err = bpf_rejit_test_maybe_fail_refresh_after_swap();
-		if (err) {
-			ret = err;
-			err = bpf_prog_rejit_rollback(prog, tmp, new_bpf_func,
-						      saved_poke_tab,
-						      saved_poke_cnt,
-						      &rollback_state);
-			if (err) {
-				pr_warn("bpf_rejit: rollback after injected refresh failure failed: %d\n",
-					err);
-				retain_old_image = true;
-			}
-			goto post_swap_sync;
-		}
 
 		err = bpf_trampoline_refresh_prog(prog);
 		if (err) {
