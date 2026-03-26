@@ -23764,6 +23764,12 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 
+			if (kinsn->max_insn_cnt > INSN_BUF_SIZE) {
+				verbose(env, "kinsn max_insn_cnt %u exceeds insn_buf size %u\n",
+					kinsn->max_insn_cnt, INSN_BUF_SIZE);
+				return -E2BIG;
+			}
+
 			cnt = kinsn->instantiate_insn(bpf_kinsn_sidecar_payload(insn),
 						      env->insn_buf);
 			if (cnt <= 0)

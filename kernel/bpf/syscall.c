@@ -3454,6 +3454,7 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	SWAP_PROG_BITFIELD(prog->call_get_func_ip, tmp->call_get_func_ip);
 	SWAP_PROG_BITFIELD(prog->call_session_cookie, tmp->call_session_cookie);
 	SWAP_PROG_BITFIELD(prog->tstamp_type_access, tmp->tstamp_type_access);
+	SWAP_PROG_BITFIELD(prog->has_callchain_buf, tmp->has_callchain_buf);
 
 	swap(prog->aux->max_ctx_offset, tmp->aux->max_ctx_offset);
 	swap(prog->aux->max_pkt_offset, tmp->aux->max_pkt_offset);
@@ -5594,16 +5595,6 @@ struct bpf_prog *bpf_prog_by_id(u32 id)
 	return prog;
 }
 
-static void rejit_scx_debug_prog(const char *phase, const struct bpf_prog *prog, u32 req_id)
-{
-	if (!prog || prog->type != BPF_PROG_TYPE_STRUCT_OPS)
-		return;
-
-	pr_info("rejit-scx-debug: %s req_id=%u prog_id=%u name=%s func=%px jited_len=%u aux=%px\n",
-		phase, req_id, prog->aux->id, prog->aux->name,
-		prog->bpf_func, prog->jited_len, prog->aux);
-}
-
 static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 {
 	struct bpf_prog *prog;
@@ -5619,14 +5610,10 @@ static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 	prog = bpf_prog_by_id(id);
 	if (IS_ERR(prog))
 		return PTR_ERR(prog);
-	rejit_scx_debug_prog("get_fd_by_id.enter", prog, id);
 
 	fd = bpf_prog_new_fd(prog);
 	if (fd < 0) {
-		rejit_scx_debug_prog("get_fd_by_id.fd_fail", prog, id);
 		bpf_prog_put(prog);
-	} else {
-		rejit_scx_debug_prog("get_fd_by_id.fd_ok", prog, id);
 	}
 
 	return fd;
@@ -5848,14 +5835,12 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	 */
 	guard(mutex)(&prog->aux->rejit_mutex);
 	attach_btf = bpf_prog_get_target_btf(prog);
-	rejit_scx_debug_prog("get_info.enter", prog, prog->aux->id);
 	func = READ_ONCE(prog->aux->func);
 	func_cnt = READ_ONCE(prog->aux->func_cnt);
 	real_func_cnt = READ_ONCE(prog->aux->real_func_cnt);
-	if (unlikely(func_cnt > real_func_cnt || (func_cnt && !func))) {
-		rejit_scx_debug_prog("get_info.bad_func_array", prog, prog->aux->id);
+	if (unlikely(func_cnt > real_func_cnt || (func_cnt && !func)))
 		return -EIO;
-	}
+
 	multi_func_meta = bpf_prog_info_expose_subprog_metadata(prog, func_cnt);
 
 	info.type = prog->type;
@@ -5884,7 +5869,6 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 			}
 	}
 	mutex_unlock(&prog->aux->used_maps_mutex);
-	rejit_scx_debug_prog("get_info.after_maps", prog, prog->aux->id);
 
 	err = set_info_rec_size(&info);
 	if (err)
@@ -5894,7 +5878,6 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	info.run_time_ns = stats.nsecs;
 	info.run_cnt = stats.cnt;
 	info.recursion_misses = stats.misses;
-	rejit_scx_debug_prog("get_info.after_stats", prog, prog->aux->id);
 
 	info.verified_insns = prog->aux->verified_insns;
 	if (prog->aux->btf)
@@ -6162,7 +6145,6 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 done:
-	rejit_scx_debug_prog("get_info.done", prog, prog->aux->id);
 	if (copy_to_user(uinfo, &info, info_len) ||
 	    put_user(info_len, &uattr->info.info_len))
 		return -EFAULT;
