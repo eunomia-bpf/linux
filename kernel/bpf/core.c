@@ -654,7 +654,6 @@ static void __bpf_ksym_del(struct bpf_ksym *ksym)
 
 	latch_tree_erase(&ksym->tnode, &bpf_tree, &bpf_tree_ops);
 	list_del_rcu(&ksym->lnode);
-	INIT_LIST_HEAD_RCU(&ksym->lnode);
 }
 
 void bpf_ksym_del(struct bpf_ksym *ksym)

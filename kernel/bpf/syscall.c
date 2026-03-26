@@ -3472,14 +3472,6 @@ static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
 	tmp->jited_len = old_jited_len;
 	WRITE_ONCE(tmp->bpf_func, old_bpf_func);
 
-	bpf_prog_kallsyms_add(prog);
-	/* NOTE: subfuncs (prog->aux->func[i]) were already registered in
-	 * bpf_prog_kallsyms by jit_subprogs() during REJIT compilation.
-	 * Do NOT call bpf_prog_kallsyms_add() for them again here - that
-	 * would double-insert into the latch tree and corrupt it.
-	 * The subfuncs' ksym addresses are already correct since they were
-	 * set during JIT compilation of the new image.
-	 */
 }
 
 static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
@@ -3798,6 +3790,19 @@ post_swap_sync:
 		synchronize_rcu_tasks_trace();
 	else
 		synchronize_rcu_expedited();
+
+	/* __bpf_ksym_del() leaves the deleted list nodes untouched until the
+	 * grace period ends, so reset and re-register the main-program symbols
+	 * only after post-swap synchronization. The func[] swap above already
+	 * transferred the new subprog objects into prog, so their existing
+	 * kallsyms registrations stay with prog and tmp now owns only the old
+	 * subprog symbols that will be torn down below.
+	 */
+	INIT_LIST_HEAD_RCU(&prog->aux->ksym.lnode);
+#ifdef CONFIG_FINEIBT
+	INIT_LIST_HEAD_RCU(&prog->aux->ksym_prefix.lnode);
+#endif
+	bpf_prog_kallsyms_add(prog);
 
 	/* Release the extra dst_prog ref we took for the tmp verifier pass */
 	if (tmp->aux->dst_prog) {
@@ -5705,6 +5710,36 @@ static int set_info_rec_size(struct bpf_prog_info *info)
 	return 0;
 }
 
+static int bpf_prog_info_get_subprog(struct bpf_prog * const *func,
+				     u32 func_cnt, u32 i,
+				     struct bpf_prog **subprog)
+{
+	if (unlikely(!func || i >= func_cnt))
+		return -EIO;
+
+	*subprog = READ_ONCE(func[i]);
+	if (unlikely(!*subprog))
+		return -EIO;
+
+	return 0;
+}
+
+static bool bpf_prog_info_expose_subprog_metadata(const struct bpf_prog *prog,
+						  u32 func_cnt)
+{
+	if (!func_cnt)
+		return false;
+
+	/* struct_ops programs can be registered/unregistered while userspace is
+	 * polling prog metadata. Export only the stable main-program JIT fields
+	 * here instead of chasing live subprog arrays.
+	 */
+	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+		return false;
+
+	return true;
+}
+
 static int bpf_prog_get_info_by_fd(struct file *file,
 				   struct bpf_prog *prog,
 				   const union bpf_attr *attr,
@@ -5712,8 +5747,11 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 {
 	struct bpf_prog_info __user *uinfo = u64_to_user_ptr(attr->info.info);
 	struct btf *attach_btf;
+	struct bpf_prog * const *func;
 	struct bpf_prog_info info;
 	u32 info_len = attr->info.info_len;
+	u32 func_cnt, real_func_cnt;
+	bool multi_func_meta;
 	struct bpf_prog_kstats stats;
 	char __user *uinsns;
 	u32 ulen;
@@ -5734,6 +5772,14 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	guard(mutex)(&prog->aux->rejit_mutex);
 	attach_btf = bpf_prog_get_target_btf(prog);
 	rejit_scx_debug_prog("get_info.enter", prog, prog->aux->id);
+	func = READ_ONCE(prog->aux->func);
+	func_cnt = READ_ONCE(prog->aux->func_cnt);
+	real_func_cnt = READ_ONCE(prog->aux->real_func_cnt);
+	if (unlikely(func_cnt > real_func_cnt || (func_cnt && !func))) {
+		rejit_scx_debug_prog("get_info.bad_func_array", prog, prog->aux->id);
+		return -EIO;
+	}
+	multi_func_meta = bpf_prog_info_expose_subprog_metadata(prog, func_cnt);
 
 	info.type = prog->type;
 	info.id = prog->aux->id;
@@ -5835,12 +5881,19 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	 * for offload.
 	 */
 	ulen = info.jited_prog_len;
-	if (prog->aux->func_cnt) {
+	if (multi_func_meta) {
 		u32 i;
 
 		info.jited_prog_len = 0;
-		for (i = 0; i < prog->aux->func_cnt; i++)
-			info.jited_prog_len += prog->aux->func[i]->jited_len;
+		for (i = 0; i < func_cnt; i++) {
+			struct bpf_prog *subprog;
+
+			err = bpf_prog_info_get_subprog(func, func_cnt, i, &subprog);
+			if (err)
+				return err;
+
+			info.jited_prog_len += subprog->jited_len;
+		}
 	} else {
 		info.jited_prog_len = prog->jited_len;
 	}
@@ -5853,15 +5906,21 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 			/* for multi-function programs, copy the JITed
 			 * instructions for all the functions
 			 */
-			if (prog->aux->func_cnt) {
+			if (multi_func_meta) {
 				u32 len, free, i;
 				u8 *img;
 
 				free = ulen;
-				for (i = 0; i < prog->aux->func_cnt; i++) {
-					len = prog->aux->func[i]->jited_len;
+				for (i = 0; i < func_cnt; i++) {
+					struct bpf_prog *subprog;
+
+					err = bpf_prog_info_get_subprog(func, func_cnt, i, &subprog);
+					if (err)
+						return err;
+
+					len = subprog->jited_len;
 					len = min_t(u32, len, free);
-					img = (u8 *) prog->aux->func[i]->bpf_func;
+					img = (u8 *)subprog->bpf_func;
 					if (copy_to_user(uinsns, img, len))
 						return -EFAULT;
 					uinsns += len;
@@ -5879,7 +5938,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 	ulen = info.nr_jited_ksyms;
-	info.nr_jited_ksyms = prog->aux->func_cnt ? : 1;
+	info.nr_jited_ksyms = multi_func_meta ? func_cnt : 1;
 	if (ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
 			unsigned long ksym_addr;
@@ -5891,10 +5950,15 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 			 */
 			ulen = min_t(u32, info.nr_jited_ksyms, ulen);
 			user_ksyms = u64_to_user_ptr(info.jited_ksyms);
-			if (prog->aux->func_cnt) {
+			if (multi_func_meta) {
 				for (i = 0; i < ulen; i++) {
-					ksym_addr = (unsigned long)
-						prog->aux->func[i]->bpf_func;
+					struct bpf_prog *subprog;
+
+					err = bpf_prog_info_get_subprog(func, func_cnt, i, &subprog);
+					if (err)
+						return err;
+
+					ksym_addr = (unsigned long)subprog->bpf_func;
 					if (put_user((u64) ksym_addr,
 						     &user_ksyms[i]))
 						return -EFAULT;
@@ -5910,7 +5974,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 	ulen = info.nr_jited_func_lens;
-	info.nr_jited_func_lens = prog->aux->func_cnt ? : 1;
+	info.nr_jited_func_lens = multi_func_meta ? func_cnt : 1;
 	if (ulen) {
 		if (bpf_dump_raw_ok(file->f_cred)) {
 			u32 __user *user_lens;
@@ -5919,10 +5983,15 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 			/* copy the JITed image lengths for each function */
 			ulen = min_t(u32, info.nr_jited_func_lens, ulen);
 			user_lens = u64_to_user_ptr(info.jited_func_lens);
-			if (prog->aux->func_cnt) {
+			if (multi_func_meta) {
 				for (i = 0; i < ulen; i++) {
-					func_len =
-						prog->aux->func[i]->jited_len;
+					struct bpf_prog *subprog;
+
+					err = bpf_prog_info_get_subprog(func, func_cnt, i, &subprog);
+					if (err)
+						return err;
+
+					func_len = subprog->jited_len;
 					if (put_user(func_len, &user_lens[i]))
 						return -EFAULT;
 				}
@@ -5988,17 +6057,23 @@ static int bpf_prog_get_info_by_fd(struct file *file,
 	}
 
 	ulen = info.nr_prog_tags;
-	info.nr_prog_tags = prog->aux->func_cnt ? : 1;
+	info.nr_prog_tags = multi_func_meta ? func_cnt : 1;
 	if (ulen) {
 		__u8 __user (*user_prog_tags)[BPF_TAG_SIZE];
 		u32 i;
 
 		user_prog_tags = u64_to_user_ptr(info.prog_tags);
 		ulen = min_t(u32, info.nr_prog_tags, ulen);
-		if (prog->aux->func_cnt) {
+		if (multi_func_meta) {
 			for (i = 0; i < ulen; i++) {
+				struct bpf_prog *subprog;
+
+				err = bpf_prog_info_get_subprog(func, func_cnt, i, &subprog);
+				if (err)
+					return err;
+
 				if (copy_to_user(user_prog_tags[i],
-						 prog->aux->func[i]->tag,
+						 subprog->tag,
 						 BPF_TAG_SIZE))
 					return -EFAULT;
 			}
