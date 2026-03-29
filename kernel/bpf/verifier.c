@@ -3836,10 +3836,10 @@ err_free_proof_buf:
 
 static int restore_kinsn_proof_regions(struct bpf_verifier_env *env)
 {
-	struct bpf_insn_aux_data *aux = env->insn_aux_data;
 	u32 i;
 
 	for (i = 0; i < env->kinsn_region_cnt; i++) {
+		struct bpf_insn_aux_data *aux;
 		struct bpf_prog *new_prog;
 		struct bpf_kinsn_region *region = &env->kinsn_regions[i];
 		int err;
@@ -3848,12 +3848,14 @@ static int restore_kinsn_proof_regions(struct bpf_verifier_env *env)
 		if (!new_prog)
 			return -ENOMEM;
 		env->prog = new_prog;
+		aux = env->insn_aux_data;
 
 		if (region->proof_len > 1) {
 			err = verifier_remove_insns(env, region->start + 2,
 						    region->proof_len - 1);
 			if (err)
 				return err;
+			aux = env->insn_aux_data;
 		}
 
 		if (aux[region->start].jt) {

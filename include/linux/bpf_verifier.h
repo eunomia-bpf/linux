@@ -23,8 +23,12 @@
  * (in the "-8,-16,...,-512" form)
  */
 #define TMP_STR_BUF_LEN 320
-/* Patch buffer size */
-#define INSN_BUF_SIZE 32
+/*
+ * Patch buffer size for verifier-side instruction rewriting and temporary
+ * kinsn proof instantiation. Bulk-memory kinsns can legitimately expand well
+ * past 32 insns before native JIT emit takes over.
+ */
+#define INSN_BUF_SIZE 256
 
 #define ITER_PREFIX "bpf_iter_"
 
