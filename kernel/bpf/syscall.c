@@ -3227,13 +3227,22 @@ static int bpf_prog_rejit_update_poke_tab(struct bpf_prog *prog,
 	if (!prog->aux->size_poke_tab)
 		return 0;
 
-	/* Validate that every entry references the same map+key. */
+	/* Validate that every entry references the same direct-tail-call
+	 * site in sequence.
+	 *
+	 * REJIT re-verifies and re-JITs a lifted program image. The new JIT
+	 * image can legitimately place the helper call at a different eBPF
+	 * insn index while still emitting the same poke descriptors in the
+	 * same verifier discovery order for the same map/key pair. The
+	 * runtime update path only consumes the map/key metadata together
+	 * with the refreshed JIT addresses below, so rejecting moved insn
+	 * indices unnecessarily breaks otherwise valid REJITs.
+	 */
 	for (i = 0; i < prog->aux->size_poke_tab; i++) {
 		old_poke = &prog->aux->poke_tab[i];
 		new_poke = &tmp->aux->poke_tab[i];
 
 		if (old_poke->reason != new_poke->reason ||
-		    old_poke->insn_idx != new_poke->insn_idx ||
 		    old_poke->tail_call.map != new_poke->tail_call.map ||
 		    old_poke->tail_call.key != new_poke->tail_call.key)
 			return -EINVAL;
