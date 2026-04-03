@@ -1531,8 +1531,8 @@ bool ex_handler_bpf(const struct exception_table_entry *x, struct pt_regs *regs)
 	return true;
 }
 
-static void detect_reg_usage(struct bpf_insn *insn, int insn_cnt,
-			     bool *regs_used)
+static void detect_insn_reg_usage(const struct bpf_insn *insn, int insn_cnt,
+				  bool *regs_used)
 {
 	int i;
 
@@ -1546,6 +1546,56 @@ static void detect_reg_usage(struct bpf_insn *insn, int insn_cnt,
 		if (insn->dst_reg == BPF_REG_9 || insn->src_reg == BPF_REG_9)
 			regs_used[3] = true;
 	}
+}
+
+static int detect_reg_usage(const struct bpf_prog *bpf_prog, bool *regs_used)
+{
+	const struct bpf_insn *insn = bpf_prog->insnsi;
+	int insn_cnt = bpf_prog->len;
+	int i;
+
+	detect_insn_reg_usage(insn, insn_cnt, regs_used);
+
+	for (i = 0; i < insn_cnt; i++) {
+		const struct bpf_kinsn *kinsn;
+		const struct bpf_insn *call;
+		struct bpf_insn *proof_buf;
+		u64 payload;
+		int cnt;
+		int err;
+
+		if (!bpf_kinsn_is_sidecar_insn(&insn[i]))
+			continue;
+		if (i + 1 >= insn_cnt)
+			continue;
+
+		call = &insn[i + 1];
+		if (call->code != (BPF_JMP | BPF_CALL) ||
+		    call->src_reg != BPF_PSEUDO_KINSN_CALL)
+			continue;
+
+		err = bpf_jit_get_kinsn_payload(bpf_prog, call, &kinsn, &payload);
+		if (err)
+			return err;
+		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
+			return -EINVAL;
+
+		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+				     GFP_KERNEL);
+		if (!proof_buf)
+			return -ENOMEM;
+
+		cnt = kinsn->instantiate_insn(payload, proof_buf);
+		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+			kvfree(proof_buf);
+			return cnt ? -EFAULT : -EINVAL;
+		}
+
+		detect_insn_reg_usage(proof_buf, cnt, regs_used);
+		kvfree(proof_buf);
+	}
+
+	return 0;
 }
 
 /* emit the 3-byte VEX prefix
@@ -1707,7 +1757,9 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	arena_vm_start = bpf_arena_get_kern_vm_start(bpf_prog->aux->arena);
 	user_vm_start = bpf_arena_get_user_vm_start(bpf_prog->aux->arena);
 
-	detect_reg_usage(insn, insn_cnt, callee_regs_used);
+	err = detect_reg_usage(bpf_prog, callee_regs_used);
+	if (err)
+		return err;
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
