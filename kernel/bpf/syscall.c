@@ -3723,8 +3723,7 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 	 * returns early when func_info_cnt==0 in the attr and won't overwrite
 	 * these pre-populated fields.
 	 */
-	if (prog->type == BPF_PROG_TYPE_EXT && prog->aux->btf &&
-	    prog->aux->func_info && prog->aux->func_info_cnt) {
+	if (prog->aux->btf && prog->aux->func_info && prog->aux->func_info_cnt) {
 		size_t fi_size = prog->aux->func_info_cnt *
 				 sizeof(struct bpf_func_info);
 
