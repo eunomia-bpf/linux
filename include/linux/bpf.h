@@ -132,8 +132,8 @@ struct bpf_map_ops {
 	/* Prog poke tracking helpers. */
 	int (*map_poke_track)(struct bpf_map *map, struct bpf_prog_aux *aux);
 	void (*map_poke_untrack)(struct bpf_map *map, struct bpf_prog_aux *aux);
-	void (*map_poke_run)(struct bpf_map *map, u32 key, struct bpf_prog *old,
-			     struct bpf_prog *new);
+	int (*map_poke_run)(struct bpf_map *map, u32 key, struct bpf_prog *old,
+			    struct bpf_prog *new);
 
 	/* Direct value access helpers. */
 	int (*map_direct_value_addr)(const struct bpf_map *map,
@@ -3924,8 +3924,8 @@ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type old_t,
 		       enum bpf_text_poke_type new_t, void *old_addr,
 		       void *new_addr);
 
-void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
-			       struct bpf_prog *new, struct bpf_prog *old);
+int bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
+			      struct bpf_prog *new, struct bpf_prog *old);
 
 void *bpf_arch_text_copy(void *dst, void *src, size_t len);
 int bpf_arch_text_invalidate(void *dst, size_t len);

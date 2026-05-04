@@ -4111,8 +4111,8 @@ void arch_bpf_stack_walk(bool (*consume_fn)(void *cookie, u64 ip, u64 sp, u64 bp
 #endif
 }
 
-void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
-			       struct bpf_prog *new, struct bpf_prog *old)
+int bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
+			      struct bpf_prog *new, struct bpf_prog *old)
 {
 	u8 *old_addr, *new_addr, *old_bypass_addr;
 	enum bpf_text_poke_type t;
@@ -4132,20 +4132,20 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 		ret = __bpf_arch_text_poke(poke->tailcall_target,
 					   t, BPF_MOD_JUMP,
 					   old_addr, new_addr);
-		BUG_ON(ret < 0);
-		if (!old) {
-			ret = __bpf_arch_text_poke(poke->tailcall_bypass,
-						   BPF_MOD_JUMP, BPF_MOD_NOP,
-						   poke->bypass_addr,
-						   NULL);
-			BUG_ON(ret < 0);
-		}
+		if (ret < 0)
+			return ret;
+		if (!old)
+			return __bpf_arch_text_poke(poke->tailcall_bypass,
+						    BPF_MOD_JUMP, BPF_MOD_NOP,
+						    poke->bypass_addr,
+						    NULL);
 	} else {
 		t = old_bypass_addr ? BPF_MOD_JUMP : BPF_MOD_NOP;
 		ret = __bpf_arch_text_poke(poke->tailcall_bypass,
 					   t, BPF_MOD_JUMP, old_bypass_addr,
 					   poke->bypass_addr);
-		BUG_ON(ret < 0);
+		if (ret < 0)
+			return ret;
 		/* let other CPUs finish the execution of program
 		 * so that it will not possible to expose them
 		 * to invalid nop, stack unwind, nop state
@@ -4153,10 +4153,10 @@ void bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
 		if (!ret)
 			synchronize_rcu();
 		t = old_addr ? BPF_MOD_JUMP : BPF_MOD_NOP;
-		ret = __bpf_arch_text_poke(poke->tailcall_target,
-					   t, BPF_MOD_NOP, old_addr, NULL);
-		BUG_ON(ret < 0);
+		return __bpf_arch_text_poke(poke->tailcall_target,
+					    t, BPF_MOD_NOP, old_addr, NULL);
 	}
+	return 0;
 }
 
 bool bpf_jit_supports_arena(void)

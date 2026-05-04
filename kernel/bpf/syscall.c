@@ -3329,11 +3329,12 @@ static void bpf_prog_rejit_untrack_tmp_pokes(struct bpf_prog *tmp)
  *
  * Scans map_idr to find all PROG_ARRAY maps (no reverse index exists).
  */
-static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
-					      bool is_insert)
+static int bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
+					    bool is_insert)
 {
 	struct bpf_map *map;
 	u32 id = 0;
+	int last_err = 0;
 
 	/* Use bpf_map_get_curr_or_next() which takes a map reference,
 	 * allowing us to drop all locks before calling map_poke_run
@@ -3352,6 +3353,8 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 		array = container_of(map, struct bpf_array, map);
 
 		for (key = 0; key < array->map.max_entries; key++) {
+			int ret;
+
 			/*
 			 * This is an intentionally lockless pre-check. A slot can
 			 * change between this read and map_poke_run(), but both
@@ -3368,14 +3371,17 @@ static void bpf_prog_rejit_poke_target_phase(struct bpf_prog *prog,
 				continue;
 			}
 			if (is_insert)
-				map->ops->map_poke_run(map, key, NULL, prog);
+				ret = map->ops->map_poke_run(map, key, NULL, prog);
 			else
-				map->ops->map_poke_run(map, key, prog, NULL);
+				ret = map->ops->map_poke_run(map, key, prog, NULL);
 			mutex_unlock(&array->aux->poke_mutex);
+			if (ret < 0)
+				last_err = ret;
 		}
 		bpf_map_put(map);
 		id++;
 	}
+	return last_err;
 }
 
 static void bpf_prog_rejit_swap(struct bpf_prog *prog, struct bpf_prog *tmp)
@@ -3542,9 +3548,13 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 
 	/* Callers currently jump to the replacement image. Remove those edges
 	 * before restoring the old bpf_func address, then republish the old
-	 * target after the swap-back.
+	 * target after the swap-back. We're already on the rollback path, so
+	 * surface poke failures via rollback_err but keep going so the swap-back
+	 * still happens.
 	 */
-	bpf_prog_rejit_poke_target_phase(prog, false);
+	err = bpf_prog_rejit_poke_target_phase(prog, false);
+	if (err)
+		rollback_err = err;
 
 	bpf_prog_rejit_swap(prog, tmp);
 	bpf_prog_rejit_restore_rollback(prog, state);
@@ -3573,7 +3583,9 @@ static int bpf_prog_rejit_rollback(struct bpf_prog *prog, struct bpf_prog *tmp,
 		}
 	}
 
-	bpf_prog_rejit_poke_target_phase(prog, true);
+	err = bpf_prog_rejit_poke_target_phase(prog, true);
+	if (err)
+		rollback_err = err;
 
 	err = bpf_trampoline_refresh_prog(prog);
 	if (err)
@@ -3817,15 +3829,26 @@ static int bpf_prog_rejit(union bpf_attr *attr)
 		 * remove all direct jumps to it (jmp old_addr -> NOP).
 		 * Must happen while bpf_func still points to old image.
 		 */
-		bpf_prog_rejit_poke_target_phase(prog, false);
+		err = bpf_prog_rejit_poke_target_phase(prog, false);
+		if (err)
+			goto free_tmp_noref;
 
 		bpf_prog_rejit_swap(prog, tmp);
 
 		/* Target-side Phase 2: re-establish direct jumps with the
 		 * new bpf_func address (NOP -> jmp new_addr).
 		 */
-		bpf_prog_rejit_poke_target_phase(prog, true);
+		err = bpf_prog_rejit_poke_target_phase(prog, true);
 		new_bpf_func = prog->bpf_func;
+		if (err) {
+			ret = err;
+			/* Swap already happened; some prog_array slots may
+			 * still be NOP. Keep the new image; subsequent REJIT
+			 * or map_update will repoke them.
+			 */
+			retain_old_image = true;
+			goto post_swap_sync;
+		}
 
 		err = bpf_trampoline_refresh_prog(prog);
 		if (err) {

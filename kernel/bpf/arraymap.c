@@ -1098,18 +1098,20 @@ static void prog_array_map_poke_untrack(struct bpf_map *map,
 	mutex_unlock(&aux->poke_mutex);
 }
 
-void __weak bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
-				      struct bpf_prog *new, struct bpf_prog *old)
+int __weak bpf_arch_poke_desc_update(struct bpf_jit_poke_descriptor *poke,
+				     struct bpf_prog *new, struct bpf_prog *old)
 {
 	WARN_ON_ONCE(1);
+	return -EOPNOTSUPP;
 }
 
-static void prog_array_map_poke_run(struct bpf_map *map, u32 key,
-				    struct bpf_prog *old,
-				    struct bpf_prog *new)
+static int prog_array_map_poke_run(struct bpf_map *map, u32 key,
+				   struct bpf_prog *old,
+				   struct bpf_prog *new)
 {
 	struct prog_poke_elem *elem;
 	struct bpf_array_aux *aux;
+	int ret = 0, last_err = 0;
 
 	aux = container_of(map, struct bpf_array, map)->aux;
 	WARN_ON_ONCE(!mutex_is_locked(&aux->poke_mutex));
@@ -1148,9 +1150,12 @@ static void prog_array_map_poke_run(struct bpf_map *map, u32 key,
 			    poke->tail_call.key != key)
 				continue;
 
-			bpf_arch_poke_desc_update(poke, new, old);
+			ret = bpf_arch_poke_desc_update(poke, new, old);
+			if (ret < 0)
+				last_err = ret;
 		}
 	}
+	return last_err;
 }
 
 static void prog_array_map_clear_deferred(struct work_struct *work)
