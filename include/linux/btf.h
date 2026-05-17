@@ -114,6 +114,7 @@ struct btf_type;
 union bpf_attr;
 struct btf_show;
 struct btf_id_set;
+struct bpf_kinsn;
 struct bpf_prog;
 
 typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
@@ -122,6 +123,7 @@ struct btf_kfunc_id_set {
 	struct module *owner;
 	struct btf_id_set8 *set;
 	btf_kfunc_filter_t filter;
+	const struct bpf_kinsn * const *kinsn_descs;
 };
 
 struct btf_id_dtor_kfunc {

@@ -1192,6 +1192,49 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
+/* Maximum number of ARM64 instructions a kinsn emit callback may produce.
+ * Each ARM64 instruction is 4 bytes, so the scratch buffer is
+ * BPF_KINSN_MAX_ARM64_INSNS * 4 bytes.
+ */
+#define BPF_KINSN_MAX_ARM64_INSNS	64
+
+static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
+				      const struct bpf_prog *bpf_prog,
+				      const struct bpf_insn *insn)
+{
+	const struct bpf_kinsn *kinsn;
+	u32 scratch[BPF_KINSN_MAX_ARM64_INSNS];
+	u64 payload;
+	int ret, scratch_idx = 0, n_insns, i;
+
+	ret = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
+	if (ret)
+		return ret;
+	if (!kinsn || !kinsn->emit_arm64)
+		return -EOPNOTSUPP;
+	if (kinsn->max_emit_bytes > sizeof(scratch))
+		return -E2BIG;
+
+	n_insns = kinsn->emit_arm64(scratch, &scratch_idx, ctx->write,
+				    payload, bpf_prog);
+	if (n_insns < 0)
+		return n_insns;
+	if (scratch_idx != n_insns)
+		return -EFAULT;
+	if (n_insns > BPF_KINSN_MAX_ARM64_INSNS)
+		return -EFAULT;
+	if (n_insns * 4 > kinsn->max_emit_bytes)
+		return -EFAULT;
+
+	if (ctx->image && ctx->write) {
+		for (i = 0; i < n_insns; i++)
+			ctx->image[ctx->idx + i] = cpu_to_le32(scratch[i]);
+	}
+	ctx->idx += n_insns;
+
+	return 0;
+}
+
 /* JITs an eBPF instruction.
  * Returns:
  * 0  - successfully JITed an 8-byte eBPF instruction.
@@ -1223,6 +1266,9 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 	int off_adj;
 	int ret;
 	bool sign_extend;
+
+	if (bpf_kinsn_is_sidecar_insn(insn))
+		return 0;
 
 	switch (code) {
 	/* dst = src */
@@ -1591,6 +1637,14 @@ emit_cond_jmp:
 		if (insn->src_reg == 0 && (insn->imm == BPF_FUNC_get_current_task ||
 					   insn->imm == BPF_FUNC_get_current_task_btf)) {
 			emit(A64_MRS_SP_EL0(r0), ctx);
+			break;
+		}
+
+		/* Try to inline a kinsn call via module-provided ARM64 emit */
+		if (insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
+			ret = emit_kinsn_desc_call_arm64(ctx, ctx->prog, insn);
+			if (ret)
+				return ret;
 			break;
 		}
 
