@@ -371,30 +371,73 @@ static void prepare_bpf_tail_call_cnt(struct jit_ctx *ctx)
 		emit(A64_PUSH(ptr, ptr, A64_SP), ctx);
 }
 
-static void find_used_callee_regs(struct jit_ctx *ctx)
+static void detect_insn_callee_regs(struct jit_ctx *ctx,
+				    const struct bpf_insn *insn,
+				    int insn_cnt, int *reg_used)
 {
+	static const int reg_mask[BPF_REG_FP + 1] = {
+		[BPF_REG_6] = 1,
+		[BPF_REG_7] = 2,
+		[BPF_REG_8] = 4,
+		[BPF_REG_9] = 8,
+		[BPF_REG_FP] = 16,
+	};
 	int i;
+
+	for (i = 0; i < insn_cnt; i++, insn++) {
+		if (insn->dst_reg <= BPF_REG_FP)
+			*reg_used |= reg_mask[insn->dst_reg];
+		if (insn->src_reg <= BPF_REG_FP)
+			*reg_used |= reg_mask[insn->src_reg];
+	}
+	if (*reg_used & 16)
+		ctx->fp_used = true;
+}
+
+static int find_used_callee_regs(struct jit_ctx *ctx)
+{
 	const struct bpf_prog *prog = ctx->prog;
 	const struct bpf_insn *insn = &prog->insnsi[0];
 	int reg_used = 0;
+	int i;
 
 	for (i = 0; i < prog->len; i++, insn++) {
-		if (insn->dst_reg == BPF_REG_6 || insn->src_reg == BPF_REG_6)
-			reg_used |= 1;
+		const struct bpf_kinsn *kinsn;
+		struct bpf_insn *proof_buf;
+		u64 payload;
+		int cnt;
+		int err;
 
-		if (insn->dst_reg == BPF_REG_7 || insn->src_reg == BPF_REG_7)
-			reg_used |= 2;
+		detect_insn_callee_regs(ctx, insn, 1, &reg_used);
 
-		if (insn->dst_reg == BPF_REG_8 || insn->src_reg == BPF_REG_8)
-			reg_used |= 4;
+		if (!bpf_kinsn_is_sidecar_insn(insn))
+			continue;
+		if (i + 1 >= prog->len)
+			continue;
 
-		if (insn->dst_reg == BPF_REG_9 || insn->src_reg == BPF_REG_9)
-			reg_used |= 8;
+		if ((insn + 1)->code != (BPF_JMP | BPF_CALL) ||
+		    (insn + 1)->src_reg != BPF_PSEUDO_KINSN_CALL)
+			continue;
 
-		if (insn->dst_reg == BPF_REG_FP || insn->src_reg == BPF_REG_FP) {
-			ctx->fp_used = true;
-			reg_used |= 16;
+		err = bpf_jit_get_kinsn_payload(prog, insn + 1, &kinsn, &payload);
+		if (err)
+			return err;
+		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
+			return -EINVAL;
+
+		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+				     GFP_KERNEL);
+		if (!proof_buf)
+			return -ENOMEM;
+
+		cnt = kinsn->instantiate_insn(payload, proof_buf);
+		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+			kvfree(proof_buf);
+			return cnt ? -EFAULT : -EINVAL;
 		}
+
+		detect_insn_callee_regs(ctx, proof_buf, cnt, &reg_used);
+		kvfree(proof_buf);
 	}
 
 	i = 0;
@@ -420,12 +463,14 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 		ctx->used_callee_reg[i++] = bpf2a64[ARENA_VM_START];
 
 	ctx->nr_used_callee_reg = i;
+	return 0;
 }
 
 /* Save callee-saved registers */
-static void push_callee_regs(struct jit_ctx *ctx)
+static int push_callee_regs(struct jit_ctx *ctx)
 {
 	int reg1, reg2, i;
+	int err;
 
 	/*
 	 * Program acting as exception boundary should save all ARM64
@@ -440,7 +485,9 @@ static void push_callee_regs(struct jit_ctx *ctx)
 		emit(A64_PUSH(A64_R(27), A64_R(28), A64_SP), ctx);
 		ctx->fp_used = true;
 	} else {
-		find_used_callee_regs(ctx);
+		err = find_used_callee_regs(ctx);
+		if (err)
+			return err;
 		for (i = 0; i + 1 < ctx->nr_used_callee_reg; i += 2) {
 			reg1 = ctx->used_callee_reg[i];
 			reg2 = ctx->used_callee_reg[i + 1];
@@ -452,6 +499,7 @@ static void push_callee_regs(struct jit_ctx *ctx)
 			emit(A64_PUSH(reg1, A64_ZR, A64_SP), ctx);
 		}
 	}
+	return 0;
 }
 
 /* Restore callee-saved registers */
@@ -519,6 +567,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	const u8 priv_sp = bpf2a64[PRIVATE_SP];
 	void __percpu *priv_stack_ptr;
 	int cur_offset;
+	int err;
 
 	/*
 	 * BPF prog stack layout
@@ -578,7 +627,9 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 			/* BTI landing pad for the tail call, done with a BR */
 			emit_bti(A64_BTI_J, ctx);
 		}
-		push_callee_regs(ctx);
+		err = push_callee_regs(ctx);
+		if (err)
+			return err;
 	} else {
 		/*
 		 * Exception callback receives FP of Main Program as third
