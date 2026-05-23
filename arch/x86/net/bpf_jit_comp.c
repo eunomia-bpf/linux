@@ -577,7 +577,8 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 }
 
 static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
-				const struct bpf_insn *insn, bool emit)
+				const struct bpf_insn *insn, bool emit,
+				const u8 *final_ip)
 {
 	const struct bpf_kinsn *kinsn;
 	u8 scratch[BPF_MAX_INSN_SIZE];
@@ -594,7 +595,8 @@ static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
 	if (kinsn->max_emit_bytes > BPF_MAX_INSN_SIZE)
 		return -E2BIG;
 
-	ret = kinsn->emit_x86(scratch, &off, emit, payload, bpf_prog);
+	ret = kinsn->emit_x86(scratch, &off, emit, payload, bpf_prog,
+			      final_ip);
 	if (ret < 0)
 		return ret;
 	if (ret != off || ret > kinsn->max_emit_bytes)
@@ -2529,7 +2531,8 @@ populate_extable:
 			func = (u8 *) __bpf_call_base + imm32;
 			if (src_reg == BPF_PSEUDO_KINSN_CALL) {
 				err = emit_kinsn_desc_call(&prog, bpf_prog, insn,
-							    !!rw_image);
+							    !!rw_image,
+							    image ? ip : NULL);
 				if (err)
 					return err;
 				break;

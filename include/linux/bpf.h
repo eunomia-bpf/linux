@@ -973,7 +973,8 @@ struct bpf_kinsn {
 	int (*instantiate_insn)(u64 payload, struct bpf_insn *insn_buf);
 
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
-			u64 payload, const struct bpf_prog *prog);
+			u64 payload, const struct bpf_prog *prog,
+			const u8 *final_ip);
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
 			  u64 payload, const struct bpf_prog *prog);
 };
