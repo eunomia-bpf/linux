@@ -1254,6 +1254,7 @@ static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
 				      const struct bpf_insn *insn)
 {
 	const struct bpf_kinsn *kinsn;
+	const u32 *final_ip;
 	u32 scratch[BPF_KINSN_MAX_ARM64_INSNS];
 	u64 payload;
 	int ret, scratch_idx = 0, n_insns, i;
@@ -1266,8 +1267,9 @@ static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
 	if (kinsn->max_emit_bytes > sizeof(scratch))
 		return -E2BIG;
 
+	final_ip = ctx->ro_image ? (const u32 *)&ctx->ro_image[ctx->idx] : NULL;
 	n_insns = kinsn->emit_arm64(scratch, &scratch_idx, ctx->write,
-				    payload, bpf_prog);
+				    payload, bpf_prog, final_ip);
 	if (n_insns < 0)
 		return n_insns;
 	if (scratch_idx != n_insns)

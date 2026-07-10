@@ -976,7 +976,8 @@ struct bpf_kinsn {
 			u64 payload, const struct bpf_prog *prog,
 			const u8 *final_ip);
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
-			  u64 payload, const struct bpf_prog *prog);
+			  u64 payload, const struct bpf_prog *prog,
+			  const u32 *final_ip);
 };
 
 static inline bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
