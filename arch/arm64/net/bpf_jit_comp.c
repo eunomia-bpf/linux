@@ -402,7 +402,7 @@ static int find_used_callee_regs(struct jit_ctx *ctx)
 	int i;
 
 	for (i = 0; i < prog->len; i++, insn++) {
-		const struct bpf_kinsn *kinsn;
+		const struct bpf_kop *kop;
 		struct bpf_insn *proof_buf;
 		u64 payload;
 		int cnt;
@@ -410,28 +410,28 @@ static int find_used_callee_regs(struct jit_ctx *ctx)
 
 		detect_insn_callee_regs(ctx, insn, 1, &reg_used);
 
-		if (!bpf_kinsn_is_sidecar_insn(insn))
+		if (!bpf_kop_is_sidecar_insn(insn))
 			continue;
 		if (i + 1 >= prog->len)
 			continue;
 
 		if ((insn + 1)->code != (BPF_JMP | BPF_CALL) ||
-		    (insn + 1)->src_reg != BPF_PSEUDO_KINSN_CALL)
+		    (insn + 1)->src_reg != BPF_PSEUDO_KOP_CALL)
 			continue;
 
-		err = bpf_jit_get_kinsn_payload(prog, insn + 1, &kinsn, &payload);
+		err = bpf_jit_get_kop_payload(prog, insn + 1, &kop, &payload);
 		if (err)
 			return err;
-		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
+		if (!kop || !kop->instantiate_insn || !kop->max_insn_cnt)
 			return -EINVAL;
 
-		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+		proof_buf = kvcalloc(kop->max_insn_cnt, sizeof(*proof_buf),
 				     GFP_KERNEL);
 		if (!proof_buf)
 			return -ENOMEM;
 
-		cnt = kinsn->instantiate_insn(payload, proof_buf);
-		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+		cnt = kop->instantiate_insn(payload, proof_buf);
+		if (cnt <= 0 || cnt > kop->max_insn_cnt) {
 			kvfree(proof_buf);
 			return cnt ? -EFAULT : -EINVAL;
 		}
@@ -1243,40 +1243,40 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
-/* Maximum number of ARM64 instructions a kinsn emit callback may produce.
+/* Maximum number of ARM64 instructions a kop emit callback may produce.
  * Each ARM64 instruction is 4 bytes, so the scratch buffer is
- * BPF_KINSN_MAX_ARM64_INSNS * 4 bytes.
+ * BPF_KOP_MAX_ARM64_INSNS * 4 bytes.
  */
-#define BPF_KINSN_MAX_ARM64_INSNS	64
+#define BPF_KOP_MAX_ARM64_INSNS	64
 
-static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
+static int emit_kop_desc_call_arm64(struct jit_ctx *ctx,
 				      const struct bpf_prog *bpf_prog,
 				      const struct bpf_insn *insn)
 {
-	const struct bpf_kinsn *kinsn;
+	const struct bpf_kop *kop;
 	const u32 *final_ip;
-	u32 scratch[BPF_KINSN_MAX_ARM64_INSNS];
+	u32 scratch[BPF_KOP_MAX_ARM64_INSNS];
 	u64 payload;
 	int ret, scratch_idx = 0, n_insns, i;
 
-	ret = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
+	ret = bpf_jit_get_kop_payload(bpf_prog, insn, &kop, &payload);
 	if (ret)
 		return ret;
-	if (!kinsn || !kinsn->emit_arm64)
+	if (!kop || !kop->emit_arm64)
 		return -EOPNOTSUPP;
-	if (kinsn->max_emit_bytes > sizeof(scratch))
+	if (kop->max_emit_bytes > sizeof(scratch))
 		return -E2BIG;
 
 	final_ip = ctx->ro_image ? (const u32 *)&ctx->ro_image[ctx->idx] : NULL;
-	n_insns = kinsn->emit_arm64(scratch, &scratch_idx, ctx->write,
+	n_insns = kop->emit_arm64(scratch, &scratch_idx, ctx->write,
 				    payload, bpf_prog, final_ip);
 	if (n_insns < 0)
 		return n_insns;
 	if (scratch_idx != n_insns)
 		return -EFAULT;
-	if (n_insns > BPF_KINSN_MAX_ARM64_INSNS)
+	if (n_insns > BPF_KOP_MAX_ARM64_INSNS)
 		return -EFAULT;
-	if (n_insns * 4 > kinsn->max_emit_bytes)
+	if (n_insns * 4 > kop->max_emit_bytes)
 		return -EFAULT;
 
 	if (ctx->image && ctx->write) {
@@ -1320,7 +1320,7 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 	int ret;
 	bool sign_extend;
 
-	if (bpf_kinsn_is_sidecar_insn(insn))
+	if (bpf_kop_is_sidecar_insn(insn))
 		return 0;
 
 	switch (code) {
@@ -1693,9 +1693,9 @@ emit_cond_jmp:
 			break;
 		}
 
-		/* Try to inline a kinsn call via module-provided ARM64 emit */
-		if (insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
-			ret = emit_kinsn_desc_call_arm64(ctx, ctx->prog, insn);
+		/* Try to inline a kop call via module-provided ARM64 emit */
+		if (insn->src_reg == BPF_PSEUDO_KOP_CALL) {
+			ret = emit_kop_desc_call_arm64(ctx, ctx->prog, insn);
 			if (ret)
 				return ret;
 			break;

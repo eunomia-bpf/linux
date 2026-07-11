@@ -965,7 +965,7 @@ struct bpf_func_proto {
 	bool (*allowed)(const struct bpf_prog *prog);
 };
 
-struct bpf_kinsn {
+struct bpf_kop {
 	struct module *owner; /* NULL for built-in/vmlinux descriptors */
 	u16 max_insn_cnt;
 	u16 max_emit_bytes;
@@ -980,28 +980,28 @@ struct bpf_kinsn {
 			  const u32 *final_ip);
 };
 
-static inline bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
+static inline bool bpf_kop_has_native_emit(const struct bpf_kop *kop)
 {
-	if (!kinsn)
+	if (!kop)
 		return false;
 #ifdef CONFIG_X86
-	if (kinsn->emit_x86)
+	if (kop->emit_x86)
 		return true;
 #endif
 #ifdef CONFIG_ARM64
-	if (kinsn->emit_arm64)
+	if (kop->emit_arm64)
 		return true;
 #endif
 	return false;
 }
 
-static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
+static inline bool bpf_kop_is_sidecar_insn(const struct bpf_insn *insn)
 {
 	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
-	       insn->src_reg == BPF_PSEUDO_KINSN_SIDECAR;
+	       insn->src_reg == BPF_PSEUDO_KOP_SIDECAR;
 }
 
-static inline u64 bpf_kinsn_sidecar_payload(const struct bpf_insn *insn)
+static inline u64 bpf_kop_sidecar_payload(const struct bpf_insn *insn)
 {
 	return (u64)(insn->dst_reg & 0xf) |
 	       ((u64)(u16)insn->off << 4) |
@@ -3079,9 +3079,9 @@ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
-int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+int bpf_jit_get_kop_payload(const struct bpf_prog *prog,
 			      const struct bpf_insn *insn,
-			      const struct bpf_kinsn **kinsn,
+			      const struct bpf_kop **kop,
 			      u64 *payload);
 int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
 		       u16 btf_fd_idx, u8 **func_addr);
@@ -3375,9 +3375,9 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 }
 
 static inline int
-bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+bpf_jit_get_kop_payload(const struct bpf_prog *prog,
 			      const struct bpf_insn *insn,
-			      const struct bpf_kinsn **kinsn,
+			      const struct bpf_kop **kop,
 			      u64 *payload)
 {
 	return -EOPNOTSUPP;

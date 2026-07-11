@@ -25,7 +25,7 @@
 #define TMP_STR_BUF_LEN 320
 /*
  * Patch buffer size for verifier-side instruction rewriting and temporary
- * kinsn proof instantiation. Bulk-memory kinsns can legitimately expand well
+ * KOperation proof instantiation. Bulk-memory KOperation instances can legitimately expand well
  * past 32 insns before native JIT emit takes over.
  */
 #define INSN_BUF_SIZE 256
@@ -746,7 +746,7 @@ struct bpf_scc_info {
 
 struct bpf_liveness;
 
-struct bpf_kinsn_region {
+struct bpf_kop_region {
 	u32 start;
 	u16 proof_len;
 	struct bpf_insn orig[2];
@@ -861,10 +861,10 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
-	struct bpf_kinsn_region *kinsn_regions;
-	u32 kinsn_call_cnt;
-	u32 kinsn_region_cnt;
-	u32 kinsn_region_cap;
+	struct bpf_kop_region *kop_regions;
+	u32 kop_call_cnt;
+	u32 kop_region_cnt;
+	u32 kop_region_cap;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -951,7 +951,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			    const struct bpf_prog *tgt_prog,
 			    u32 btf_id,
 			    struct bpf_attach_target_info *tgt_info);
-const struct bpf_kinsn *btf_kfunc_kinsn_desc(const struct btf *btf,
+const struct bpf_kop *btf_kfunc_kop_desc(const struct btf *btf,
 					     u32 kfunc_btf_id,
 					     const struct bpf_prog *prog);
 void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);

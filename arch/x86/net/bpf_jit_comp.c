@@ -576,30 +576,30 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
-static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
+static int emit_kop_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
 				const struct bpf_insn *insn, bool emit,
 				const u8 *final_ip)
 {
-	const struct bpf_kinsn *kinsn;
+	const struct bpf_kop *kop;
 	u8 scratch[BPF_MAX_INSN_SIZE];
 	u8 *prog = *pprog;
 	u32 off = 0;
 	u64 payload;
 	int ret;
 
-	ret = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
+	ret = bpf_jit_get_kop_payload(bpf_prog, insn, &kop, &payload);
 	if (ret)
 		return ret;
-	if (!kinsn || !kinsn->emit_x86)
+	if (!kop || !kop->emit_x86)
 		return -EOPNOTSUPP;
-	if (kinsn->max_emit_bytes > BPF_MAX_INSN_SIZE)
+	if (kop->max_emit_bytes > BPF_MAX_INSN_SIZE)
 		return -E2BIG;
 
-	ret = kinsn->emit_x86(scratch, &off, emit, payload, bpf_prog,
+	ret = kop->emit_x86(scratch, &off, emit, payload, bpf_prog,
 			      final_ip);
 	if (ret < 0)
 		return ret;
-	if (ret != off || ret > kinsn->max_emit_bytes)
+	if (ret != off || ret > kop->max_emit_bytes)
 		return -EFAULT;
 	if (emit)
 		memcpy(prog, scratch, off);
@@ -1559,36 +1559,36 @@ static int detect_reg_usage(const struct bpf_prog *bpf_prog, bool *regs_used)
 	detect_insn_reg_usage(insn, insn_cnt, regs_used);
 
 	for (i = 0; i < insn_cnt; i++) {
-		const struct bpf_kinsn *kinsn;
+		const struct bpf_kop *kop;
 		const struct bpf_insn *call;
 		struct bpf_insn *proof_buf;
 		u64 payload;
 		int cnt;
 		int err;
 
-		if (!bpf_kinsn_is_sidecar_insn(&insn[i]))
+		if (!bpf_kop_is_sidecar_insn(&insn[i]))
 			continue;
 		if (i + 1 >= insn_cnt)
 			continue;
 
 		call = &insn[i + 1];
 		if (call->code != (BPF_JMP | BPF_CALL) ||
-		    call->src_reg != BPF_PSEUDO_KINSN_CALL)
+		    call->src_reg != BPF_PSEUDO_KOP_CALL)
 			continue;
 
-		err = bpf_jit_get_kinsn_payload(bpf_prog, call, &kinsn, &payload);
+		err = bpf_jit_get_kop_payload(bpf_prog, call, &kop, &payload);
 		if (err)
 			return err;
-		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
+		if (!kop || !kop->instantiate_insn || !kop->max_insn_cnt)
 			return -EINVAL;
 
-		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+		proof_buf = kvcalloc(kop->max_insn_cnt, sizeof(*proof_buf),
 				     GFP_KERNEL);
 		if (!proof_buf)
 			return -ENOMEM;
 
-		cnt = kinsn->instantiate_insn(payload, proof_buf);
-		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+		cnt = kop->instantiate_insn(payload, proof_buf);
+		if (cnt <= 0 || cnt > kop->max_insn_cnt) {
 			kvfree(proof_buf);
 			return cnt ? -EFAULT : -EINVAL;
 		}
@@ -1949,7 +1949,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 
 		case BPF_ALU64 | BPF_MOV | BPF_K:
 		case BPF_ALU | BPF_MOV | BPF_K:
-			if (bpf_kinsn_is_sidecar_insn(insn))
+			if (bpf_kop_is_sidecar_insn(insn))
 				break;
 			emit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64,
 				       dst_reg, imm32);
@@ -2529,8 +2529,8 @@ populate_extable:
 			u8 *ip = image + addrs[i - 1];
 
 			func = (u8 *) __bpf_call_base + imm32;
-			if (src_reg == BPF_PSEUDO_KINSN_CALL) {
-				err = emit_kinsn_desc_call(&prog, bpf_prog, insn,
+			if (src_reg == BPF_PSEUDO_KOP_CALL) {
+				err = emit_kop_desc_call(&prog, bpf_prog, insn,
 							    !!rw_image,
 							    image ? ip : NULL);
 				if (err)
