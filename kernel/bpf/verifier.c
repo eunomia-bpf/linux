@@ -23742,6 +23742,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 		if (bpf_kop_is_sidecar_insn(insn)) {
 			const struct bpf_kop *kop;
 			const struct bpf_insn *call = insn + 1;
+			struct bpf_insn *kop_proof;
 
 			if (i + 1 >= insn_cnt || !bpf_pseudo_kop_call(call))
 				goto next_insn;
@@ -23750,37 +23751,46 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 
-			if (kop->max_insn_cnt > INSN_BUF_SIZE) {
-				verbose(env, "kop max_insn_cnt %u exceeds insn_buf size %u\n",
-					kop->max_insn_cnt, INSN_BUF_SIZE);
-				return -E2BIG;
+			kop_proof = kvcalloc(kop->max_insn_cnt,
+					      sizeof(*kop_proof), GFP_KERNEL_ACCOUNT);
+			if (!kop_proof)
+				return -ENOMEM;
+			cnt = kop->instantiate_insn(bpf_kop_sidecar_payload(insn),
+						      kop_proof);
+			if (cnt <= 0) {
+				ret = cnt ? cnt : -EINVAL;
+				goto free_kop_proof;
 			}
 
-			cnt = kop->instantiate_insn(bpf_kop_sidecar_payload(insn),
-						      env->insn_buf);
-			if (cnt <= 0)
-				return cnt ? cnt : -EINVAL;
-
-			ret = validate_kop_proof_seq(env, kop, env->insn_buf, cnt);
+			ret = validate_kop_proof_seq(env, kop, kop_proof, cnt);
 			if (ret)
-				return ret;
+				goto free_kop_proof;
 
-			if (prog->jit_requested && bpf_kop_has_native_emit(kop))
+			if (prog->jit_requested && bpf_kop_has_native_emit(kop)) {
+				kvfree(kop_proof);
 				goto next_insn;
+			}
 
 			ret = verifier_remove_insns(env, i + delta + 1, 1);
 			if (ret)
-				return ret;
+				goto free_kop_proof;
 
-			new_prog = bpf_patch_insn_data(env, i + delta, insn_buf, cnt);
-			if (!new_prog)
-				return -ENOMEM;
+			new_prog = bpf_patch_insn_data(env, i + delta, kop_proof, cnt);
+			if (!new_prog) {
+				ret = -ENOMEM;
+				goto free_kop_proof;
+			}
+			kvfree(kop_proof);
 
 			delta += cnt - 2;
 			env->prog = prog = new_prog;
 			insn = new_prog->insnsi + i + delta;
 			i++;
 			goto next_insn;
+
+free_kop_proof:
+			kvfree(kop_proof);
+			return ret;
 		}
 
 		if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_X) && insn->imm) {

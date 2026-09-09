@@ -1243,19 +1243,14 @@ static int add_exception_handler(const struct bpf_insn *insn,
 	return 0;
 }
 
-/* Maximum number of ARM64 instructions a kop emit callback may produce.
- * Each ARM64 instruction is 4 bytes, so the scratch buffer is
- * BPF_KOP_MAX_ARM64_INSNS * 4 bytes.
- */
-#define BPF_KOP_MAX_ARM64_INSNS	64
-
 static int emit_kop_desc_call_arm64(struct jit_ctx *ctx,
 				      const struct bpf_prog *bpf_prog,
 				      const struct bpf_insn *insn)
 {
 	const struct bpf_kop *kop;
 	const u32 *final_ip;
-	u32 scratch[BPF_KOP_MAX_ARM64_INSNS];
+	u32 *scratch;
+	size_t max_insns;
 	u64 payload;
 	int ret, scratch_idx = 0, n_insns, i;
 
@@ -1264,28 +1259,36 @@ static int emit_kop_desc_call_arm64(struct jit_ctx *ctx,
 		return ret;
 	if (!kop || !kop->emit_arm64)
 		return -EOPNOTSUPP;
-	if (kop->max_emit_bytes > sizeof(scratch))
-		return -E2BIG;
+	if (!kop->max_emit_bytes || kop->max_emit_bytes % sizeof(*scratch))
+		return -EINVAL;
+
+	max_insns = kop->max_emit_bytes / sizeof(*scratch);
+	scratch = kvcalloc(max_insns, sizeof(*scratch), GFP_KERNEL);
+	if (!scratch)
+		return -ENOMEM;
 
 	final_ip = ctx->ro_image ? (const u32 *)&ctx->ro_image[ctx->idx] : NULL;
 	n_insns = kop->emit_arm64(scratch, &scratch_idx, ctx->write,
 				    payload, bpf_prog, final_ip);
-	if (n_insns < 0)
-		return n_insns;
-	if (scratch_idx != n_insns)
-		return -EFAULT;
-	if (n_insns > BPF_KOP_MAX_ARM64_INSNS)
-		return -EFAULT;
-	if (n_insns * 4 > kop->max_emit_bytes)
-		return -EFAULT;
+	if (n_insns < 0) {
+		ret = n_insns;
+		goto out;
+	}
+	if (scratch_idx != n_insns || (size_t)n_insns > max_insns) {
+		ret = -EFAULT;
+		goto out;
+	}
 
 	if (ctx->image && ctx->write) {
 		for (i = 0; i < n_insns; i++)
 			ctx->image[ctx->idx + i] = cpu_to_le32(scratch[i]);
 	}
 	ctx->idx += n_insns;
+	ret = 0;
 
-	return 0;
+out:
+	kvfree(scratch);
+	return ret;
 }
 
 /* JITs an eBPF instruction.
