@@ -20,6 +20,7 @@ that goes into great technical depth about the BPF Architecture.
    syscall_api
    helpers
    kfuncs
+   kinsn
    cpumasks
    fs_kfuncs
    programs
