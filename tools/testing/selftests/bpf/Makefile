@@ -47,7 +47,7 @@ TEST_PROGS := test_kmod.sh \
 TEST_PROGS_EXTENDED := \
 	ima_setup.sh verify_sig_setup.sh
 
-TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
+TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_kinsn_registration.ko bpf_test_modorder_x.ko \
 	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
 TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
 
