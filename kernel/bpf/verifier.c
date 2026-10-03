@@ -260,6 +260,7 @@ static int validate_ref_obj(struct bpf_verifier_env *env, struct ref_obj_desc *r
 struct bpf_kfunc_meta {
 	struct btf *btf;
 	const struct btf_type *proto;
+	const struct bpf_kinsn *kinsn;
 	const char *name;
 	const u32 *flags;
 	s32 id;
@@ -2860,6 +2861,7 @@ static int fetch_kfunc_meta(struct bpf_verifier_env *env,
 	memset(kfunc, 0, sizeof(*kfunc));
 	kfunc->btf = btf;
 	kfunc->id = func_id;
+	kfunc->kinsn = btf_kfunc_kinsn_desc(btf, func_id, env->prog);
 	kfunc->name = func_name;
 	kfunc->proto = func_proto;
 	kfunc->flags = kfunc_flags;
@@ -2947,6 +2949,26 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	if (err)
 		return err;
 
+	if (kfunc.kinsn) {
+		if (!kfunc.flags ||
+		    !btf_kfunc_is_allowed(kfunc.btf, kfunc.id, env->prog)) {
+			verbose(env, "calling kernel function %s is not allowed\n", kfunc.name);
+			return -EACCES;
+		}
+		if (!env->prog->jit_requested || !env->prog->gpl_compatible ||
+		    !bpf_jit_supports_kinsn()) {
+			verbose(env, "kinsn requires JIT support and a GPL program\n");
+			return -EOPNOTSUPP;
+		}
+		if (!kfunc.kinsn->instantiate_insn || !kfunc.kinsn->max_insn_cnt ||
+		    !kfunc.kinsn->max_emit_bytes ||
+		    !bpf_kinsn_has_native_emit(kfunc.kinsn)) {
+			verbose(env, "kfunc btf_id %u has no complete kinsn descriptor\n", func_id);
+			return -EINVAL;
+		}
+		goto add_desc;
+	}
+
 	addr = kallsyms_lookup_name(kfunc.name);
 	if (!addr) {
 		verbose(env, "cannot find address for kernel function %s\n", kfunc.name);
@@ -2982,6 +3004,7 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	meta.func_name = kfunc.name;
 	meta.kfunc_flags = kfunc.flags ? *kfunc.flags : 0;
 
+add_desc:
 	tab = krealloc(tab, struct_size(tab, descs, tab->nr_descs + 1), GFP_KERNEL_ACCOUNT);
 	if (!tab)
 		return -ENOMEM;
@@ -2990,14 +3013,18 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	desc = &tab->descs[tab->nr_descs];
 	memset(desc, 0, sizeof(*desc));
 
-	err = gen_kfunc_arg_proto(env, &meta, &func_model, &desc->proto);
-	if (err)
-		return err;
+	if (kfunc.kinsn) {
+		desc->kinsn = kfunc.kinsn;
+	} else {
+		err = gen_kfunc_arg_proto(env, &meta, &func_model, &desc->proto);
+		if (err)
+			return err;
+		desc->addr = addr;
+		desc->func_model = func_model;
+	}
 
 	desc->func_id = func_id;
 	desc->offset = offset;
-	desc->addr = addr;
-	desc->func_model = func_model;
 	tab->nr_descs++;
 	tab->nr_base_descs++;
 	sort(tab->descs, tab->nr_base_descs, sizeof(tab->descs[0]),
@@ -3110,6 +3137,13 @@ static int add_kfuncs(struct bpf_verifier_env *env)
 		}
 
 		ret = bpf_add_kfunc_call(env, insn->imm, insn->off);
+		if (!ret) {
+			struct bpf_kfunc_desc *desc;
+
+			desc = find_kfunc_desc(env->prog, insn->imm, insn->off);
+			if (desc && desc->kinsn)
+				env->kinsn_call_cnt++;
+		}
 		if (ret < 0)
 			return ret;
 	}
@@ -20120,6 +20154,9 @@ static int check_alu_fields(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	u8 class = BPF_CLASS(insn->code);
 	u8 opcode = BPF_OP(insn->code);
 
+	if (bpf_kinsn_is_sidecar_insn(insn))
+		return 0;
+
 	switch (opcode) {
 	case BPF_NEG:
 		if (BPF_SRC(insn->code) != BPF_K || insn->src_reg != BPF_REG_0 ||
@@ -20327,6 +20364,7 @@ static int check_and_resolve_insns(struct bpf_verifier_env *env)
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
 		if (insn->dst_reg >= MAX_BPF_REG &&
+		    !bpf_kinsn_is_sidecar_insn(insn) &&
 		    !is_stack_arg_st(insn) && !is_stack_arg_stx(insn)) {
 			verbose(env, "R%d is invalid\n", insn->dst_reg);
 			return -EINVAL;
@@ -22140,6 +22178,10 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 		return -EFAULT;
 	}
 	base_desc_idx = desc - env->prog->aux->kfunc_tab->descs;
+	if (desc->kinsn) {
+		insn->off = base_desc_idx;
+		return 0;
+	}
 
 	near_call = !bpf_jit_supports_far_kfunc_call();
 	desc_copy = *desc;
@@ -22607,15 +22649,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 		env->test_state_freq = attr->prog_flags & BPF_F_TEST_STATE_FREQ;
 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
 
-	env->explored_states = kvzalloc_objs(struct list_head,
-					     state_htab_size(env),
-					     GFP_KERNEL_ACCOUNT);
-	ret = -ENOMEM;
-	if (!env->explored_states)
-		goto skip_full_check;
-
-	for (i = 0; i < state_htab_size(env); i++)
-		INIT_LIST_HEAD(&env->explored_states[i]);
 	INIT_LIST_HEAD(&env->free_list);
 
 	/* Prepare BTF and func_info needed to discover all subprograms. */
@@ -22658,6 +22691,18 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 	ret = add_kfuncs(env);
 	if (ret < 0)
 		goto skip_full_check;
+
+	ret = bpf_lower_kinsn_proof_regions(env);
+	if (ret < 0)
+		goto skip_full_check;
+	env->explored_states = kvzalloc_objs(struct list_head,
+					     state_htab_size(env),
+					     GFP_KERNEL_ACCOUNT);
+	ret = -ENOMEM;
+	if (!env->explored_states)
+		goto skip_full_check;
+	for (i = 0; i < state_htab_size(env); i++)
+		INIT_LIST_HEAD(&env->explored_states[i]);
 
 	if (bpf_prog_is_offloaded(env->prog->aux)) {
 		ret = bpf_prog_offload_verifier_prep(env->prog);
@@ -22722,6 +22767,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
 
 skip_full_check:
 	kvfree(env->explored_states);
+
+	if (ret == 0)
+		ret = bpf_restore_kinsn_proof_regions(env);
 
 	/* might decrease stack depth, keep it before passes that
 	 * allocate additional slots.
@@ -22850,6 +22898,7 @@ err_prep:
 	release_maps(env);
 	release_btfs(env);
 err_free_env:
+	kvfree(env->kinsn_regions);
 	bpf_free_subprog_jts(env);
 	vfree(env->insn_aux_data);
 	kvfree(env->fd_array);

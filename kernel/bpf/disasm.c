@@ -193,6 +193,17 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
 	const bpf_insn_print_t verbose = cbs->cb_print;
 	u8 class = BPF_CLASS(insn->code);
 
+	if (insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
+	    insn->src_reg == BPF_PSEUDO_KINSN_SIDECAR) {
+		u64 payload = (u64)(insn->dst_reg & 0xf) |
+			      ((u64)(u16)insn->off << 4) |
+			      ((u64)(u32)insn->imm << 20);
+
+		verbose(cbs->private_data, "(%02x) kinsn payload 0x%llx",
+			insn->code, (unsigned long long)payload);
+		return;
+	}
+
 	if (class == BPF_ALU || class == BPF_ALU64) {
 		if (BPF_OP(insn->code) == BPF_END) {
 			if (class == BPF_ALU64)

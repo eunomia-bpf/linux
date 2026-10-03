@@ -1586,6 +1586,9 @@ struct bpf_prog *bpf_jit_blind_constants(struct bpf_verifier_env *env, struct bp
 	insn = clone->insnsi;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
+		/* The sidecar immediate is kinsn metadata, not an ALU constant. */
+		if (bpf_kinsn_is_sidecar_insn(insn))
+			continue;
 		if (bpf_pseudo_func(insn)) {
 			/* ld_imm64 with an address of bpf subprog is not
 			 * a user controlled constant. Don't randomize it,
@@ -3306,6 +3309,11 @@ bool __weak bpf_jit_supports_percpu_insn(void)
 }
 
 bool __weak bpf_jit_supports_kfunc_call(void)
+{
+	return false;
+}
+
+bool __weak bpf_jit_supports_kinsn(void)
 {
 	return false;
 }
