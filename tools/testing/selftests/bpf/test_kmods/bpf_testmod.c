@@ -925,15 +925,246 @@ BTF_ID_FLAGS(func, bpf_kfunc_kasan_poison)
 BTF_ID_FLAGS(func, bpf_kfunc_kasan_unpoison)
 BTF_ID_FLAGS(func, bpf_testmod_oob_alloc, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_testmod_oob_free, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_7)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_42)
 BTF_KFUNCS_END(bpf_testmod_common_kfunc_ids)
 
 BTF_ID_LIST(bpf_testmod_dtor_ids)
 BTF_ID(struct, bpf_testmod_ctx)
 BTF_ID(func, bpf_testmod_ctx_release_dtor)
 
+__bpf_kfunc_start_defs();
+
+__bpf_kfunc u64 bpf_testmod_kinsn_42(void)
+{
+	return 42;
+}
+
+__bpf_kfunc u64 bpf_testmod_kinsn_7(void)
+{
+	return 7;
+}
+
+__bpf_kfunc u64 bpf_testmod_kinsn_flagged(void)
+{
+	return 42;
+}
+
+__bpf_kfunc_end_defs();
+
+#define TEST_KINSN_PACKED_PAYLOAD 0x123456781234fULL
+#define TEST_KINSN_STACK_PAYLOAD 4
+#define TEST_KINSN_R6_PAYLOAD 5
+
+static int test_kinsn_proof(u64 payload, struct bpf_insn *insns)
+{
+	if (payload == 6 || payload == 7) {
+		insns[0] = BPF_JMP_A(payload == 6 ? -1 : 1);
+		return 1;
+	}
+	if (payload == 8) {
+		insns[0] = BPF_RAW_INSN(BPF_JMP | BPF_JCOND, 0, 0, 1, 0);
+		return 1;
+	}
+	if (payload == 9) {
+		insns[0] = BPF_RAW_INSN(BPF_JMP | BPF_JA | BPF_X, 0, 0, 1, 0);
+		return 1;
+	}
+	if (payload == 10) {
+		insns[0] = BPF_EMIT_CALL(BPF_FUNC_get_prandom_u32);
+		return 1;
+	}
+	if (payload == 11) {
+		insns[0] = BPF_EXIT_INSN();
+		return 1;
+	}
+	if (payload == 12) {
+		insns[0] = BPF_RAW_INSN(BPF_LD | BPF_DW | BPF_IMM,
+					0, BPF_PSEUDO_MAP_FD, 0, 0);
+		insns[1] = BPF_RAW_INSN(0, 0, 0, 0, 0);
+		return 2;
+	}
+	if (payload != 0 && payload != 1 && payload != 3 &&
+	    payload != TEST_KINSN_STACK_PAYLOAD &&
+	    payload != TEST_KINSN_R6_PAYLOAD &&
+	    payload != TEST_KINSN_PACKED_PAYLOAD)
+		return -EINVAL;
+	if (payload == TEST_KINSN_STACK_PAYLOAD) {
+		insns[0] = BPF_MOV64_IMM(BPF_REG_0, 42);
+		insns[1] = BPF_STX_MEM(BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
+		insns[2] = BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_FP, -8);
+		return 3;
+	}
+	if (payload == TEST_KINSN_R6_PAYLOAD) {
+		insns[0] = BPF_MOV64_IMM(BPF_REG_6, 42);
+		insns[1] = BPF_MOV64_REG(BPF_REG_0, BPF_REG_6);
+		return 2;
+	}
+	if (payload == 3) {
+		insns[0] = BPF_MOV64_IMM(BPF_REG_0, 42);
+		insns[1] = BPF_JMP_IMM(BPF_JEQ, BPF_REG_2, 0, 1);
+		insns[2] = BPF_MOV64_IMM(BPF_REG_0, 42);
+		return 3;
+	}
+	insns[0] = payload == 1 ? BPF_MOV64_REG(BPF_REG_0, BPF_REG_2) :
+			     BPF_MOV64_IMM(BPF_REG_0, 42);
+	return 1;
+}
+
+#ifdef CONFIG_X86_64
+static int test_kinsn_emit_x86(u8 *image, u64 payload,
+			       const struct bpf_prog *prog, const u8 *final_ip)
+{
+	static const u8 mov_42[] = { 0xb8, 42, 0, 0, 0 };
+	static const u8 stack_roundtrip[] = {
+		0xb8, 42, 0, 0, 0, /* mov eax, 42 */
+		0x48, 0x89, 0x45, 0xf8, /* mov [rbp-8], rax */
+		0x48, 0x8b, 0x45, 0xf8, /* mov rax, [rbp-8] */
+	};
+	static const u8 r6_roundtrip[] = {
+		0xbb, 42, 0, 0, 0, /* mov ebx, 42 */
+		0x48, 0x89, 0xd8, /* mov rax, rbx */
+	};
+
+	if (payload == TEST_KINSN_STACK_PAYLOAD) {
+		memcpy(image, stack_roundtrip, sizeof(stack_roundtrip));
+		return sizeof(stack_roundtrip);
+	}
+	if (payload == TEST_KINSN_R6_PAYLOAD) {
+		memcpy(image, r6_roundtrip, sizeof(r6_roundtrip));
+		return sizeof(r6_roundtrip);
+	}
+	if (payload && payload != 3 && payload != TEST_KINSN_PACKED_PAYLOAD)
+		return -EINVAL;
+	memcpy(image, mov_42, sizeof(mov_42));
+	return sizeof(mov_42);
+}
+#endif
+
+#ifdef CONFIG_ARM64
+static int test_kinsn_emit_arm64(u32 *image, u64 payload,
+				 const struct bpf_prog *prog, const u32 *final_ip)
+{
+	if (payload == TEST_KINSN_STACK_PAYLOAD) {
+		image[0] = 0xd2800548; /* movz x8, #42: BPF R0 */
+		image[1] = 0xf81f8328; /* stur x8, [x25, #-8]: BPF FP */
+		image[2] = 0xf85f8328; /* ldur x8, [x25, #-8] */
+		return 3;
+	}
+	if (payload == TEST_KINSN_R6_PAYLOAD) {
+		image[0] = 0xd2800553; /* movz x19, #42: BPF R6 */
+		image[1] = 0xaa1303e8; /* mov x8, x19: BPF R0 */
+		return 2;
+	}
+	if (payload && payload != 3 && payload != TEST_KINSN_PACKED_PAYLOAD)
+		return -EINVAL;
+	image[0] = 0xd2800548; /* movz x8, #42: BPF R0 */
+	return 1;
+}
+#endif
+
+static const struct bpf_kinsn test_kinsn_42 = {
+	.owner = THIS_MODULE,
+	.max_insn_cnt = 3,
+	.max_emit_bytes = 16,
+	.instantiate_insn = test_kinsn_proof,
+#ifdef CONFIG_X86_64
+	.emit_x86 = test_kinsn_emit_x86,
+#endif
+#ifdef CONFIG_ARM64
+	.emit_arm64 = test_kinsn_emit_arm64,
+#endif
+};
+
+static int test_kinsn_7_proof(u64 payload, struct bpf_insn *insns)
+{
+	if (payload)
+		return -EINVAL;
+	insns[0] = BPF_MOV64_IMM(BPF_REG_0, 7);
+	return 1;
+}
+
+#ifdef CONFIG_X86_64
+static int test_kinsn_7_emit_x86(u8 *image, u64 payload,
+				 const struct bpf_prog *prog, const u8 *final_ip)
+{
+	static const u8 mov_7[] = { 0xb8, 7, 0, 0, 0 };
+
+	if (payload)
+		return -EINVAL;
+	memcpy(image, mov_7, sizeof(mov_7));
+	return sizeof(mov_7);
+}
+#endif
+
+#ifdef CONFIG_ARM64
+static int test_kinsn_7_emit_arm64(u32 *image, u64 payload,
+				   const struct bpf_prog *prog, const u32 *final_ip)
+{
+	if (payload)
+		return -EINVAL;
+	image[0] = 0xd28000e8; /* movz x8, #7: BPF R0 */
+	return 1;
+}
+#endif
+
+static const struct bpf_kinsn test_kinsn_7 = {
+	.owner = THIS_MODULE,
+	.max_insn_cnt = 1,
+	.max_emit_bytes = 8,
+	.instantiate_insn = test_kinsn_7_proof,
+#ifdef CONFIG_X86_64
+	.emit_x86 = test_kinsn_7_emit_x86,
+#endif
+#ifdef CONFIG_ARM64
+	.emit_arm64 = test_kinsn_7_emit_arm64,
+#endif
+};
+
+/* This list keeps descriptor order independent of sorted BTF_SET8 pairs. */
+BTF_ID_LIST(bpf_testmod_kinsn_ids)
+BTF_ID(func, bpf_testmod_kinsn_7)
+BTF_ID(func, bpf_testmod_kinsn_42)
+
+static const struct bpf_kinsn * const bpf_testmod_kinsns[] = {
+	&test_kinsn_7,
+	&test_kinsn_42,
+};
+
+static int bpf_testmod_kinsn_filter(const struct bpf_prog *prog, u32 kfunc_id)
+{
+	/* Common kfuncs share this hook; filter only the rejection fixture. */
+	return prog->type == BPF_PROG_TYPE_NETFILTER &&
+	       !strcmp(prog->aux->name, "filtered_kinsn");
+}
+
 static const struct btf_kfunc_id_set bpf_testmod_common_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &bpf_testmod_common_kfunc_ids,
+	.filter = bpf_testmod_kinsn_filter,
+	.kinsn_descs = bpf_testmod_kinsns,
+	.kinsn_ids = bpf_testmod_kinsn_ids,
+	.kinsn_cnt = ARRAY_SIZE(bpf_testmod_kinsns),
+};
+
+/* Registration must reject a kinsn carrying ordinary kfunc semantics. */
+BTF_KFUNCS_START(bpf_testmod_flagged_kinsn_ids)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_flagged, KF_SLEEPABLE)
+BTF_KFUNCS_END(bpf_testmod_flagged_kinsn_ids)
+
+BTF_ID_LIST(bpf_testmod_flagged_kinsn_list)
+BTF_ID(func, bpf_testmod_kinsn_flagged)
+
+static const struct bpf_kinsn * const bpf_testmod_flagged_kinsns[] = {
+	&test_kinsn_42,
+};
+
+static const struct btf_kfunc_id_set bpf_testmod_flagged_kinsn_set = {
+	.owner = THIS_MODULE,
+	.set = &bpf_testmod_flagged_kinsn_ids,
+	.kinsn_descs = bpf_testmod_flagged_kinsns,
+	.kinsn_ids = bpf_testmod_flagged_kinsn_list,
+	.kinsn_cnt = ARRAY_SIZE(bpf_testmod_flagged_kinsns),
 };
 
 __bpf_kfunc u64 bpf_kfunc_call_test1(struct sock *sk, u32 a, u64 b, u32 c, u64 d)
@@ -2439,6 +2670,11 @@ static int bpf_testmod_init(void)
 	void **tramp;
 	int ret;
 
+	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_testmod_flagged_kinsn_set);
+	if (ret != -EINVAL) {
+		pr_err("flagged kinsn registration unexpectedly returned %d\n", ret);
+		return ret ?: -EINVAL;
+	}
 	ret = register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &bpf_testmod_common_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS, &bpf_testmod_kfunc_set);
 	ret = ret ?: register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_testmod_kfunc_set);
