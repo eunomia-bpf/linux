@@ -633,6 +633,25 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
+static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
+				const struct bpf_kinsn *kinsn, u64 payload,
+				const u8 *final_ip)
+{
+	int ret;
+
+	if (!kinsn->emit_x86)
+		return -EOPNOTSUPP;
+	if (kinsn->max_emit_bytes > BPF_MAX_INSN_SIZE)
+		return -E2BIG;
+	ret = kinsn->emit_x86(*pprog, payload, bpf_prog, final_ip);
+	if (ret < 0)
+		return ret;
+	if (ret > kinsn->max_emit_bytes)
+		return -EFAULT;
+	*pprog += ret;
+	return 0;
+}
+
 static int emit_rsb_call(u8 **pprog, void *func, void *ip)
 {
 	OPTIMIZER_HIDE_VAR(func);
@@ -2054,6 +2073,9 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 	user_vm_start = bpf_arena_get_user_vm_start(bpf_prog->aux->arena);
 
 	detect_reg_usage(insn, insn_cnt, callee_regs_used);
+	for (i = 0; i < ARRAY_SIZE(callee_regs_used); i++)
+		if (bpf_prog->aux->kinsn_callee_regs & BIT(i))
+			callee_regs_used[i] = true;
 
 	emit_prologue(&prog, image, stack_depth,
 		      bpf_prog_was_classic(bpf_prog), tail_call_reachable,
@@ -2290,6 +2312,8 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
 
 		case BPF_ALU64 | BPF_MOV | BPF_K:
 		case BPF_ALU | BPF_MOV | BPF_K:
+			if (bpf_kinsn_is_sidecar_insn(insn))
+				break;
 			emit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64,
 				       dst_reg, imm32);
 			break;
@@ -2942,7 +2966,22 @@ populate_extable:
 			/* call */
 		case BPF_JMP | BPF_CALL: {
 			const struct btf_func_model *fm = NULL;
+			const struct bpf_kinsn *kinsn;
+			u64 payload;
 
+			if (src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				err = bpf_jit_get_kinsn_payload(bpf_prog, insn,
+								&kinsn, &payload);
+				if (err && err != -ENOENT)
+					return err;
+			}
+			if (src_reg == BPF_PSEUDO_KFUNC_CALL && !err) {
+				err = emit_kinsn_desc_call(&prog, bpf_prog, kinsn, payload,
+							   image ? ip : NULL);
+				if (err)
+					return err;
+				break;
+			}
 			func = (u8 *) __bpf_call_base + imm32;
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
 				LOAD_TAIL_CALL_CNT_PTR(stack_depth);
@@ -4501,6 +4540,11 @@ bool bpf_jit_supports_callx(void)
 }
 
 bool bpf_jit_supports_kfunc_call(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_kinsn(void)
 {
 	return true;
 }
