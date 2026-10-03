@@ -376,7 +376,10 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 	int i;
 	const struct bpf_prog *prog = ctx->prog;
 	const struct bpf_insn *insn = &prog->insnsi[0];
-	int reg_used = 0;
+	int reg_used = prog->aux->kinsn_callee_regs;
+
+	if (reg_used & BIT(BPF_REG_FP - BPF_REG_6))
+		ctx->fp_used = true;
 
 	for (i = 0; i < prog->len; i++, insn++) {
 		if (insn->dst_reg == BPF_REG_6 || insn->src_reg == BPF_REG_6)
@@ -1348,6 +1351,31 @@ static void emit_kfunc_arg_moves(struct jit_ctx *ctx, const struct btf_func_mode
 	}
 }
 
+static int emit_kinsn_desc_call_arm64(struct jit_ctx *ctx,
+				      const struct bpf_prog *bpf_prog,
+				      const struct bpf_kinsn *kinsn,
+				      u64 payload)
+{
+	const u32 *final_ip;
+	u32 insns[32];
+	int n_insns, i;
+
+	if (!kinsn->emit_arm64)
+		return -EOPNOTSUPP;
+	if (kinsn->max_emit_bytes > sizeof(insns) ||
+	    kinsn->max_emit_bytes % sizeof(insns[0]))
+		return -E2BIG;
+	final_ip = ctx->ro_image ? (const u32 *)&ctx->ro_image[ctx->idx] : NULL;
+	n_insns = kinsn->emit_arm64(insns, payload, bpf_prog, final_ip);
+	if (n_insns < 0)
+		return n_insns;
+	if (n_insns > kinsn->max_emit_bytes / sizeof(insns[0]))
+		return -EFAULT;
+	for (i = 0; i < n_insns; i++)
+		emit(insns[i], ctx);
+	return 0;
+}
+
 /* JITs an eBPF instruction.
  * Returns:
  * 0  - successfully JITed an 8-byte eBPF instruction.
@@ -1382,6 +1410,9 @@ static int build_insn(const struct bpf_verifier_env *env, const struct bpf_insn 
 
 	if (bpf_insn_is_indirect_target(env, ctx->prog, i))
 		emit_bti(A64_BTI_J, ctx);
+
+	if (bpf_kinsn_is_sidecar_insn(insn))
+		return 0;
 
 	switch (code) {
 	/* dst = src */
@@ -1764,6 +1795,24 @@ emit_cond_jmp:
 					   insn->imm == BPF_FUNC_get_current_task_btf)) {
 			emit(A64_MRS_SP_EL0(r0), ctx);
 			break;
+		}
+
+		/* Try to inline a kinsn call via module-provided ARM64 emit */
+		if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL) {
+			const struct bpf_kinsn *kinsn;
+			u64 payload;
+
+			ret = bpf_jit_get_kinsn_payload(ctx->prog, insn,
+							&kinsn, &payload);
+			if (ret && ret != -ENOENT)
+				return ret;
+			if (!ret) {
+				ret = emit_kinsn_desc_call_arm64(ctx, ctx->prog,
+								 kinsn, payload);
+				if (ret)
+					return ret;
+				break;
+			}
 		}
 
 		ret = bpf_jit_get_func_addr(ctx->prog, insn, extra_pass,
@@ -2456,6 +2505,11 @@ bool bpf_jit_supports_private_stack(void)
 }
 
 bool bpf_jit_supports_kfunc_call(void)
+{
+	return true;
+}
+
+bool bpf_jit_supports_kinsn(void)
 {
 	return true;
 }
