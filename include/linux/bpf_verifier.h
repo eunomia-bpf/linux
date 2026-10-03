@@ -921,6 +921,12 @@ struct bpf_scc_info {
 
 struct bpf_liveness;
 
+struct bpf_kinsn_region {
+	u32 start;
+	u16 proof_len;
+	struct bpf_insn orig[2];
+};
+
 struct bpf_fd_array {
 	union {
 		struct bpf_map *map;
@@ -1081,6 +1087,10 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
+	struct bpf_kinsn_region *kinsn_regions;
+	u32 kinsn_call_cnt;
+	u32 kinsn_region_cnt;
+	u32 kinsn_region_cap;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1254,6 +1264,9 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
 			    const struct bpf_prog *tgt_prog,
 			    u32 btf_id,
 			    struct bpf_attach_target_info *tgt_info);
+const struct bpf_kinsn *btf_kfunc_kinsn_desc(const struct btf *btf,
+					     u32 kfunc_btf_id,
+					     const struct bpf_prog *prog);
 void bpf_free_kfunc_btf_tab(struct bpf_kfunc_btf_tab *tab);
 
 int mark_chain_precision(struct bpf_verifier_env *env, int regno);
@@ -1795,6 +1808,7 @@ static_assert(MAX_KFUNC_CALL_DESCS <= S16_MAX + 1);
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
 	struct bpf_func_proto proto;
+	const struct bpf_kinsn *kinsn;
 	u32 func_id;
 	u16 offset;
 	unsigned long addr;
@@ -1838,6 +1852,8 @@ int bpf_convert_ctx_accesses(struct bpf_verifier_env *env);
 int bpf_jit_subprogs(struct bpf_verifier_env *env);
 int bpf_fixup_call_args(struct bpf_verifier_env *env);
 int bpf_do_misc_fixups(struct bpf_verifier_env *env);
+int bpf_lower_kinsn_proof_regions(struct bpf_verifier_env *env);
+int bpf_restore_kinsn_proof_regions(struct bpf_verifier_env *env);
 int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

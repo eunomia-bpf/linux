@@ -1074,6 +1074,47 @@ struct bpf_func_proto {
 	bool (*allowed)(const struct bpf_prog *prog);
 };
 
+struct bpf_kinsn {
+	struct module *owner; /* NULL for built-in/vmlinux descriptors */
+	u16 max_insn_cnt;
+	u16 max_emit_bytes;
+
+	int (*instantiate_insn)(u64 payload, struct bpf_insn *insn_buf);
+
+	int (*emit_x86)(u8 *image, u64 payload, const struct bpf_prog *prog,
+			const u8 *final_ip);
+	int (*emit_arm64)(u32 *image, u64 payload, const struct bpf_prog *prog,
+			  const u32 *final_ip);
+};
+
+static inline bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
+{
+	if (!kinsn)
+		return false;
+#ifdef CONFIG_X86_64
+	if (kinsn->emit_x86)
+		return true;
+#endif
+#ifdef CONFIG_ARM64
+	if (kinsn->emit_arm64)
+		return true;
+#endif
+	return false;
+}
+
+static inline bool bpf_kinsn_is_sidecar_insn(const struct bpf_insn *insn)
+{
+	return insn->code == (BPF_ALU64 | BPF_MOV | BPF_K) &&
+	       insn->src_reg == BPF_PSEUDO_KINSN_SIDECAR;
+}
+
+static inline u64 bpf_kinsn_sidecar_payload(const struct bpf_insn *insn)
+{
+	return (u64)(insn->dst_reg & 0xf) |
+	       ((u64)(u16)insn->off << 4) |
+	       ((u64)(u32)insn->imm << 20);
+}
+
 /* bpf_context is intentionally undefined structure. Pointer to bpf_context is
  * the first argument to eBPF programs.
  * For socket filters: 'struct bpf_context *' == 'struct sk_buff *'
@@ -1883,6 +1924,7 @@ struct bpf_prog_aux {
 	bool changes_pkt_data;
 	bool might_sleep;
 	bool kprobe_write_ctx;
+	u8 kinsn_callee_regs;
 	struct {
 		s32 keyring_serial;
 		u8 keyring_type;
@@ -3337,6 +3379,10 @@ void bpf_cgrp_storage_free(struct cgroup *cgroup);
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn);
+int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn,
+			      const struct bpf_kinsn **kinsn,
+			      u64 *payload);
 int bpf_get_kfunc_addr(const struct bpf_prog *prog, u32 func_id,
 		       u16 desc_idx, u8 **func_addr);
 
@@ -3677,6 +3723,15 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
 {
 	return NULL;
+}
+
+static inline int
+bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+			  const struct bpf_insn *insn,
+			  const struct bpf_kinsn **kinsn,
+			  u64 *payload)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int

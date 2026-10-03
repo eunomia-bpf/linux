@@ -115,6 +115,67 @@ int bpf_insn_def32(struct bpf_prog *prog, struct bpf_insn *insn)
 	return dst_reg;
 }
 
+static const struct bpf_kfunc_desc *
+find_kinsn_desc(const struct bpf_prog *prog, const struct bpf_insn *insn,
+		bool finalized, u16 *desc_idx)
+{
+	struct bpf_kfunc_desc_tab *tab = prog->aux->kfunc_tab;
+	const struct bpf_kfunc_desc *desc;
+	u32 i;
+
+	if (!tab)
+		return NULL;
+	if (finalized) {
+		if (insn->off < 0 || insn->off >= tab->nr_descs)
+			return NULL;
+		i = insn->off;
+		desc = &tab->descs[i];
+		if (!desc->kinsn || desc->func_id != insn->imm)
+			return NULL;
+	} else {
+		for (i = 0; i < tab->nr_base_descs; i++) {
+			desc = &tab->descs[i];
+			if (desc->kinsn && desc->func_id == insn->imm &&
+			    desc->offset == insn->off)
+				break;
+		}
+		if (i == tab->nr_base_descs)
+			return NULL;
+	}
+	if (desc_idx)
+		*desc_idx = i;
+	return desc;
+}
+
+static int get_kinsn_payload(const struct bpf_prog *prog,
+			     const struct bpf_insn *insn, bool finalized,
+			     const struct bpf_kinsn **kinsn, u64 *payload)
+{
+	const struct bpf_kfunc_desc *desc;
+	ptrdiff_t insn_idx = insn - prog->insnsi;
+
+	desc = find_kinsn_desc(prog, insn, finalized, NULL);
+	if (!desc)
+		return -ENOENT;
+
+	if (insn_idx <= 0 || !bpf_kinsn_is_sidecar_insn(insn - 1))
+		return -EINVAL;
+
+	if (kinsn)
+		*kinsn = desc->kinsn;
+	if (payload)
+		*payload = bpf_kinsn_sidecar_payload(insn - 1);
+	return 0;
+}
+
+int bpf_jit_get_kinsn_payload(const struct bpf_prog *prog,
+			      const struct bpf_insn *insn,
+			      const struct bpf_kinsn **kinsn,
+			      u64 *payload)
+{
+	return get_kinsn_payload(prog, insn, true, kinsn, payload);
+}
+
 const struct btf_func_model *
 bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 			 const struct bpf_insn *insn)
@@ -134,7 +195,7 @@ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
 		return NULL;
 	}
 
-	return &res->func_model;
+	return res->kinsn ? NULL : &res->func_model;
 }
 
 static int add_kfunc_in_insns(struct bpf_verifier_env *env,
@@ -597,6 +658,187 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
 	memmove(aux_data + off,	aux_data + off + cnt,
 		sizeof(*aux_data) * (orig_prog_len - off - cnt));
 	env->insn_aux_data_len -= cnt;
+
+	return 0;
+}
+
+static int validate_kinsn_proof_seq(struct bpf_verifier_env *env,
+				    const struct bpf_kinsn *kinsn,
+				    const struct bpf_insn *insn_buf,
+				    u32 cnt)
+{
+	u32 i;
+
+	if (!cnt || cnt > kinsn->max_insn_cnt)
+		return -EINVAL;
+
+	for (i = 0; i < cnt; i++) {
+		const struct bpf_insn *insn = &insn_buf[i];
+		u8 class = BPF_CLASS(insn->code);
+
+		if (bpf_kinsn_is_sidecar_insn(insn)) {
+			verbose(env, "kinsn proof sequence cannot contain sidecar pseudo-insns\n");
+			return -EINVAL;
+		}
+
+		if (class == BPF_JMP || class == BPF_JMP32) {
+			u8 op = BPF_OP(insn->code);
+			s64 target;
+
+			if (op == BPF_CALL || op == BPF_EXIT || op == BPF_JCOND ||
+			    insn->code == (BPF_JMP | BPF_JA | BPF_X)) {
+				verbose(env,
+					"kinsn proof sequence cannot contain calls, exits, may_goto or gotox\n");
+				return -EINVAL;
+			}
+			target = (s64)i + bpf_jmp_offset((struct bpf_insn *)insn) + 1;
+			if (target <= i || target > cnt) {
+				verbose(env,
+					"kinsn proof jump must stay forward and within its region\n");
+				return -EINVAL;
+			}
+		}
+
+		if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM &&
+		    insn->src_reg != 0) {
+			verbose(env, "kinsn proof sequence cannot contain pseudo ldimm64\n");
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static void record_kinsn_callee_regs(struct bpf_prog_aux *aux,
+				     const struct bpf_insn *insns, u32 cnt)
+{
+	static const u8 reg_mask[BPF_REG_FP + 1] = {
+		[BPF_REG_6] = BIT(0),
+		[BPF_REG_7] = BIT(1),
+		[BPF_REG_8] = BIT(2),
+		[BPF_REG_9] = BIT(3),
+		[BPF_REG_FP] = BIT(4),
+	};
+	u32 i;
+
+	for (i = 0; i < cnt; i++) {
+		if (insns[i].dst_reg <= BPF_REG_FP)
+			aux->kinsn_callee_regs |= reg_mask[insns[i].dst_reg];
+		if (insns[i].src_reg <= BPF_REG_FP)
+			aux->kinsn_callee_regs |= reg_mask[insns[i].src_reg];
+	}
+}
+
+int bpf_lower_kinsn_proof_regions(struct bpf_verifier_env *env)
+{
+	u32 orig_len = env->prog->len;
+	u32 cap = env->kinsn_call_cnt;
+	int delta = 0, i;
+
+	env->kinsn_region_cap = cap;
+	if (cap) {
+		env->kinsn_regions = kvcalloc(cap, sizeof(*env->kinsn_regions),
+					      GFP_KERNEL_ACCOUNT);
+		if (!env->kinsn_regions)
+			return -ENOMEM;
+	}
+
+	for (i = 0; i < orig_len; i++) {
+		struct bpf_kinsn_region *region;
+		struct bpf_prog *new_prog;
+		const struct bpf_kinsn *kinsn;
+		struct bpf_insn *call;
+		u64 payload;
+		int idx = i + delta, cnt, err;
+
+		call = &env->prog->insnsi[idx];
+		if (bpf_kinsn_is_sidecar_insn(call)) {
+			if (idx + 1 >= env->prog->len ||
+			    !bpf_pseudo_kfunc_call(call + 1) ||
+			    !find_kinsn_desc(env->prog, call + 1, false, NULL)) {
+				verbose(env, "kinsn sidecar must immediately precede kinsn call\n");
+				return -EINVAL;
+			}
+			continue;
+		}
+		if (!bpf_pseudo_kfunc_call(call) ||
+		    !find_kinsn_desc(env->prog, call, false, NULL))
+			continue;
+		if (idx == 0 || !bpf_kinsn_is_sidecar_insn(call - 1) ||
+		    bpf_find_subprog(env, idx) >= 0) {
+			verbose(env, "kinsn call must be preceded by sidecar payload\n");
+			return -EINVAL;
+		}
+
+		err = get_kinsn_payload(env->prog, call, false, &kinsn, &payload);
+		if (err)
+			return err;
+		memset(env->insn_buf, 0, sizeof(env->insn_buf));
+		cnt = kinsn->instantiate_insn(payload, env->insn_buf);
+		if (cnt <= 0) {
+			verbose(env, "invalid kinsn proof payload\n");
+			return cnt ? cnt : -EINVAL;
+		}
+		err = validate_kinsn_proof_seq(env, kinsn, env->insn_buf, cnt);
+		if (err)
+			return err;
+		record_kinsn_callee_regs(env->prog->aux, env->insn_buf, cnt);
+		if (env->kinsn_region_cnt == env->kinsn_region_cap) {
+			verbose(env, "too many kinsn proof regions\n");
+			return -E2BIG;
+		}
+
+		region = &env->kinsn_regions[env->kinsn_region_cnt++];
+		region->start = idx - 1;
+		region->proof_len = cnt;
+		region->orig[0] = call[-1];
+		region->orig[1] = *call;
+		err = verifier_remove_insns(env, idx - 1, 1);
+		if (err)
+			return err;
+		new_prog = bpf_patch_insn_data(env, idx - 1, env->insn_buf, cnt);
+		if (!new_prog)
+			return -ENOMEM;
+		env->prog = new_prog;
+		delta += cnt - 2;
+	}
+	return 0;
+}
+
+int bpf_restore_kinsn_proof_regions(struct bpf_verifier_env *env)
+{
+	u32 i;
+
+	for (i = env->kinsn_region_cnt; i-- > 0;) {
+		struct bpf_insn_aux_data *aux;
+		struct bpf_prog *new_prog;
+		struct bpf_kinsn_region *region = &env->kinsn_regions[i];
+		int err;
+
+		new_prog = bpf_patch_insn_data(env, region->start, region->orig, 2);
+		if (!new_prog)
+			return -ENOMEM;
+		env->prog = new_prog;
+		aux = env->insn_aux_data;
+
+		if (region->proof_len > 1) {
+			err = verifier_remove_insns(env, region->start + 2,
+						    region->proof_len - 1);
+			if (err)
+				return err;
+			aux = env->insn_aux_data;
+		}
+
+		aux[region->start] = (struct bpf_insn_aux_data) {
+			.seen = max(aux[region->start].seen,
+				    aux[region->start + 1].seen),
+			.orig_idx = aux[region->start].orig_idx,
+		};
+		aux[region->start + 1] = (struct bpf_insn_aux_data) {
+			.seen = aux[region->start].seen,
+			.orig_idx = aux[region->start + 1].orig_idx,
+		};
+	}
 
 	return 0;
 }

@@ -236,8 +236,19 @@ struct btf_kfunc_hook_filter {
 	u32 nr_filters;
 };
 
+struct btf_kfunc_kinsn_desc {
+	u32 id;
+	const struct bpf_kinsn *kinsn;
+};
+
+struct btf_kfunc_kinsn_set {
+	u32 cnt;
+	struct btf_kfunc_kinsn_desc descs[];
+};
+
 struct btf_kfunc_set_tab {
 	struct btf_id_set8 *sets[BTF_KFUNC_HOOK_MAX];
+	struct btf_kfunc_kinsn_set *kinsn_sets[BTF_KFUNC_HOOK_MAX];
 	struct btf_kfunc_hook_filter hook_filters[BTF_KFUNC_HOOK_MAX];
 };
 
@@ -1837,8 +1848,10 @@ static void btf_free_kfunc_set_tab(struct btf *btf)
 
 	if (!tab)
 		return;
-	for (hook = 0; hook < ARRAY_SIZE(tab->sets); hook++)
+	for (hook = 0; hook < ARRAY_SIZE(tab->sets); hook++) {
 		kfree(tab->sets[hook]);
+		kfree(tab->kinsn_sets[hook]);
+	}
 	kfree(tab);
 	btf->kfunc_set_tab = NULL;
 }
@@ -9410,11 +9423,14 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 {
 	struct btf_kfunc_hook_filter *hook_filter;
 	struct btf_id_set8 *add_set = kset->set;
+	const struct bpf_kinsn * const *add_kinsn_descs = kset->kinsn_descs;
+	const u32 *add_kinsn_ids = kset->kinsn_ids;
 	bool vmlinux_set = !btf_is_module(btf);
 	bool add_filter = !!kset->filter;
 	struct btf_kfunc_set_tab *tab;
+	struct btf_kfunc_kinsn_set *kinsn_set;
 	struct btf_id_set8 *set;
-	u32 set_cnt, i;
+	u32 kinsn_set_cnt, set_cnt, i;
 	int ret;
 
 	if (hook >= BTF_KFUNC_HOOK_MAX) {
@@ -9506,6 +9522,41 @@ static int btf_populate_kfunc_set(struct btf *btf, enum btf_kfunc_hook hook,
 
 	sort(set->pairs, set->cnt, sizeof(set->pairs[0]), btf_id_cmp_func, NULL);
 
+	if (add_kinsn_descs) {
+		kinsn_set = tab->kinsn_sets[hook];
+		kinsn_set_cnt = kinsn_set ? kinsn_set->cnt : 0;
+
+		if (kinsn_set_cnt > U32_MAX - kset->kinsn_cnt) {
+			ret = -EOVERFLOW;
+			goto end;
+		}
+
+		kinsn_set = krealloc(tab->kinsn_sets[hook],
+				     struct_size(kinsn_set, descs,
+						 kinsn_set_cnt + kset->kinsn_cnt),
+				     GFP_KERNEL | __GFP_NOWARN);
+		if (!kinsn_set) {
+			ret = -ENOMEM;
+			goto end;
+		}
+
+		if (!tab->kinsn_sets[hook])
+			kinsn_set->cnt = 0;
+		tab->kinsn_sets[hook] = kinsn_set;
+
+		for (i = 0; i < kset->kinsn_cnt; i++) {
+			struct btf_kfunc_kinsn_desc *desc =
+				&kinsn_set->descs[kinsn_set->cnt + i];
+
+			desc->id = btf_relocate_id(btf, add_kinsn_ids[i]);
+			desc->kinsn = add_kinsn_descs[i];
+		}
+
+		kinsn_set->cnt += kset->kinsn_cnt;
+		sort(kinsn_set->descs, kinsn_set->cnt, sizeof(kinsn_set->descs[0]),
+		     btf_id_cmp_func, NULL);
+	}
+
 	if (add_filter) {
 		hook_filter = &tab->hook_filters[hook];
 		hook_filter->filters[hook_filter->nr_filters++] = kset->filter;
@@ -9535,6 +9586,26 @@ static u32 *btf_kfunc_id_set_contains(const struct btf *btf,
 		return NULL;
 	/* The flags for BTF ID are located next to it */
 	return id + 1;
+}
+
+static const struct bpf_kinsn *
+btf_kfunc_kinsn_set_contains(const struct btf *btf, enum btf_kfunc_hook hook,
+			     u32 kfunc_btf_id)
+{
+	struct btf_kfunc_kinsn_desc key = { .id = kfunc_btf_id };
+	struct btf_kfunc_kinsn_set *set;
+	struct btf_kfunc_kinsn_desc *desc;
+
+	if (hook >= BTF_KFUNC_HOOK_MAX)
+		return NULL;
+	if (!btf->kfunc_set_tab)
+		return NULL;
+	set = btf->kfunc_set_tab->kinsn_sets[hook];
+	if (!set)
+		return NULL;
+	desc = bsearch(&key, set->descs, set->cnt, sizeof(set->descs[0]),
+		       btf_id_cmp_func);
+	return desc ? desc->kinsn : NULL;
 }
 
 static bool __btf_kfunc_is_allowed(const struct btf *btf,
@@ -9647,6 +9718,21 @@ u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_p
 	return btf_kfunc_id_set_contains(btf, hook, kfunc_btf_id);
 }
 
+const struct bpf_kinsn *btf_kfunc_kinsn_desc(const struct btf *btf, u32 kfunc_btf_id,
+					     const struct bpf_prog *prog)
+{
+	enum btf_kfunc_hook hook;
+	const struct bpf_kinsn *kinsn;
+
+	kinsn = btf_kfunc_kinsn_set_contains(btf, BTF_KFUNC_HOOK_COMMON,
+					     kfunc_btf_id);
+	if (kinsn)
+		return kinsn;
+
+	hook = bpf_prog_type_to_kfunc_hook(resolve_prog_type(prog));
+	return btf_kfunc_kinsn_set_contains(btf, hook, kfunc_btf_id);
+}
+
 /*
  * Check a single KF_* @flag on a kfunc across all of its hook sets.
  * Returns:
@@ -9702,6 +9788,32 @@ static int __register_btf_kfunc_id_set(enum btf_kfunc_hook hook,
 					     kset->set->pairs[i].flags);
 		if (ret)
 			goto err_out;
+	}
+
+	if (!!kset->kinsn_descs != !!kset->kinsn_ids ||
+	    (!!kset->kinsn_descs != !!kset->kinsn_cnt)) {
+		ret = -EINVAL;
+		goto err_out;
+	}
+	for (i = 0; i < kset->kinsn_cnt; i++) {
+		const struct bpf_kinsn *kinsn = kset->kinsn_descs[i];
+		u32 id = kset->kinsn_ids[i];
+		u32 *flags = id ? btf_id_set8_contains(kset->set, id) : NULL;
+		int j;
+
+		if (!flags || flags[1] ||
+		    !kinsn || kinsn->owner != kset->owner ||
+		    !kinsn->instantiate_insn || !kinsn->max_insn_cnt ||
+		    kinsn->max_insn_cnt > INSN_BUF_SIZE || !kinsn->max_emit_bytes) {
+			ret = -EINVAL;
+			goto err_out;
+		}
+		for (j = 0; j < i; j++) {
+			if (id != kset->kinsn_ids[j])
+				continue;
+			ret = -EINVAL;
+			goto err_out;
+		}
 	}
 
 	ret = btf_populate_kfunc_set(btf, hook, kset);
