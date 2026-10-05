@@ -1283,6 +1283,13 @@ struct bpf_kfunc_body {
 	u32 len;
 };
 
+/* kfuncs with a body that a JIT may have its own code for */
+u64 bpf_rol64(u64 x, u32 n__k);
+u64 bpf_select64(u64 cond, u64 a, u64 b);
+u64 bpf_extract64(u64 x, u32 start__k, u32 len__k);
+u64 bpf_load_be64(const void *p, s32 off__k);
+u64 bpf_lea64(u64 base, u64 index, u32 scale__k, s32 disp__k);
+
 /* Restore arguments before returning from trampoline to let original function
  * continue executing. This flag is used for fentry progs when there are no
  * fexit progs.
