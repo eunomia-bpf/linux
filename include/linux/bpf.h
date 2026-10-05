@@ -1269,6 +1269,20 @@ static inline u32 btf_func_model_arg_slots(const struct btf_func_model *m, u32 a
 	return (m->arg_size[arg] + sizeof(u64) - 1) / sizeof(u64);
 }
 
+#define BPF_KFUNC_BODY_MAX_INSNS	32
+
+/*
+ * The body of a kfunc: @len BPF instructions that compute the kfunc from its
+ * arguments in R1-R5 into R0. The verifier analyzes each call of the kfunc as
+ * the body, and the body runs in place of the call unless the JIT has native
+ * code for it, see kernel/bpf/kfunc_inline.c.
+ */
+struct bpf_kfunc_body {
+	const u32 *id;
+	const struct bpf_insn *insns;
+	u32 len;
+};
+
 /* Restore arguments before returning from trampoline to let original function
  * continue executing. This flag is used for fentry progs when there are no
  * fexit progs.
