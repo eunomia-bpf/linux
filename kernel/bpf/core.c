@@ -2173,24 +2173,24 @@ out:
 	LDSX(W,  s32)
 #undef LDSX
 
-#define ATOMIC_ALU_OP(BOP, KOP)						\
+#define ATOMIC_ALU_OP(BOP, KINSN)						\
 		case BOP:						\
 			if (BPF_SIZE(insn->code) == BPF_W)		\
-				atomic_##KOP((u32) SRC, (atomic_t *)(unsigned long) \
+				atomic_##KINSN((u32) SRC, (atomic_t *)(unsigned long) \
 					     (DST + insn->off));	\
 			else if (BPF_SIZE(insn->code) == BPF_DW)	\
-				atomic64_##KOP((u64) SRC, (atomic64_t *)(unsigned long) \
+				atomic64_##KINSN((u64) SRC, (atomic64_t *)(unsigned long) \
 					       (DST + insn->off));	\
 			else						\
 				goto default_label;			\
 			break;						\
 		case BOP | BPF_FETCH:					\
 			if (BPF_SIZE(insn->code) == BPF_W)		\
-				SRC = (u32) atomic_fetch_##KOP(		\
+				SRC = (u32) atomic_fetch_##KINSN(		\
 					(u32) SRC,			\
 					(atomic_t *)(unsigned long) (DST + insn->off)); \
 			else if (BPF_SIZE(insn->code) == BPF_DW)	\
-				SRC = (u64) atomic64_fetch_##KOP(	\
+				SRC = (u64) atomic64_fetch_##KINSN(	\
 					(u64) SRC,			\
 					(atomic64_t *)(unsigned long) (DST + insn->off)); \
 			else						\
