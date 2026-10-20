@@ -2523,14 +2523,26 @@ static u32 x86_reg_bit(u32 bpf_reg)
 }
 
 /*
+ * Without a REX prefix, byte registers 4-7 are ah, ch, dh and bh, the second
+ * bytes of rax, rcx, rdx and rbx.
+ */
+static u32 kfunc_byte_reg_bit(u8 reg, u8 rex)
+{
+	return !rex && reg >= 4 && reg <= 7 ? BIT(reg - 4) : BIT(reg);
+}
+
+/*
  * Return the mask of x86 registers named by an insn of a kfunc or -EINVAL if
- * the insn cannot be copied. Only 32 and 64-bit moves and ALU ops can be:
- * no control flow, prefixes, rip-relative addressing or implicit destination.
+ * the insn cannot be copied. Only moves, ALU ops, setcc and byte zero/sign
+ * extension can be: no control flow, prefixes, rip-relative addressing or
+ * implicit destination.
  */
 static int kfunc_insn_regs(struct insn *insn)
 {
 	u8 rex = insn->rex_prefix.bytes[0], modrm = insn->modrm.bytes[0], sib = insn->sib.bytes[0];
 	u8 ext = X86_MODRM_REG(modrm), idx = X86_SIB_INDEX(sib) | X86_REX_X(rex) << 2;
+	u8 rm = X86_MODRM_RM(modrm) | X86_REX_B(rex) << 3;
+	bool byte_rm = false;
 	u32 op = insn->opcode.bytes[0];
 	int regs = 0;
 
@@ -2556,6 +2568,17 @@ static int kfunc_insn_regs(struct insn *insn)
 	case 0x0fb7: case 0x0fbf:		/* movzx, movsx */
 		regs = BIT(ext | X86_REX_R(rex) << 1);
 		break;
+	case 0x84:				/* test (byte) */
+		regs = kfunc_byte_reg_bit(ext | X86_REX_R(rex) << 1, rex);
+		byte_rm = true;
+		break;
+	case 0x0fb6: case 0x0fbe:		/* movzx, movsx (byte) */
+		regs = BIT(ext | X86_REX_R(rex) << 1);
+		byte_rm = true;
+		break;
+	case 0x0f90 ... 0x0f9f:			/* setcc */
+		byte_rm = true;
+		break;
 	case 0x81: case 0x83:			/* ALU ops with imm */
 	case 0xc1: case 0xd1: case 0xd3:	/* shifts and rotates */
 		break;
@@ -2573,8 +2596,10 @@ static int kfunc_insn_regs(struct insn *insn)
 	default:
 		return -EINVAL;
 	}
+	if (X86_MODRM_MOD(modrm) == 3 && byte_rm)
+		return regs | kfunc_byte_reg_bit(rm, rex);
 	if (!insn->sib.nbytes)
-		return regs | BIT(X86_MODRM_RM(modrm) | X86_REX_B(rex) << 3);
+		return regs | BIT(rm);
 	if (idx != 4)
 		regs |= BIT(idx);
 	return regs | BIT(X86_SIB_BASE(sib) | X86_REX_B(rex) << 3);
@@ -2594,17 +2619,19 @@ static void emit_push_pop(u8 **pprog, u8 op, int reg)
 /*
  * Inline a KF_FASTCALL kfunc: copy what the compiler generated for it without
  * ENDBR, fentry and 'ret'. bpf_fastcall lets it clobber only R0 and the
- * arguments. Push/pop the other caller saved registers that it uses.
+ * arguments. Push/pop the other caller saved registers that it uses and that
+ * are @live, the ones whose bpf_fastcall spill/fill the verifier removed.
  */
-static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_func_model *m)
+static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_func_model *m,
+			     u32 live)
 {
 	/* a call clobbers r10 and r11, hence nothing is live there */
 	u32 scratch = x86_reg_bit(BPF_REG_AX) | x86_reg_bit(AUX_REG);
 	u32 save = x86_reg_bit(X86_REG_R9), used = 0;
-	u8 *p = (u8 *)addr, *start, *prog = *pprog;
-	unsigned long size, off;
+	u8 code[KFUNC_INLINE_MAX + MAX_INSN_SIZE], *p = (u8 *)addr, *prog = *pprog;
+	unsigned long size, off, len;
 	struct insn insn;
-	int i, regs;
+	int i, n, regs;
 
 	if (m->nr_args > MAX_BPF_FUNC_REG_ARGS)
 		return -EINVAL;
@@ -2612,7 +2639,7 @@ static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_fu
 		if (m->arg_size[i] > 8 || (m->arg_flags[i] & BTF_FMODEL_ARENA_ARG))
 			return -EINVAL;
 	for (i = BPF_REG_0; i <= BPF_REG_5; i++) {
-		if (i ? i <= m->nr_args : m->ret_size)
+		if (i ? i <= m->nr_args || !(live & BIT(i)) : m->ret_size)
 			scratch |= x86_reg_bit(i);
 		else
 			save |= x86_reg_bit(i);
@@ -2625,13 +2652,16 @@ static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_fu
 	if (ftrace_location(addr) == (unsigned long)p)
 		p += MCOUNT_INSN_SIZE;
 
-	for (start = p;; p += insn.length) {
-		if (p - start > KFUNC_INLINE_MAX || p >= (u8 *)addr + size ||
-		    insn_decode_kernel(&insn, p))
+	/* decode the bytes that are copied, a kprobe may change the text */
+	len = min_t(unsigned long, (u8 *)addr + size - p, sizeof(code));
+	if (copy_from_kernel_nofault(code, p, len))
+		return -EINVAL;
+	for (n = 0;; n += insn.length) {
+		if (n > KFUNC_INLINE_MAX || insn_decode(&insn, code + n, len - n, INSN_MODE_KERN))
 			return -EINVAL;
 		if (insn.opcode.bytes[0] == RET_INSN_OPCODE ||
 		    (insn.opcode.bytes[0] == JMP32_INSN_OPCODE &&
-		     p + insn.length + insn.immediate.value == (u8 *)x86_return_thunk))
+		     p + n + insn.length + insn.immediate.value == (u8 *)x86_return_thunk))
 			break;
 		regs = kfunc_insn_regs(&insn);
 		if (regs < 0)
@@ -2645,8 +2675,8 @@ static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_fu
 	for (i = 0; i < 16; i++)
 		if (save & BIT(i))
 			emit_push_pop(&prog, 0x50, i);
-	memcpy(prog, start, p - start);
-	prog += p - start;
+	memcpy(prog, code, n);
+	prog += n;
 	for (i = 15; i >= 0; i--)
 		if (save & BIT(i))
 			emit_push_pop(&prog, 0x58, i);
@@ -2659,7 +2689,7 @@ bool bpf_jit_inlines_kfunc_call(unsigned long addr, const struct btf_func_model 
 {
 	u8 buf[BPF_MAX_INSN_SIZE], *prog = buf;
 
-	return !emit_kfunc_inline(&prog, addr, m);
+	return !emit_kfunc_inline(&prog, addr, m, GENMASK(BPF_REG_5, BPF_REG_1));
 }
 
 static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *addrs, u8 *image,
@@ -3588,7 +3618,8 @@ populate_extable:
 				if (!fm)
 					return -EINVAL;
 				if (fm->ret_flags & BTF_FMODEL_JIT_INLINE) {
-					err = emit_kfunc_inline(&prog, (unsigned long)func, fm);
+					err = emit_kfunc_inline(&prog, (unsigned long)func, fm,
+								bpf_fastcall_spilled_regs(env, bpf_prog, i - 1));
 					if (err)
 						return err;
 					break;

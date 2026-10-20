@@ -1659,6 +1659,20 @@ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struc
 	return env->insn_aux_data[insn_idx].indirect_target;
 }
 
+/*
+ * The caller saved registers that must survive a bpf_fastcall call that the
+ * JIT inlines: the ones whose spill/fill the verifier removed, or all of R1-R5
+ * without the verifier.
+ */
+u32 bpf_fastcall_spilled_regs(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+			      int insn_idx)
+{
+	if (!env)
+		return GENMASK(BPF_REG_5, BPF_REG_1);
+	insn_idx += prog->aux->subprog_start;
+	return env->insn_aux_data[insn_idx].fastcall_spilled_regs;
+}
+
 u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
 {
 	const struct bpf_subprog_info *sub;

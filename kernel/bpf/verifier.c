@@ -19664,6 +19664,7 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
 	u32 clobbered_regs_mask;
 	struct bpf_call_summary cs;
 	u32 expected_regs_mask;
+	u32 spilled_regs = 0;
 	s16 off;
 	int i;
 
@@ -19717,6 +19718,7 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
 		if (stx->off != off || ldx->off != off)
 			break;
 		expected_regs_mask &= ~BIT(stx->src_reg);
+		spilled_regs |= BIT(stx->src_reg);
 		env->insn_aux_data[insn_idx - i].fastcall_pattern = 1;
 		env->insn_aux_data[insn_idx + i].fastcall_pattern = 1;
 	}
@@ -19739,9 +19741,10 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
 	 * don't set 'fastcall_spills_num' for call B so that remove_fastcall_spills_fills()
 	 * does not remove spill/fill pair {4,6}.
 	 */
-	if (cs.fastcall)
+	if (cs.fastcall) {
 		env->insn_aux_data[insn_idx].fastcall_spills_num = i - 1;
-	else
+		env->insn_aux_data[insn_idx].fastcall_spilled_regs = spilled_regs;
+	} else
 		subprog->keep_fastcall_stack = 1;
 	subprog->fastcall_stack_off = min(subprog->fastcall_stack_off, off);
 }
