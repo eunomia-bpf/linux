@@ -3372,6 +3372,15 @@ bool __weak bpf_jit_inlines_helper_call(s32 imm)
 	return false;
 }
 
+/* Return TRUE if the JIT backend inlines the KF_FASTCALL kfunc at @addr
+ * without clobbering registers that bpf_fastcall contract doesn't allow.
+ * Otherwise the kfunc is called and spills/fills around the call stay.
+ */
+bool __weak bpf_jit_inlines_kfunc_call(unsigned long addr, const struct btf_func_model *m)
+{
+	return false;
+}
+
 /* Return TRUE if the JIT backend supports mixing bpf2bpf and tailcalls. */
 bool __weak bpf_jit_supports_subprog_tailcalls(void)
 {

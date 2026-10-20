@@ -1257,6 +1257,9 @@ struct bpf_prog_offload {
 /* The argument is nullable. */
 #define BTF_FMODEL_NULLABLE_ARG		BIT(3)
 
+/* In ret_flags: the JIT inlines calls of this kfunc. */
+#define BTF_FMODEL_JIT_INLINE		BIT(4)
+
 struct btf_func_model {
 	u8 ret_size;
 	u8 ret_flags;

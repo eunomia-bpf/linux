@@ -3170,6 +3170,8 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
 	meta.func_proto = kfunc.proto;
 	meta.func_name = kfunc.name;
 	meta.kfunc_flags = kfunc.flags ? *kfunc.flags : 0;
+	if ((meta.kfunc_flags & KF_FASTCALL) && bpf_jit_inlines_kfunc_call(addr, &func_model))
+		func_model.ret_flags |= BTF_FMODEL_JIT_INLINE;
 
 	tab = krealloc(tab, struct_size(tab, descs, tab->nr_descs + 1), GFP_KERNEL_ACCOUNT);
 	if (!tab)
@@ -19521,6 +19523,13 @@ bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm)
 	}
 }
 
+/* True if bpf_fixup_kfunc_call() replaces calls to the kfunc */
+static bool verifier_inlines_kfunc_call(u32 func_id)
+{
+	return func_id == special_kfunc_list[KF_bpf_cast_to_kern_ctx] ||
+	       func_id == special_kfunc_list[KF_bpf_rdonly_cast];
+}
+
 /* If @call is a kfunc or helper call, fills @cs and returns true,
  * otherwise returns false.
  */
@@ -19549,14 +19558,18 @@ bool bpf_get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
 	}
 
 	if (bpf_pseudo_kfunc_call(call)) {
+		struct bpf_kfunc_desc *desc;
 		int err;
 
 		err = bpf_fetch_kfunc_arg_meta(env, call->imm, call->off, &meta);
 		if (err < 0)
 			/* error would be reported later */
 			return false;
+		desc = find_kfunc_desc(env->prog, call->imm, call->off);
 		cs->arg_slot_cnt = btf_proto_slots(meta.btf, meta.func_proto);
-		cs->fastcall = meta.kfunc_flags & KF_FASTCALL;
+		cs->fastcall = (meta.kfunc_flags & KF_FASTCALL) &&
+			       (verifier_inlines_kfunc_call(meta.func_id) ||
+				(desc && (desc->func_model.ret_flags & BTF_FMODEL_JIT_INLINE)));
 		cs->is_void = btf_type_is_void(btf_type_by_id(meta.btf, meta.func_proto->type));
 		return true;
 	}
@@ -23357,8 +23370,7 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 
 		__fixup_collection_insert_kfunc(&env->insn_aux_data[insn_idx], struct_meta_reg,
 						node_offset_reg, insn, insn_buf, cnt);
-	} else if (desc->func_id == special_kfunc_list[KF_bpf_cast_to_kern_ctx] ||
-		   desc->func_id == special_kfunc_list[KF_bpf_rdonly_cast]) {
+	} else if (verifier_inlines_kfunc_call(desc->func_id)) {
 		insn_buf[0] = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);
 		*cnt = 1;
 	} else if (desc->func_id == special_kfunc_list[KF_bpf_session_is_return] &&

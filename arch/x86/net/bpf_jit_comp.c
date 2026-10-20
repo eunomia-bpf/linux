@@ -15,8 +15,11 @@
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <linux/execmem.h>
+#include <linux/ftrace.h>
+#include <linux/kallsyms.h>
 #include <asm/extable.h>
 #include <asm/ftrace.h>
+#include <asm/insn.h>
 #include <asm/set_memory.h>
 #include <asm/nospec-branch.h>
 #include <asm/text-patching.h>
@@ -2511,6 +2514,154 @@ static void adjust_cmp_imm(u32 *op, s32 *imm)
 	}
 }
 
+/* The longest kfunc to inline, in bytes */
+#define KFUNC_INLINE_MAX	64
+
+static u32 x86_reg_bit(u32 bpf_reg)
+{
+	return BIT(reg2hex[bpf_reg] | is_ereg(bpf_reg) << 3);
+}
+
+/*
+ * Return the mask of x86 registers named by an insn of a kfunc or -EINVAL if
+ * the insn cannot be copied. Only 32 and 64-bit moves and ALU ops can be:
+ * no control flow, prefixes, rip-relative addressing or implicit destination.
+ */
+static int kfunc_insn_regs(struct insn *insn)
+{
+	u8 rex = insn->rex_prefix.bytes[0], modrm = insn->modrm.bytes[0], sib = insn->sib.bytes[0];
+	u8 ext = X86_MODRM_REG(modrm), idx = X86_SIB_INDEX(sib) | X86_REX_X(rex) << 2;
+	u32 op = insn->opcode.bytes[0];
+	int regs = 0;
+
+	if (insn->prefixes.nbytes || insn->rex_prefix.nbytes > 1 || insn->opcode.nbytes > 2 ||
+	    insn_is_avx_or_xop(insn) || insn_rip_relative(insn))
+		return -EINVAL;
+	if (insn->opcode.nbytes == 2)
+		op = op << 8 | insn->opcode.bytes[1];
+
+	switch (op) {
+	case 0x01: case 0x03:			/* add */
+	case 0x09: case 0x0b:			/* or */
+	case 0x21: case 0x23:			/* and */
+	case 0x29: case 0x2b:			/* sub */
+	case 0x31: case 0x33:			/* xor */
+	case 0x39: case 0x3b:			/* cmp */
+	case 0x63:				/* movsxd */
+	case 0x69: case 0x6b: case 0x0faf:	/* imul */
+	case 0x85:				/* test */
+	case 0x89: case 0x8b:			/* mov */
+	case 0x8d:				/* lea */
+	case 0x0f40 ... 0x0f4f:			/* cmovcc */
+	case 0x0fb7: case 0x0fbf:		/* movzx, movsx */
+		regs = BIT(ext | X86_REX_R(rex) << 1);
+		break;
+	case 0x81: case 0x83:			/* ALU ops with imm */
+	case 0xc1: case 0xd1: case 0xd3:	/* shifts and rotates */
+		break;
+	case 0xc7:				/* mov imm */
+		if (ext)
+			return -EINVAL;
+		break;
+	case 0xf7:				/* test, not, neg */
+		if (ext > 3)
+			return -EINVAL;
+		break;
+	case 0xb8 ... 0xbf:			/* mov imm */
+	case 0x0fc8 ... 0x0fcf:			/* bswap */
+		return BIT((op & 7) | X86_REX_B(rex) << 3);
+	default:
+		return -EINVAL;
+	}
+	if (!insn->sib.nbytes)
+		return regs | BIT(X86_MODRM_RM(modrm) | X86_REX_B(rex) << 3);
+	if (idx != 4)
+		regs |= BIT(idx);
+	return regs | BIT(X86_SIB_BASE(sib) | X86_REX_B(rex) << 3);
+}
+
+/* @op is 0x50 for push and 0x58 for pop of x86 register @reg */
+static void emit_push_pop(u8 **pprog, u8 op, int reg)
+{
+	u8 *prog = *pprog;
+
+	if (reg > 7)
+		EMIT1(0x41);
+	EMIT1(op | (reg & 7));
+	*pprog = prog;
+}
+
+/*
+ * Inline a KF_FASTCALL kfunc: copy what the compiler generated for it without
+ * ENDBR, fentry and 'ret'. bpf_fastcall lets it clobber only R0 and the
+ * arguments. Push/pop the other caller saved registers that it uses.
+ */
+static int emit_kfunc_inline(u8 **pprog, unsigned long addr, const struct btf_func_model *m)
+{
+	/* a call clobbers r10 and r11, hence nothing is live there */
+	u32 scratch = x86_reg_bit(BPF_REG_AX) | x86_reg_bit(AUX_REG);
+	u32 save = x86_reg_bit(X86_REG_R9), used = 0;
+	u8 *p = (u8 *)addr, *start, *prog = *pprog;
+	unsigned long size, off;
+	struct insn insn;
+	int i, regs;
+
+	if (m->nr_args > MAX_BPF_FUNC_REG_ARGS)
+		return -EINVAL;
+	for (i = 0; i < m->nr_args; i++)
+		if (m->arg_size[i] > 8 || (m->arg_flags[i] & BTF_FMODEL_ARENA_ARG))
+			return -EINVAL;
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++) {
+		if (i ? i <= m->nr_args : m->ret_size)
+			scratch |= x86_reg_bit(i);
+		else
+			save |= x86_reg_bit(i);
+	}
+
+	if (!kallsyms_lookup_size_offset(addr, &size, &off) || off)
+		return -EINVAL;
+	if (is_endbr((u32 *)p))
+		p += ENDBR_INSN_SIZE;
+	if (ftrace_location(addr) == (unsigned long)p)
+		p += MCOUNT_INSN_SIZE;
+
+	for (start = p;; p += insn.length) {
+		if (p - start > KFUNC_INLINE_MAX || p >= (u8 *)addr + size ||
+		    insn_decode_kernel(&insn, p))
+			return -EINVAL;
+		if (insn.opcode.bytes[0] == RET_INSN_OPCODE ||
+		    (insn.opcode.bytes[0] == JMP32_INSN_OPCODE &&
+		     p + insn.length + insn.immediate.value == (u8 *)x86_return_thunk))
+			break;
+		regs = kfunc_insn_regs(&insn);
+		if (regs < 0)
+			return regs;
+		used |= regs;
+	}
+	if (used & ~(scratch | save))
+		return -EINVAL;
+	save &= used;
+
+	for (i = 0; i < 16; i++)
+		if (save & BIT(i))
+			emit_push_pop(&prog, 0x50, i);
+	memcpy(prog, start, p - start);
+	prog += p - start;
+	for (i = 15; i >= 0; i--)
+		if (save & BIT(i))
+			emit_push_pop(&prog, 0x58, i);
+
+	*pprog = prog;
+	return 0;
+}
+
+bool bpf_jit_inlines_kfunc_call(unsigned long addr, const struct btf_func_model *m)
+{
+	u8 buf[BPF_MAX_INSN_SIZE], *prog = buf;
+
+	return !emit_kfunc_inline(&prog, addr, m);
+}
+
 static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 		  u8 *rw_image, int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -3436,6 +3587,12 @@ populate_extable:
 				fm = bpf_jit_find_kfunc_model(bpf_prog, insn);
 				if (!fm)
 					return -EINVAL;
+				if (fm->ret_flags & BTF_FMODEL_JIT_INLINE) {
+					err = emit_kfunc_inline(&prog, (unsigned long)func, fm);
+					if (err)
+						return err;
+					break;
+				}
 				err = emit_kfunc_arena_args(bpf_prog, fm, &prog);
 				if (err < 0)
 					return err;
