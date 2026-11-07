@@ -967,8 +967,13 @@ struct bpf_func_proto {
 
 struct bpf_kinsn {
 	struct module *owner; /* NULL for built-in/vmlinux descriptors */
-	u16 max_insn_cnt;
+	u32 max_insn_cnt;
 	u16 max_emit_bytes;
+	u16 native_stack_depth;
+	/* Full verifier-facing native artifact, rather than an instruction slice. */
+	bool native_proof;
+	int (*validate_native_program)(u64 payload, const struct bpf_prog *prog);
+	int (*validate_native_proof)(u64 payload, const struct bpf_verifier_env *env);
 
 	int (*instantiate_insn)(u64 payload, struct bpf_insn *insn_buf);
 
@@ -979,6 +984,19 @@ struct bpf_kinsn {
 			  u64 payload, const struct bpf_prog *prog,
 			  const u32 *final_ip);
 };
+
+/* Native artifacts query their generation-bound size with a NULL buffer.
+ * Instruction-slice descriptors retain their existing fixed upper bound.
+ */
+static inline int bpf_kinsn_proof_capacity(const struct bpf_kinsn *kinsn, u64 payload)
+{
+	int count = kinsn->native_proof ?
+		kinsn->instantiate_insn(payload, NULL) : kinsn->max_insn_cnt;
+
+	if (count <= 0 || count > kinsn->max_insn_cnt)
+		return count < 0 ? count : -EINVAL;
+	return count;
+}
 
 static inline bool bpf_kinsn_has_native_emit(const struct bpf_kinsn *kinsn)
 {
@@ -1723,6 +1741,13 @@ struct bpf_prog_aux {
 	struct bpf_trampoline *dst_trampoline;
 	enum bpf_prog_type saved_dst_prog_type;
 	enum bpf_attach_type saved_dst_attach_type;
+	u32 native_load_flags; /* Exact original BPF_PROG_LOAD context. */
+	u32 native_load_ifindex;
+	void *native_trusted_request; /* Immutable kernel-owned native capsule. */
+	void (*native_trusted_put)(void *);
+	struct module *native_trusted_owner;
+	bool native_proof; /* Interpreter execution cannot replace native emission. */
+	bool native_entry_inputs; /* Private proof inputs require a matching JIT. */
 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
 	bool dev_bound; /* Program is bound to the netdev. */
 	bool offload_requested; /* Program is bound and offloaded to the netdev. */

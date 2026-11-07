@@ -10,6 +10,7 @@
 #include <linux/if_vlan.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native_input.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
@@ -1563,7 +1564,7 @@ static int detect_reg_usage(const struct bpf_prog *bpf_prog, bool *regs_used)
 		const struct bpf_insn *call;
 		struct bpf_insn *proof_buf;
 		u64 payload;
-		int cnt;
+		int cnt, capacity;
 		int err;
 
 		if (!bpf_kinsn_is_sidecar_insn(&insn[i]))
@@ -1582,13 +1583,16 @@ static int detect_reg_usage(const struct bpf_prog *bpf_prog, bool *regs_used)
 		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
 			return -EINVAL;
 
-		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+		capacity = bpf_kinsn_proof_capacity(kinsn, payload);
+		if (capacity < 0)
+			return capacity;
+		proof_buf = kvcalloc(capacity, sizeof(*proof_buf),
 				     GFP_KERNEL);
 		if (!proof_buf)
 			return -ENOMEM;
 
 		cnt = kinsn->instantiate_insn(payload, proof_buf);
-		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+		if (cnt <= 0 || cnt > capacity) {
 			kvfree(proof_buf);
 			return cnt ? -EFAULT : -EINVAL;
 		}
@@ -1745,6 +1749,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 	void __percpu *priv_stack_ptr;
 	int i, excnt = 0;
 	int ilen, proglen = 0;
+	int native_body_offset;
 	u8 *prog = temp;
 	u32 stack_depth;
 	int err;
@@ -1796,6 +1801,7 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		memcpy(rw_image + proglen, temp, ilen);
 	proglen += ilen;
 	addrs[0] = proglen;
+	native_body_offset = proglen;
 	prog = temp;
 
 	for (i = 1; i <= insn_cnt; i++, insn++) {
@@ -1951,6 +1957,29 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		case BPF_ALU | BPF_MOV | BPF_K:
 			if (bpf_kinsn_is_sidecar_insn(insn))
 				break;
+			if (bpf_native_input_candidate(insn)) {
+				u64 address = image ? (u64)(image + native_body_offset) : 0;
+
+				switch (insn->off) {
+				case NATIVE_LAB_INPUT_SP:
+					EMIT3(0x48, 0x89, 0xe0); /* mov rax, rsp */
+					break;
+				case NATIVE_LAB_INPUT_CODE:
+					/* Fixed size in all sizing/emission passes. */
+					EMIT2(0x48, 0xb8);
+					EMIT(address, 8);
+					break;
+				case NATIVE_LAB_INPUT_RETURN:
+					EMIT4(0x48, 0x8b, 0x45, 0x08); /* [rbp+8] */
+					break;
+				case NATIVE_LAB_INPUT_NUMERIC:
+					EMIT3(0x48, 0x89, 0xf8); /* mov rax, rdi */
+					break;
+				default:
+					return -EINVAL;
+				}
+				break;
+			}
 			emit_mov_imm32(&prog, BPF_CLASS(insn->code) == BPF_ALU64,
 				       dst_reg, imm32);
 			break;

@@ -734,6 +734,7 @@ bool bpf_prog_dev_bound_match(const struct bpf_prog *lhs, const struct bpf_prog 
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(bpf_prog_dev_bound_match);
 
 bool bpf_offload_prog_map_match(struct bpf_prog *prog, struct bpf_map *map)
 {

@@ -24,6 +24,7 @@
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native_input.h>
 #include <linux/btf.h>
 #include <linux/hex.h>
 #include <linux/objtool.h>
@@ -291,6 +292,10 @@ void __bpf_prog_free(struct bpf_prog *fp)
 		mutex_destroy(&fp->aux->dst_mutex);
 		mutex_destroy(&fp->aux->st_ops_assoc_mutex);
 		kfree(fp->aux->poke_tab);
+		if (fp->aux->native_trusted_put) {
+			fp->aux->native_trusted_put(fp->aux->native_trusted_request);
+			module_put(fp->aux->native_trusted_owner);
+		}
 		kfree(fp->aux);
 	}
 	free_percpu(fp->stats);
@@ -1320,6 +1325,9 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 	 * register for rewrites as long as they do not interfere with
 	 * the above cases!
 	 */
+	if (bpf_native_input_candidate(from))
+		goto out; /* imm is the input ABI, not a scalar constant. */
+
 	if (from->dst_reg == BPF_REG_AX || from->src_reg == BPF_REG_AX)
 		goto out;
 
@@ -2527,7 +2535,8 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
 		goto finalize;
 
 	if (IS_ENABLED(CONFIG_BPF_JIT_ALWAYS_ON) ||
-	    bpf_prog_has_kfunc_call(fp))
+	    bpf_prog_has_kfunc_call(fp) || fp->aux->native_proof ||
+	    fp->aux->native_entry_inputs)
 		jit_needed = true;
 
 	if (!bpf_prog_select_interpreter(fp))

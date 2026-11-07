@@ -747,8 +747,10 @@ struct bpf_scc_info {
 struct bpf_liveness;
 
 struct bpf_kinsn_region {
+	const struct bpf_kinsn *kinsn;
+	u64 payload;
 	u32 start;
-	u16 proof_len;
+	u32 proof_len;
 	struct bpf_insn orig[2];
 };
 

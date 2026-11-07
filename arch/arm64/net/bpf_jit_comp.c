@@ -10,6 +10,7 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native_input.h>
 #include <linux/cfi.h>
 #include <linux/filter.h>
 #include <linux/memory.h>
@@ -80,6 +81,7 @@ struct jit_ctx {
 	const struct bpf_prog *prog;
 	int idx;
 	int epilogue_offset;
+	int native_body_offset;
 	int *offset;
 	int exentry_idx;
 	int nr_used_callee_reg;
@@ -405,7 +407,7 @@ static int find_used_callee_regs(struct jit_ctx *ctx)
 		const struct bpf_kinsn *kinsn;
 		struct bpf_insn *proof_buf;
 		u64 payload;
-		int cnt;
+		int cnt, capacity;
 		int err;
 
 		detect_insn_callee_regs(ctx, insn, 1, &reg_used);
@@ -425,13 +427,16 @@ static int find_used_callee_regs(struct jit_ctx *ctx)
 		if (!kinsn || !kinsn->instantiate_insn || !kinsn->max_insn_cnt)
 			return -EINVAL;
 
-		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+		capacity = bpf_kinsn_proof_capacity(kinsn, payload);
+		if (capacity < 0)
+			return capacity;
+		proof_buf = kvcalloc(capacity, sizeof(*proof_buf),
 				     GFP_KERNEL);
 		if (!proof_buf)
 			return -ENOMEM;
 
 		cnt = kinsn->instantiate_insn(payload, proof_buf);
-		if (cnt <= 0 || cnt > kinsn->max_insn_cnt) {
+		if (cnt <= 0 || cnt > capacity) {
 			kvfree(proof_buf);
 			return cnt ? -EFAULT : -EINVAL;
 		}
@@ -668,6 +673,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	if (ctx->arena_vm_start)
 		emit_a64_mov_i64(arena_vm_base, ctx->arena_vm_start, ctx);
 
+	ctx->native_body_offset = ctx->idx;
 	return 0;
 }
 
@@ -1325,6 +1331,31 @@ static int build_insn(const struct bpf_insn *insn, struct jit_ctx *ctx,
 
 	if (bpf_kinsn_is_sidecar_insn(insn))
 		return 0;
+	if (bpf_native_input_candidate(insn)) {
+		u64 address = ctx->ro_image ?
+			(u64)(ctx->ro_image + ctx->native_body_offset) : 0;
+		int shift;
+
+		switch (off) {
+		case NATIVE_LAB_INPUT_SP:
+			emit(A64_ADD_I(1, dst, A64_SP, 0), ctx);
+			break;
+		case NATIVE_LAB_INPUT_CODE:
+			emit(A64_MOVZ(1, dst, address & 0xffff, 0), ctx);
+			for (shift = 16; shift < 64; shift += 16)
+				emit(A64_MOVK(1, dst, (address >> shift) & 0xffff, shift), ctx);
+			break;
+		case NATIVE_LAB_INPUT_RETURN:
+			emit(A64_LDR64I(dst, A64_FP, 8), ctx);
+			break;
+		case NATIVE_LAB_INPUT_NUMERIC:
+			emit(A64_MOV(1, dst, bpf2a64[BPF_REG_1]), ctx);
+			break;
+		default:
+			return -EINVAL;
+		}
+		return 0;
+	}
 
 	switch (code) {
 	/* dst = src */

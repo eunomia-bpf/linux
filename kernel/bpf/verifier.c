@@ -9,6 +9,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native_input.h>
 #include <linux/btf.h>
 #include <linux/bpf_verifier.h>
 #include <linux/filter.h>
@@ -3688,15 +3689,21 @@ static int validate_kinsn_proof_seq(struct bpf_verifier_env *env,
 		if (class == BPF_JMP || class == BPF_JMP32) {
 			u8 op = BPF_OP(insn->code);
 
-			if (op == BPF_CALL || op == BPF_EXIT) {
-				verbose(env, "kinsn proof sequence cannot contain calls or exits\n");
+			if (op == BPF_CALL && (!kinsn->native_proof || insn->src_reg)) {
+				verbose(env, "kinsn proof call requires a resolved helper identity\n");
+				return -EINVAL;
+			}
+			if (op == BPF_EXIT) {
+				verbose(env, "kinsn proof sequence cannot contain exits\n");
 				return -EINVAL;
 			}
 		}
 
 		if (class == BPF_LD && BPF_MODE(insn->code) == BPF_IMM &&
-		    insn->src_reg != 0) {
-			verbose(env, "kinsn proof sequence cannot contain pseudo ldimm64\n");
+		    insn->src_reg && (!kinsn->native_proof ||
+		    (insn->src_reg != BPF_PSEUDO_MAP_FD &&
+		     insn->src_reg != BPF_PSEUDO_MAP_VALUE))) {
+			verbose(env, "kinsn proof load requires a resolved map identity\n");
 			return -EINVAL;
 		}
 	}
@@ -3710,6 +3717,26 @@ static int lower_kinsn_proof_regions(struct bpf_verifier_env *env)
 	struct bpf_insn *proof_buf = NULL;
 	int err;
 	int i;
+
+	/* Validate the original program before expanding any native regions. */
+	for (i = 0; i < env->prog->len; i++) {
+		const struct bpf_kinsn *kinsn;
+		u64 payload;
+
+		if (!bpf_pseudo_kinsn_call(&env->prog->insnsi[i]))
+			continue;
+		err = bpf_jit_get_kinsn_payload(env->prog, &env->prog->insnsi[i],
+					      &kinsn, &payload);
+		if (err)
+			return err;
+		if (!kinsn->native_proof)
+			continue;
+		if (!kinsn->validate_native_program)
+			return -EINVAL;
+		err = kinsn->validate_native_program(payload, env->prog);
+		if (err)
+			return err;
+	}
 
 	kvfree(env->kinsn_regions);
 	env->kinsn_regions = NULL;
@@ -3729,7 +3756,7 @@ static int lower_kinsn_proof_regions(struct bpf_verifier_env *env)
 		struct bpf_insn *call;
 		const struct bpf_insn *sidecar = NULL;
 		u64 payload;
-		int cnt;
+		int cnt, capacity;
 
 		proof_buf = NULL;
 		call = &env->prog->insnsi[i];
@@ -3755,15 +3782,31 @@ static int lower_kinsn_proof_regions(struct bpf_verifier_env *env)
 		err = bpf_jit_get_kinsn_payload(env->prog, call, &kinsn, &payload);
 		if (err)
 			return err;
+		if (kinsn->native_proof) {
+			if (!env->prog->jit_requested || !bpf_kinsn_has_native_emit(kinsn)) {
+				verbose(env, "native proof requires native JIT emission\n");
+				return -EINVAL;
+			}
+			env->prog->aux->native_proof = true;
+			env->allow_uninit_stack = false;
+			env->subprog_info[0].keep_fastcall_stack = true;
+			if (kinsn->native_stack_depth > MAX_BPF_STACK)
+				return -EINVAL;
+			env->subprog_info[0].stack_depth = max_t(u32,
+				env->subprog_info[0].stack_depth, kinsn->native_stack_depth);
+		}
 
-		proof_buf = kvcalloc(kinsn->max_insn_cnt, sizeof(*proof_buf),
+		capacity = bpf_kinsn_proof_capacity(kinsn, payload);
+		if (capacity < 0)
+			return capacity;
+		proof_buf = kvcalloc(capacity, sizeof(*proof_buf),
 				     GFP_KERNEL_ACCOUNT);
 		if (!proof_buf)
 			return -ENOMEM;
 
 		cnt = kinsn->instantiate_insn(payload, proof_buf);
-		if (cnt <= 0) {
-			err = cnt ? cnt : -EINVAL;
+		if (cnt <= 0 || cnt > capacity) {
+			err = cnt < 0 ? cnt : -EINVAL;
 			goto err_free_proof_buf;
 		}
 
@@ -3778,6 +3821,8 @@ static int lower_kinsn_proof_regions(struct bpf_verifier_env *env)
 		}
 
 		region = &env->kinsn_regions[env->kinsn_region_cnt++];
+		region->kinsn = kinsn;
+		region->payload = payload;
 		region->start = i - 1;
 		region->proof_len = cnt;
 		region->orig[0] = *sidecar;
@@ -3821,6 +3866,20 @@ err_free_proof_buf:
 static int restore_kinsn_proof_regions(struct bpf_verifier_env *env)
 {
 	u32 i;
+
+	/* Check resolved external identities while every proof is still present. */
+	for (i = 0; i < env->kinsn_region_cnt; i++) {
+		const struct bpf_kinsn_region *region = &env->kinsn_regions[i];
+		int err;
+
+		if (!region->kinsn->native_proof)
+			continue;
+		if (!region->kinsn->validate_native_proof)
+			return -EINVAL;
+		err = region->kinsn->validate_native_proof(region->payload, env);
+		if (err)
+			return err;
+	}
 
 	for (i = 0; i < env->kinsn_region_cnt; i++) {
 		struct bpf_insn_aux_data *aux;
@@ -21358,6 +21417,78 @@ static int check_kinsn_sidecar_insn(struct bpf_verifier_env *env,
 	return 0;
 }
 
+static int check_native_input(struct bpf_verifier_env *env,
+			      const struct bpf_insn *insn)
+{
+	bool exclusive = insn->off == NATIVE_LAB_INPUT_EXCLUSIVE_FAILURE;
+	u32 i;
+	int err;
+
+	if (insn->dst_reg != BPF_REG_0 || (!exclusive && insn->imm != NATIVE_LAB_INPUT_ABI) ||
+	    insn->off < NATIVE_LAB_INPUT_SP ||
+	    insn->off > NATIVE_LAB_INPUT_EXCLUSIVE_FAILURE) {
+		verbose(env, "invalid native proof input ABI/kind/register\n");
+		return -EINVAL;
+	}
+	if ((!IS_ENABLED(CONFIG_X86_64) && !IS_ENABLED(CONFIG_ARM64)) ||
+	    env->prog->aux->offload_requested) {
+		verbose(env, "native proof inputs require the x86/arm64 host JIT\n");
+		return -EOPNOTSUPP;
+	}
+	if (!env->allow_ptr_leaks) {
+		verbose(env, "native proof inputs require pointer-leak privilege\n");
+		return -EPERM;
+	}
+	if (exclusive) {
+		/* Native callbacks validate the sealed program before lowering.
+		 * A standalone marker has no host JIT implementation.
+		 */
+		for (i = 0; i < env->kinsn_region_cnt; i++) {
+			const struct bpf_kinsn_region *region = &env->kinsn_regions[i];
+
+			if (region->kinsn->native_proof &&
+			    region->kinsn->validate_native_program &&
+			    region->kinsn->validate_native_proof &&
+			    env->insn_idx >= region->start &&
+			    env->insn_idx - region->start < region->proof_len)
+				break;
+		}
+		if (i == env->kinsn_region_cnt) {
+			verbose(env, "exclusive choice requires a bound native proof region\n");
+			return -EINVAL;
+		}
+	} else if (insn->off == NATIVE_LAB_INPUT_NUMERIC) {
+		err = check_reg_arg(env, BPF_REG_1, SRC_OP);
+		if (err)
+			return err;
+	} else if (env->cur_state->curframe ||
+		   env->cur_state->frame[0]->subprogno) {
+		verbose(env, "native entry input outside main body\n");
+		return -EINVAL;
+	}
+	err = check_reg_arg(env, BPF_REG_0, DST_OP);
+	if (err)
+		return err;
+	/* Quantify over every 64-bit word. Do not invent an arena-relative
+	 * native address, copy pointer IDs, or turn the marker into imm=2.
+	 */
+	mark_reg_unknown(env, cur_regs(env), BPF_REG_0);
+	cur_regs(env)[BPF_REG_0].subreg_def = DEF_NOT_SUBREG;
+	if (exclusive) {
+		struct bpf_reg_state *reg = &cur_regs(env)[BPF_REG_0];
+
+		/* Fresh scalar, no ID shared with another site or loop visit. */
+		reg->var_off = tnum_range(0, 1);
+		reg->umin_value = reg->smin_value = 0;
+		reg->umax_value = reg->smax_value = 1;
+		reg->u32_min_value = reg->s32_min_value = 0;
+		reg->u32_max_value = reg->s32_max_value = 1;
+	}
+	env->prog->aux->native_entry_inputs = true;
+	env->insn_idx++;
+	return 0;
+}
+
 static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 {
 	int err;
@@ -21366,6 +21497,8 @@ static int do_check_insn(struct bpf_verifier_env *env, bool *do_print_state)
 
 	if (bpf_kinsn_is_sidecar_insn(insn))
 		return check_kinsn_sidecar_insn(env, insn);
+	if (bpf_native_input_candidate(insn))
+		return check_native_input(env, insn);
 
 	if (class == BPF_ALU || class == BPF_ALU64) {
 		err = check_alu_op(env, insn);
@@ -23743,6 +23876,7 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			const struct bpf_kinsn *kinsn;
 			const struct bpf_insn *call = insn + 1;
 			struct bpf_insn *kinsn_proof;
+			int capacity;
 
 			if (i + 1 >= insn_cnt || !bpf_pseudo_kinsn_call(call))
 				goto next_insn;
@@ -23751,14 +23885,17 @@ static int do_misc_fixups(struct bpf_verifier_env *env)
 			if (ret)
 				return ret;
 
-			kinsn_proof = kvcalloc(kinsn->max_insn_cnt,
+			capacity = bpf_kinsn_proof_capacity(kinsn, bpf_kinsn_sidecar_payload(insn));
+			if (capacity < 0)
+				return capacity;
+			kinsn_proof = kvcalloc(capacity,
 					      sizeof(*kinsn_proof), GFP_KERNEL_ACCOUNT);
 			if (!kinsn_proof)
 				return -ENOMEM;
 			cnt = kinsn->instantiate_insn(bpf_kinsn_sidecar_payload(insn),
 						      kinsn_proof);
-			if (cnt <= 0) {
-				ret = cnt ? cnt : -EINVAL;
+			if (cnt <= 0 || cnt > capacity) {
+				ret = cnt < 0 ? cnt : -EINVAL;
 				goto free_kinsn_proof;
 			}
 
@@ -25987,7 +26124,9 @@ static void compute_insn_live_regs(struct bpf_verifier_env *env,
 			break;
 		case BPF_MOV:
 			def = dst;
-			if (BPF_SRC(insn->code) == BPF_K)
+			if (bpf_native_input_candidate(insn))
+				use = insn->off == NATIVE_LAB_INPUT_NUMERIC ? BIT(BPF_REG_1) : 0;
+			else if (BPF_SRC(insn->code) == BPF_K)
 				use = 0;
 			else
 				use = src;

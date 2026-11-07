@@ -3000,6 +3000,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 		goto put_token;
 	}
 
+	prog->aux->native_load_flags = attr->prog_flags;
+	prog->aux->native_load_ifindex = attr->prog_ifindex;
 	prog->expected_attach_type = attr->expected_attach_type;
 	prog->sleepable = !!(attr->prog_flags & BPF_F_SLEEPABLE);
 	prog->aux->attach_btf = attach_btf;
@@ -4772,6 +4774,8 @@ again:
 	return map;
 }
 
+EXPORT_SYMBOL_GPL(bpf_map_get_curr_or_next);
+
 struct bpf_prog *bpf_prog_get_curr_or_next(u32 *id)
 {
 	struct bpf_prog *prog;
@@ -4809,6 +4813,7 @@ struct bpf_prog *bpf_prog_by_id(u32 id)
 	spin_unlock_bh(&prog_idr_lock);
 	return prog;
 }
+EXPORT_SYMBOL_GPL(bpf_prog_by_id);
 
 static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 {
