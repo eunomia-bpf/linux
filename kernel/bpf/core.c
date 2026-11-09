@@ -89,27 +89,6 @@ struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog)
 	return image;
 }
 
-/* Keep the armed entry across load errors, including diagnostic retries. */
-int bpf_native_image_prepare(const struct bpf_prog *prog)
-{
-	u32 i;
-	int err = 0;
-
-	spin_lock(&bpf_native_lock);
-	if (bpf_native_pending && bpf_native_pending->owner == current) {
-		for (i = 0; i < prog->len; i++) {
-			if ((prog->insnsi[i].code == (BPF_JMP | BPF_CALL) &&
-			     prog->insnsi[i].src_reg == BPF_PSEUDO_CALL) ||
-			    bpf_pseudo_func(&prog->insnsi[i])) {
-				err = -EOPNOTSUPP;
-				break;
-			}
-		}
-	}
-	spin_unlock(&bpf_native_lock);
-	return err;
-}
-
 /* Registers */
 #define BPF_R0	regs[BPF_REG_0]
 #define BPF_R1	regs[BPF_REG_1]

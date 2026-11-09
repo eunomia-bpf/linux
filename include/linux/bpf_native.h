@@ -43,6 +43,5 @@ struct bpf_native_image {
 void bpf_native_image_arm(struct bpf_native_image *image);
 void bpf_native_image_free(struct bpf_native_image *image);
 struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog);
-int bpf_native_image_prepare(const struct bpf_prog *prog);
 
 #endif
