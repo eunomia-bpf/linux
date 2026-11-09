@@ -10,6 +10,8 @@
 #include <linux/if_vlan.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
+#include <linux/sched/task.h>
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <asm/extable.h>
@@ -3713,11 +3715,166 @@ struct x64_jit_data {
 #define MAX_PASSES 20
 #define PADDING_PASSES (MAX_PASSES - 5)
 
+static DEFINE_SPINLOCK(bpf_native_lock);
+static struct bpf_native_image *bpf_native_pending;
+
+static void bpf_native_image_free(struct bpf_native_image *image)
+{
+	if (!image)
+		return;
+	put_task_struct(image->owner);
+	kvfree(image->bytes);
+	kvfree(image->relocs);
+	kvfree(image->sites);
+	kfree(image);
+}
+
+/* The next program the calling task verifies gets this image; NULL disarms. */
+void bpf_native_image_arm(struct bpf_native_image *image)
+{
+	struct bpf_native_image *old;
+
+	if (image)
+		image->owner = get_task_struct(current);
+	spin_lock(&bpf_native_lock);
+	old = bpf_native_pending;
+	bpf_native_pending = image;
+	spin_unlock(&bpf_native_lock);
+	bpf_native_image_free(old);
+}
+EXPORT_SYMBOL_NS_GPL(bpf_native_image_arm, "BPF_INTERNAL");
+
+static struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog)
+{
+	struct bpf_native_image *image;
+
+	spin_lock(&bpf_native_lock);
+	image = bpf_native_pending;
+	if (image && image->owner == current && !prog->is_func)
+		bpf_native_pending = NULL;
+	else
+		image = NULL;
+	spin_unlock(&bpf_native_lock);
+	return image;
+}
+
+static int bpf_native_relocate(const struct bpf_prog *prog,
+			       const struct bpf_native_image *native,
+			       u8 *rw, const u8 *rx)
+{
+	u32 i, j;
+
+	for (i = 0; i < native->nr_relocs; i++) {
+		const struct bpf_native_reloc *r = &native->relocs[i];
+		struct bpf_map *map = NULL;
+		u64 value = r->target;
+		s64 disp;
+		s32 rel;
+		int err;
+
+		switch (r->kind) {
+		case BPF_NATIVE_RELOC_READONLY_DATA:
+			continue;
+		case BPF_NATIVE_RELOC_CALL_REL32:
+			if ((u64)r->offset + X86_PATCH_SIZE > native->len)
+				return -ERANGE;
+			disp = (s64)r->target - (s64)(rx + r->offset + X86_PATCH_SIZE);
+			rel = disp;
+			if (rel != disp)
+				return -ERANGE;
+			memcpy(rw + r->offset + 1, &rel, sizeof(rel));
+			continue;
+		case BPF_NATIVE_RELOC_MAP_POINTER:
+		case BPF_NATIVE_RELOC_MAP_VALUE:
+			/* B holds every map P names, for the life of the program. */
+			for (j = 0; j < prog->aux->used_map_cnt; j++)
+				if (prog->aux->used_maps[j]->id == (u32)r->target)
+					map = prog->aux->used_maps[j];
+			if (!map)
+				return -ENOENT;
+			value = (unsigned long)map;
+			if (r->kind == BPF_NATIVE_RELOC_MAP_VALUE) {
+				if (!map->ops->map_direct_value_addr)
+					return -EINVAL;
+				err = map->ops->map_direct_value_addr(map, &value,
+								      r->target >> 32);
+				if (err)
+					return err;
+				value += r->target >> 32;
+			}
+			fallthrough;
+		case BPF_NATIVE_RELOC_HELPER_POINTER:
+			if ((u64)r->offset + sizeof(value) > native->len)
+				return -ERANGE;
+			memcpy(rw + r->offset, &value, sizeof(value));
+			continue;
+		default:
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/* Emit P in place of B: stock frame, P's linked bytes, stock return. */
+static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
+				       struct bpf_native_image *native)
+{
+	u32 align = __alignof__(struct exception_table_entry);
+	u32 size = roundup(native->len + 256, align);
+	struct bpf_binary_header *header, *rw_header;
+	struct exception_table_entry *ex, *rw_ex;
+	u8 *image, *rw, *p, *body;
+	u32 i;
+
+	header = bpf_jit_binary_pack_alloc(size + native->nr_sites * sizeof(*ex),
+					   &image, align, &rw_header, &rw,
+					   jit_fill_hole);
+	if (!header)
+		goto out;
+
+	p = rw;
+	emit_prologue(&p, image, 0, bpf_prog_was_classic(prog),
+		      prog->aux->tail_call_reachable, false, false);
+	push_callee_regs(&p, all_callee_regs_used);
+	body = image + (p - rw);
+	memcpy(p, native->bytes, native->len);
+	if (bpf_native_relocate(prog, native, p, body)) {
+		bpf_jit_binary_pack_free(header, rw_header);
+		goto out;
+	}
+	p += native->len;
+	pop_callee_regs(&p, all_callee_regs_used);
+	*p++ = 0xC9; /* leave */
+	emit_return(&p, image + (p - rw));
+
+	ex = (void *)image + size;
+	rw_ex = (void *)rw + size;
+	for (i = 0; i < native->nr_sites; i++) {
+		rw_ex[i].insn = body + native->sites[i].offset - (u8 *)&ex[i].insn;
+		rw_ex[i].fixup = native->sites[i].fixup;
+		rw_ex[i].data = EX_TYPE_BPF;
+	}
+
+	size = p - rw;
+	if (bpf_jit_binary_pack_finalize(header, rw_header))
+		goto out;
+
+	prog->aux->extable = ex;
+	prog->aux->num_exentries = native->nr_sites;
+	prog->bpf_func = (void *)image + cfi_get_offset();
+	prog->jited = 1;
+	prog->jited_len = size - cfi_get_offset();
+out:
+	bpf_native_image_free(native);
+	return prog;
+}
+
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
 	struct bpf_binary_header *rw_header = NULL;
 	struct bpf_binary_header *header = NULL;
 	struct bpf_prog *tmp, *orig_prog = prog;
+	struct bpf_native_image *native;
 	void __percpu *priv_stack_ptr = NULL;
 	struct x64_jit_data *jit_data;
 	int priv_stack_alloc_sz;
@@ -3734,6 +3891,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	if (!prog->jit_requested)
 		return orig_prog;
+
+	native = bpf_native_image_take(prog);
+	if (native)
+		return bpf_native_jit(prog, native);
 
 	tmp = bpf_jit_blind_constants(prog);
 	/*

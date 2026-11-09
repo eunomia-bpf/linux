@@ -8262,6 +8262,7 @@ u32 btf_obj_id(const struct btf *btf)
 {
 	return btf->id;
 }
+EXPORT_SYMBOL_GPL(btf_obj_id);
 
 bool btf_is_kernel(const struct btf *btf)
 {

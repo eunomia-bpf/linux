@@ -1245,6 +1245,14 @@ void do_user_addr_fault(struct pt_regs *regs,
 		pgtable_bad(regs, error_code, address);
 
 	/*
+	 * Kernel-mode faults at native BPF load sites take the stock recovery
+	 * entry, with or without SMAP.
+	 */
+	if (!(error_code & X86_PF_USER) && search_bpf_extables(regs->ip) &&
+	    fixup_exception(regs, X86_TRAP_PF, error_code, address))
+		return;
+
+	/*
 	 * If SMAP is on, check for invalid kernel (supervisor) access to user
 	 * pages in the user address space.  The odd case here is WRUSS,
 	 * which, according to the preliminary documentation, does not respect
@@ -1254,11 +1262,6 @@ void do_user_addr_fault(struct pt_regs *regs,
 	if (unlikely(cpu_feature_enabled(X86_FEATURE_SMAP) &&
 		     !(error_code & X86_PF_USER) &&
 		     !(regs->flags & X86_EFLAGS_AC))) {
-		/* Native BPF loads carry the stock recovery entry. */
-		if (search_bpf_extables(regs->ip) &&
-		    fixup_exception(regs, X86_TRAP_PF, error_code, address))
-			return;
-
 		/*
 		 * No extable entry here.  This was a kernel access to an
 		 * invalid pointer.  get_kernel_nofault() will not get here.

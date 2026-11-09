@@ -4809,6 +4809,7 @@ struct bpf_prog *bpf_prog_by_id(u32 id)
 	spin_unlock_bh(&prog_idr_lock);
 	return prog;
 }
+EXPORT_SYMBOL_GPL(bpf_prog_by_id);
 
 static int bpf_prog_get_fd_by_id(const union bpf_attr *attr)
 {
