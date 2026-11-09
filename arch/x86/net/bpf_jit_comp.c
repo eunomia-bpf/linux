@@ -15,8 +15,13 @@
 #include <linux/memory.h>
 #include <linux/sort.h>
 #include <linux/execmem.h>
+#include <linux/kallsyms.h>
+#include <linux/uaccess.h>
+#include <linux/log2.h>
+#include <linux/unaligned.h>
 #include <asm/extable.h>
 #include <asm/ftrace.h>
+#include <asm/insn.h>
 #include <asm/set_memory.h>
 #include <asm/nospec-branch.h>
 #include <asm/text-patching.h>
@@ -2000,6 +2005,338 @@ static int emit_kfunc_arena_args(struct bpf_prog *bpf_prog,
 	return prog - start;
 }
 
+/*
+ * Registers that copied kfunc code may use: those of R0-R5, which hold the
+ * arguments and the result as for a call, and the scratch registers r10 and
+ * r11. r9 can hold the private frame pointer.
+ */
+#define KFUNC_COPY_REGS	(BIT(0) | BIT(1) | BIT(2) | BIT(6) | BIT(7) | BIT(8) | \
+			 BIT(10) | BIT(11))
+
+/*
+ * Write an instruction of a compiled kfunc with the registers of R0-R5
+ * renamed by @map to those that the verifier bound them to. It must be a
+ * move, ALU or address computation without control flow, prefixes other than
+ * operand size, rip-relative addressing or registers other than
+ * KFUNC_COPY_REGS, and no division, which can trap.
+ */
+static u8 *kfunc_copy_insn(u8 *p, const struct insn *insn, const u8 *c, const u8 *map)
+{
+	u8 op = insn->opcode.bytes[insn->opcode.nbytes - 1], rex = insn->rex_prefix.bytes[0];
+	u8 modrm = insn->modrm.value, sib = insn->sib.value, ext = X86_MODRM_REG(modrm);
+	u8 mod = X86_MODRM_MOD(modrm), reg = ext, rm = 0, idx = 4;
+	bool two = insn->opcode.nbytes == 2, group, opreg, disp8;
+	u16 regs = 0;
+	int head;
+
+	if (insn->vex_prefix.nbytes || insn->opcode.nbytes > 2 || insn->prefixes.nbytes > 1 ||
+	    (insn->prefixes.nbytes && insn->prefixes.bytes[0] != 0x66))
+		return NULL;
+	if (two) {
+		/* cmovcc, imul, movzx/movsx of words, bswap, prefetch */
+		group = op == 0x18;
+		if ((op & 0xf0) != 0x40 && op != 0xaf && op != 0xb7 && op != 0xbf &&
+		    (op & 0xf8) != 0xc8 && !(group && ext < 4))
+			return NULL;
+	} else {
+		/* add, or, and, sub, xor, cmp, mov, lea, test, imul, shifts, not, neg, mul */
+		group = op == 0x81 || op == 0x83 || op == 0xc1 || op == 0xc7 ||
+			op == 0xd1 || op == 0xd3 || op == 0xf7;
+		if (!(op < 0x40 && (op & 0xf0) != 0x10 && (op & 7) % 2 && (op & 7) < 6) &&
+		    op != 0x63 && op != 0x69 && op != 0x6b && op != 0x85 && op != 0x89 &&
+		    op != 0x8b && op != 0x8d && op != 0x98 && op != 0x99 && op != 0xa9 &&
+		    (op & 0xf8) != 0xb8 &&
+		    !(group && op != 0xc7 && op != 0xf7 && ext != 2 && ext != 3) &&
+		    !(op == 0xc7 && !ext) && !(op == 0xf7 && ext != 1 && ext < 6))
+			return NULL;
+	}
+
+	opreg = (op & 0xf8) == (two ? 0xc8 : 0xb8);
+	if (opreg)
+		rm = (op & 7) + (X86_REX_B(rex) ? 8 : 0);
+	if (insn->modrm.nbytes) {
+		reg = group ? ext : ext + (X86_REX_R(rex) ? 8 : 0);
+		rm = (insn->sib.nbytes ? X86_SIB_BASE(sib) : X86_MODRM_RM(modrm)) +
+		     (X86_REX_B(rex) ? 8 : 0);
+		if (insn->sib.nbytes)
+			idx = X86_SIB_INDEX(sib) + (X86_REX_X(rex) ? 8 : 0);
+		/* rip-relative or absolute */
+		if (!mod && (rm & 7) == 5)
+			return NULL;
+		regs = (group ? 0 : BIT(reg)) | (idx != 4 ? BIT(idx) : 0);
+	}
+	if ((regs | (opreg || insn->modrm.nbytes ? BIT(rm) : 0)) & ~KFUNC_COPY_REGS)
+		return NULL;
+
+	/* the instruction again, with the registers renamed */
+	if (!group)
+		reg = map[reg];
+	rm = map[rm];
+	idx = idx != 4 ? map[idx] : 4;
+	if (insn->prefixes.nbytes)
+		*p++ = 0x66;
+	rex = 0x40 | (rex & 8) | (reg & 8 ? 4 : 0) | (idx & 8 ? 2 : 0) | (rm & 8 ? 1 : 0);
+	if (rex != 0x40)
+		*p++ = rex;
+	if (two)
+		*p++ = 0x0f;
+	*p++ = opreg ? (op & 0xf8) | (rm & 7) : op;
+	if (insn->modrm.nbytes) {
+		/* a base of r13 needs a displacement */
+		disp8 = !mod && (rm & 7) == 5;
+		*p++ = (disp8 ? 1 : mod) << 6 | (reg & 7) << 3 | (insn->sib.nbytes ? 4 : rm & 7);
+		if (insn->sib.nbytes)
+			*p++ = (sib & 0xc0) | (idx & 7) << 3 | (rm & 7);
+		if (disp8)
+			*p++ = 0;
+	}
+	head = insn->prefixes.nbytes + insn->rex_prefix.nbytes + insn->opcode.nbytes +
+	       insn->modrm.nbytes + insn->sib.nbytes;
+	memcpy(p, c + head, insn->length - head);
+	return p + insn->length - head;
+}
+
+/*
+ * Copy the compiled kfunc of an inlined call up to its return, without the
+ * ENDBR and NOPs at its entry, with the operands renamed by @map.
+ */
+static int kfunc_copy(const struct bpf_kfunc_inline *in, const u8 *map, u8 *buf)
+{
+	u8 code[BPF_KFUNC_INLINE_MAX + MAX_INSN_SIZE], *c, *p = buf;
+	unsigned long size, off, ret;
+	struct insn insn;
+	int pos;
+
+	if (!kallsyms_lookup_size_offset(in->addr, &size, &off) || off)
+		return -EINVAL;
+	size = min(size, sizeof(code));
+	if (copy_from_kernel_nofault(code, (void *)in->addr, size))
+		return -EFAULT;
+	for (pos = 0; pos < size; pos += insn.length) {
+		if (insn_decode(&insn, code + pos, size - pos, INSN_MODE_64))
+			return -EINVAL;
+		c = code + pos;
+		/* ret, or a jump to the return thunk */
+		ret = in->addr + pos + insn.length + insn.immediate.value;
+		if ((insn.length == 1 && c[0] == 0xc3) ||
+		    (c[0] == 0xe9 && (ret == (unsigned long)x86_return_thunk ||
+				      ret == (unsigned long)__x86_return_thunk)))
+			return p > buf ? p - buf : -EINVAL;
+		/* endbr64, or a nop */
+		if ((insn.length == 4 && !memcmp(c, "\xf3\x0f\x1e\xfa", 4)) ||
+		    (insn.length == 1 && c[0] == 0x90) ||
+		    (insn.opcode.nbytes == 2 && insn.opcode.bytes[1] == 0x1f &&
+		     !X86_MODRM_REG(insn.modrm.value) && !insn.rex_prefix.nbytes))
+			continue;
+		/* renaming adds at most a REX prefix and a displacement */
+		if (p - buf + insn.length + 2 > BPF_KFUNC_INLINE_MAX)
+			return -E2BIG;
+		p = kfunc_copy_insn(p, &insn, c, map);
+		if (!p)
+			return -EINVAL;
+	}
+	return -EINVAL;
+}
+
+/*
+ * The JIT's own code for some kfuncs, for the registers that the operands are
+ * bound to and the values of the constant arguments. Without a CPU feature
+ * that it needs, a kfunc has none, and the JIT copies the compiled kfunc.
+ */
+static u8 *kfunc_rex(u8 *p, bool w, u8 reg, u8 rm)
+{
+	u8 b = 0x40 | (w ? 8 : 0) | (reg & 8 ? 4 : 0) | (rm & 8 ? 1 : 0);
+
+	if (b != 0x40)
+		*p++ = b;
+	return p;
+}
+
+/* 64-bit op %reg, %rm */
+static u8 *kfunc_op_rr(u8 *p, u8 op, u8 reg, u8 rm)
+{
+	p = kfunc_rex(p, true, reg, rm);
+	*p++ = op;
+	*p++ = 0xc0 | (reg & 7) << 3 | (rm & 7);
+	return p;
+}
+
+/*
+ * ModRM, SIB and displacement of disp(%base, %index, 1 << scale), with @reg in
+ * the reg field. An @index of 4 (%rsp) is none.
+ */
+static u8 *kfunc_mem(u8 *p, u8 reg, u8 base, u8 index, u8 scale, s32 disp)
+{
+	u8 mod = !disp && (base & 7) != 5 ? 0 : disp == (s8)disp ? 1 : 2;
+	bool sib = index != 4 || (base & 7) == 4;
+
+	*p++ = mod << 6 | (reg & 7) << 3 | (sib ? 4 : base & 7);
+	if (sib)
+		*p++ = scale << 6 | (index & 7) << 3 | (base & 7);
+	if (mod == 1)
+		*p++ = disp;
+	if (mod == 2) {
+		put_unaligned_le32(disp, p);
+		p += 4;
+	}
+	return p;
+}
+
+static int kfunc_emit_rol64(const u8 *reg, const s32 *imm, u8 *buf)
+{
+	u8 dst = reg[0], src = reg[1], n = imm[BPF_REG_2] & 63, *p = buf;
+
+	if (n && dst != src && boot_cpu_has(X86_FEATURE_BMI2)) {
+		/* rorx $(64 - n), %src, %dst */
+		*p++ = 0xc4;
+		*p++ = (dst & 8 ? 0 : 0x80) | 0x40 | (src & 8 ? 0 : 0x20) | 0x03;
+		*p++ = 0xfb;
+		*p++ = 0xf0;
+		*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
+		*p++ = 64 - n;
+		return p - buf;
+	}
+	if (dst != src || !n)
+		p = kfunc_op_rr(p, 0x89, src, dst);	/* mov %src, %dst */
+	if (n) {
+		/* rol $n, %dst */
+		p = kfunc_rex(p, true, 0, dst);
+		*p++ = 0xc1;
+		*p++ = 0xc0 | (dst & 7);
+		*p++ = n;
+	}
+	return p - buf;
+}
+
+/* cmovcc %src, %dst */
+static u8 *kfunc_cmov(u8 *p, u8 cc, u8 dst, u8 src)
+{
+	p = kfunc_rex(p, true, dst, src);
+	*p++ = 0x0f;
+	*p++ = 0x40 | cc;
+	*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
+	return p;
+}
+
+/*
+ * dst = cc ? a : b, after the test or compare at @p. The flags come first, so
+ * the result may take the register of an operand they read. A result in the
+ * register of a takes b with the inverse condition, which a copy of the
+ * compiled kfunc cannot do.
+ */
+static int kfunc_select(u8 *buf, u8 *p, u8 cc, u8 dst, u8 a, u8 b)
+{
+	if (dst == a)
+		return kfunc_cmov(p, cc ^ 1, dst, b) - buf;
+	if (dst != b)
+		p = kfunc_op_rr(p, 0x89, b, dst);	/* mov %b, %dst */
+	return kfunc_cmov(p, cc, dst, a) - buf;
+}
+
+static int kfunc_emit_select64(const u8 *reg, const s32 *imm, u8 *buf)
+{
+	u8 cond = reg[1];
+
+	/* test %cond, %cond; cmovne */
+	return kfunc_select(buf, kfunc_op_rr(buf, 0x85, cond, cond), 0x5, reg[0],
+			   reg[2], reg[3]);
+}
+
+/* R4 is free for the control word, as there are three arguments */
+static int kfunc_emit_extract64(const u8 *reg, const s32 *imm, u8 *buf)
+{
+	u8 dst = reg[0], src = reg[1], ctl = dst != src ? dst : reg[4];
+	u32 start = imm[BPF_REG_2], len = imm[BPF_REG_3];
+	u8 *p = buf;
+
+	if (!boot_cpu_has(X86_FEATURE_BMI1) || start > 63 || !len || len > 64 - start)
+		return -EOPNOTSUPP;
+	/* mov $(start | len << 8), %ctl */
+	p = kfunc_rex(p, false, 0, ctl);
+	*p++ = 0xb8 | (ctl & 7);
+	put_unaligned_le32(start | len << 8, p);
+	p += 4;
+	/* bextr %ctl, %src, %dst */
+	*p++ = 0xc4;
+	*p++ = (dst & 8 ? 0 : 0x80) | 0x40 | (src & 8 ? 0 : 0x20) | 0x02;
+	*p++ = 0x80 | (~ctl & 0xf) << 3;
+	*p++ = 0xf7;
+	*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
+	return p - buf;
+}
+
+static int kfunc_emit_load_be64(const u8 *reg, const s32 *imm, u8 *buf)
+{
+	u8 dst = reg[0], base = reg[1], *p = buf;
+
+	if (!boot_cpu_has(X86_FEATURE_MOVBE))
+		return -EOPNOTSUPP;
+	/* movbe off(%base), %dst */
+	p = kfunc_rex(p, true, dst, base);
+	*p++ = 0x0f;
+	*p++ = 0x38;
+	*p++ = 0xf0;
+	return kfunc_mem(p, dst, base, 4, 0, imm[BPF_REG_2]) - buf;
+}
+
+static int kfunc_emit_lea64(const u8 *reg, const s32 *imm, u8 *buf)
+{
+	u8 dst = reg[0], base = reg[1], index = reg[2], *p = buf;
+	u32 scale = imm[BPF_REG_3];
+
+	/* %rsp cannot be an index, and the scale is 1, 2, 4 or 8 */
+	if (index == 4 || !is_power_of_2(scale) || scale > 8)
+		return -EINVAL;
+	/* lea disp(%base, %index, scale), %dst */
+	*p++ = 0x48 | (dst & 8 ? 4 : 0) | (index & 8 ? 2 : 0) | (base & 8 ? 1 : 0);
+	*p++ = 0x8d;
+	return kfunc_mem(p, dst, base, index, ilog2(scale), imm[BPF_REG_4]) - buf;
+}
+
+/* kfuncs that the JIT writes its own code for, rather than copying them */
+static const struct {
+	void *func;
+	int (*emit)(const u8 *reg, const s32 *imm, u8 *buf);
+} kfunc_emitters[] = {
+	{ (void *)bpf_rol64, kfunc_emit_rol64 },
+	{ (void *)bpf_select64, kfunc_emit_select64 },
+	{ (void *)bpf_extract64, kfunc_emit_extract64 },
+	{ (void *)bpf_load_be64, kfunc_emit_load_be64 },
+	{ (void *)bpf_lea64, kfunc_emit_lea64 },
+};
+
+static u8 x86_reg(u32 reg)
+{
+	return reg2hex[reg] + (is_ereg(reg) ? 8 : 0);
+}
+
+/*
+ * Get native code for an inlined kfunc call, with the operands in the x86
+ * registers that the verifier bound them to: the JIT's own code for the
+ * kfunc, or else a copy of the compiled kfunc.
+ */
+int bpf_jit_inline_kfunc(const struct bpf_kfunc_inline *in, u8 *buf)
+{
+	u8 reg[MAX_BPF_FUNC_REG_ARGS + 1], map[16];
+	int i, len;
+
+	for (i = 0; i < ARRAY_SIZE(map); i++)
+		map[i] = i;
+	for (i = BPF_REG_0; i <= BPF_REG_5; i++) {
+		reg[i] = x86_reg(in->reg[i]);
+		map[x86_reg(i)] = reg[i];
+	}
+	if (in->copy)
+		return kfunc_copy(in, map, buf);
+	for (i = 0; i < ARRAY_SIZE(kfunc_emitters); i++) {
+		if (in->addr != (unsigned long)kfunc_emitters[i].func)
+			continue;
+		len = kfunc_emitters[i].emit(reg, in->imm, buf);
+		return len > 0 && len <= BPF_KFUNC_INLINE_MAX ? len : -EINVAL;
+	}
+	return -EOPNOTSUPP;
+}
+
 static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *addrs, u8 *image,
 		  u8 *rw_image, int oldproglen, struct jit_context *ctx, bool jmp_padding)
 {
@@ -2952,6 +3289,15 @@ populate_extable:
 			if (!imm32)
 				return -EINVAL;
 			if (src_reg == BPF_PSEUDO_KFUNC_CALL) {
+				const struct bpf_kfunc_inline *in;
+
+				/* an inlined kfunc call gets its native code */
+				in = bpf_kfunc_native(env, insn_idx);
+				if (in) {
+					memcpy(prog, in->image, in->image_len);
+					prog += in->image_len;
+					break;
+				}
 				fm = bpf_jit_find_kfunc_model(bpf_prog, insn);
 				if (!fm)
 					return -EINVAL;
