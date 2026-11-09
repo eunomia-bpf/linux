@@ -102,6 +102,17 @@ config BPF_CRYPTO
 
 source "kernel/bpf/preload/Kconfig"
 
+config BPF_KINSN
+	bool "Kfuncs that BPF programs use as instructions"
+	depends on BPF_SYSCALL && DEBUG_INFO_BTF
+	help
+	  Provide kfuncs for rotate, conditional select, bit field extract,
+	  big-endian load, prefetch, copy and address computation. The
+	  verifier checks each call as a short sequence of BPF instructions,
+	  and the JIT emits native instructions in its place where it can.
+
+	  If unsure, say N.
+
 config BPF_LSM
 	bool "Enable BPF LSM Instrumentation"
 	depends on BPF_EVENTS

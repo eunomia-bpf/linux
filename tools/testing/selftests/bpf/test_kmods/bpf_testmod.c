@@ -925,15 +925,81 @@ BTF_ID_FLAGS(func, bpf_kfunc_kasan_poison)
 BTF_ID_FLAGS(func, bpf_kfunc_kasan_unpoison)
 BTF_ID_FLAGS(func, bpf_testmod_oob_alloc, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_testmod_oob_free, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_good)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_xor)
+BTF_ID_FLAGS(func, bpf_testmod_kinsn_div)
 BTF_KFUNCS_END(bpf_testmod_common_kfunc_ids)
 
 BTF_ID_LIST(bpf_testmod_dtor_ids)
 BTF_ID(struct, bpf_testmod_ctx)
 BTF_ID(func, bpf_testmod_ctx_release_dtor)
 
+/*
+ * A kinsn with native code, and two with only BPF instructions, of which the
+ * JIT copies the first and not the second, which divides.
+ */
+__bpf_kfunc u64 bpf_testmod_kinsn_good(u64 x)
+{
+	return x;
+}
+
+__bpf_kfunc u64 bpf_testmod_kinsn_xor(u64 a, u64 b)
+{
+	return a ^ b;
+}
+
+__bpf_kfunc u64 bpf_testmod_kinsn_div(u64 a, u64 b)
+{
+	return b ? a / b : 0;
+}
+
+BTF_ID_LIST(bpf_testmod_kinsn_ids)
+BTF_ID(func, bpf_testmod_kinsn_good)
+BTF_ID(func, bpf_testmod_kinsn_xor)
+BTF_ID(func, bpf_testmod_kinsn_div)
+
+static const struct bpf_insn kinsn_mov_insns[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+};
+
+static const struct bpf_insn kinsn_xor_insns[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_XOR, BPF_REG_0, BPF_REG_2),
+};
+
+static const struct bpf_insn kinsn_div_insns[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_DIV, BPF_REG_0, BPF_REG_2),
+};
+
+#ifdef CONFIG_X86_64
+/* mov %src, %dst */
+static int kinsn_good_emit(const struct bpf_kinsn_operands *ops, u8 *buf)
+{
+	u8 dst = ops->reg[0], src = ops->reg[1];
+
+	buf[0] = 0x48 | (src & 8 ? 4 : 0) | (dst & 8 ? 1 : 0);
+	buf[1] = 0x89;
+	buf[2] = 0xc0 | (src & 7) << 3 | (dst & 7);
+	return 3;
+}
+#else
+#define kinsn_good_emit	NULL
+#endif
+
+#define KINSN(i, op, emit)	{ &bpf_testmod_kinsn_ids[i], op, ARRAY_SIZE(op), emit }
+
+static const struct bpf_kinsn bpf_testmod_kinsns[] = {
+	KINSN(0, kinsn_mov_insns, kinsn_good_emit),
+	KINSN(1, kinsn_xor_insns, NULL),
+	KINSN(2, kinsn_div_insns, NULL),
+};
+
 static const struct btf_kfunc_id_set bpf_testmod_common_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &bpf_testmod_common_kfunc_ids,
+	.kinsns = bpf_testmod_kinsns,
+	.kinsn_cnt = ARRAY_SIZE(bpf_testmod_kinsns),
 };
 
 __bpf_kfunc u64 bpf_kfunc_call_test1(struct sock *sk, u32 a, u64 b, u32 c, u64 d)

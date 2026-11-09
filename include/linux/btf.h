@@ -120,10 +120,14 @@ struct bpf_prog;
 
 typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
 
+struct bpf_kinsn;
+
 struct btf_kfunc_id_set {
 	struct module *owner;
 	struct btf_id_set8 *set;
 	btf_kfunc_filter_t filter;
+	const struct bpf_kinsn *kinsns;
+	u32 kinsn_cnt;
 };
 
 struct btf_id_dtor_kfunc {
@@ -604,6 +608,7 @@ const char *btf_str_by_offset(const struct btf *btf, u32 offset);
 struct btf *btf_parse_vmlinux(void);
 struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog);
 u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
+const struct bpf_kinsn *btf_kfunc_kinsn(const struct btf *btf, u32 kfunc_btf_id);
 int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag);
 bool btf_kfunc_is_allowed(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
 u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,

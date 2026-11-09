@@ -1269,6 +1269,36 @@ static inline u32 btf_func_model_arg_slots(const struct btf_func_model *m, u32 a
 	return (m->arg_size[arg] + sizeof(u64) - 1) / sizeof(u64);
 }
 
+#define BPF_KINSN_MAX_INSNS	32
+#define BPF_KINSN_MAX_EMIT	128
+
+/*
+ * Operands of a kinsn call: the native registers of R0-R5, which the verifier
+ * may have bound to other BPF registers, and the values of the constant (__k)
+ * arguments. As in the BPF instructions, the registers of R1-R5 after the
+ * arguments are free.
+ */
+struct bpf_kinsn_operands {
+	u8 reg[MAX_BPF_FUNC_REG_ARGS + 1];
+	s32 imm[MAX_BPF_FUNC_REG_ARGS + 1];
+};
+
+/*
+ * A kfunc that BPF programs use like an instruction. The verifier checks each
+ * call as @insns, @len BPF instructions that compute the kfunc from the
+ * arguments in R1-R5 into R0. @emit, if set, writes at most
+ * BPF_KINSN_MAX_EMIT bytes of native code for @ops to @buf and returns their
+ * number, or an error if it has none; the JIT may then copy the compiled
+ * kfunc instead. Like the rest of the JIT, native code is trusted to compute
+ * what @insns compute.
+ */
+struct bpf_kinsn {
+	const u32 *id;
+	const struct bpf_insn *insns;
+	u32 len;
+	int (*emit)(const struct bpf_kinsn_operands *ops, u8 *buf);
+};
+
 /* Restore arguments before returning from trampoline to let original function
  * continue executing. This flag is used for fentry progs when there are no
  * fexit progs.

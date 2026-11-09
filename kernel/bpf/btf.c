@@ -246,6 +246,14 @@ struct btf_id_dtor_kfunc_tab {
 	struct btf_id_dtor_kfunc dtors[];
 };
 
+struct btf_kinsn_tab {
+	u32 cnt;
+	struct {
+		u32 id;
+		const struct bpf_kinsn *kinsn;
+	} kinsns[];
+};
+
 struct btf_struct_ops_tab {
 	u32 cnt;
 	u32 capacity;
@@ -269,6 +277,7 @@ struct btf {
 	struct rcu_head rcu;
 	struct btf_kfunc_set_tab *kfunc_set_tab;
 	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
+	struct btf_kinsn_tab *kinsn_tab;
 	struct btf_struct_metas *struct_meta_tab;
 	struct btf_struct_ops_tab *struct_ops_tab;
 	struct btf_layout *layout;
@@ -1883,6 +1892,7 @@ static void btf_free(struct btf *btf)
 	btf_free_struct_meta_tab(btf);
 	btf_free_dtor_kfunc_tab(btf);
 	btf_free_kfunc_set_tab(btf);
+	kfree(btf->kinsn_tab);
 	btf_free_struct_ops_tab(btf);
 	kvfree(btf->types);
 	kvfree(btf->resolved_sizes);
@@ -9695,6 +9705,103 @@ u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
 	return btf_kfunc_id_set_contains(btf, BTF_KFUNC_HOOK_FMODRET, kfunc_btf_id);
 }
 
+const struct bpf_kinsn *btf_kfunc_kinsn(const struct btf *btf, u32 kfunc_btf_id)
+{
+	const struct btf_kinsn_tab *tab = btf->kinsn_tab;
+	u32 i;
+
+	for (i = 0; tab && i < tab->cnt; i++)
+		if (tab->kinsns[i].id == kfunc_btf_id)
+			return tab->kinsns[i].kinsn;
+	return NULL;
+}
+
+/* a scalar or a pointer of one register */
+static bool btf_kinsn_reg_type(const struct btf *btf, u32 id)
+{
+	const struct btf_type *t = btf_type_skip_modifiers(btf, id, NULL);
+
+	return btf_type_is_ptr(t) ||
+	       ((btf_type_is_int(t) || btf_is_any_enum(t)) && t->size <= sizeof(u64));
+}
+
+/*
+ * A kinsn takes each argument in one of R1-R5 and returns in R0. Its
+ * instructions use R0-R5, no instruction of cpu v4, which not every JIT has,
+ * and jump only forward within them, so that they end by falling through
+ * the last one. The verifier checks the rest.
+ */
+static bool btf_kinsn_ok(const struct btf *btf, const struct btf_type *func,
+			 const struct bpf_kinsn *k)
+{
+	const struct btf_type *proto = btf_type_by_id(btf, func->type);
+	const struct btf_param *args = btf_params(proto);
+	int i, n = btf_type_vlen(proto), len = k->len;
+	const struct bpf_insn *insn;
+	u8 class, op;
+
+	if (n > MAX_BPF_FUNC_REG_ARGS || !k->insns || !len || len > BPF_KINSN_MAX_INSNS ||
+	    (proto->type && !btf_kinsn_reg_type(btf, proto->type)))
+		return false;
+	for (i = 0; i < n; i++)
+		if (!btf_kinsn_reg_type(btf, args[i].type))
+			return false;
+	for (i = 0; i < len; i++) {
+		insn = &k->insns[i];
+		class = BPF_CLASS(insn->code);
+		op = BPF_OP(insn->code);
+		if (insn->dst_reg > BPF_REG_5 || insn->src_reg > BPF_REG_5 || class == BPF_LD ||
+		    ((class == BPF_ALU || class == BPF_ALU64) &&
+		     (insn->off || (class == BPF_ALU64 && op == BPF_END))) ||
+		    ((class == BPF_LDX || class == BPF_ST || class == BPF_STX) &&
+		     BPF_MODE(insn->code) != BPF_MEM) ||
+		    ((class == BPF_JMP || class == BPF_JMP32) &&
+		     (op == BPF_CALL || op == BPF_EXIT || op == BPF_JCOND ||
+		      (op == BPF_JA && insn->code != (BPF_JMP | BPF_JA)) ||
+		      insn->off < 0 || insn->off >= len - i - 1)))
+			return false;
+	}
+	return true;
+}
+
+static int btf_add_kinsns(struct btf *btf, const struct btf_kfunc_id_set *kset)
+{
+	struct btf_kinsn_tab *tab = btf->kinsn_tab;
+	u32 i, id, cnt = tab ? tab->cnt : 0;
+	const struct bpf_kinsn *k;
+	const struct btf_type *t;
+	u32 *pair;
+
+	/* check them all first, so that a failure adds none */
+	for (i = 0; i < kset->kinsn_cnt; i++) {
+		k = &kset->kinsns[i];
+		id = btf_relocate_id(btf, *k->id);
+		t = btf_type_by_id(btf, id);
+		pair = btf_id_set8_contains(kset->set, *k->id);
+		/* the instructions stand for the call, so no kfunc flags apply */
+		if (!pair || pair[1] || !t || !btf_type_is_func(t) || !btf_kinsn_ok(btf, t, k))
+			return -EINVAL;
+	}
+	if (!kset->kinsn_cnt)
+		return 0;
+
+	tab = krealloc(btf->kinsn_tab, struct_size(tab, kinsns, cnt + kset->kinsn_cnt),
+		       GFP_KERNEL | __GFP_NOWARN);
+	if (!tab)
+		return -ENOMEM;
+	tab->cnt = cnt;
+	btf->kinsn_tab = tab;
+	for (i = 0; i < kset->kinsn_cnt; i++) {
+		id = btf_relocate_id(btf, *kset->kinsns[i].id);
+		/* a set registered for several hooks adds its kinsns once */
+		if (btf_kfunc_kinsn(btf, id))
+			continue;
+		tab->kinsns[tab->cnt].id = id;
+		tab->kinsns[tab->cnt++].kinsn = &kset->kinsns[i];
+	}
+	return 0;
+}
+
 static int __register_btf_kfunc_id_set(enum btf_kfunc_hook hook,
 				       const struct btf_kfunc_id_set *kset)
 {
@@ -9713,6 +9820,10 @@ static int __register_btf_kfunc_id_set(enum btf_kfunc_hook hook,
 		if (ret)
 			goto err_out;
 	}
+
+	ret = btf_add_kinsns(btf, kset);
+	if (ret)
+		goto err_out;
 
 	ret = btf_populate_kfunc_set(btf, hook, kset);
 

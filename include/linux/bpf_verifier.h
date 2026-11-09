@@ -634,6 +634,7 @@ struct bpf_insn_aux_data {
 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
 		struct bpf_map_ptr_state map_ptr_state;
 		s32 call_imm;			/* saved imm field of call insn */
+		u32 kinsn_call;			/* 1 + index into env->kinsns, at a call */
 		u32 alu_limit;			/* limit for add/sub register with pointer */
 		struct {
 			u32 map_index;		/* index into used_maps[] */
@@ -683,6 +684,9 @@ struct bpf_insn_aux_data {
 	 */
 	u8 fastcall_spills_num:3;
 	u8 arg_prog:4;
+	/* insn belongs to the instructions of a kinsn call, see bpf_lower_kinsns() */
+	u8 kinsn:1;
+	u8 kinsn_entry:1;
 
 	/* below fields are initialized once */
 	unsigned int orig_idx; /* original instruction index */
@@ -1083,6 +1087,8 @@ struct bpf_verifier_env {
 	u32 scc_cnt;
 	struct bpf_iarray *succ;
 	struct bpf_iarray *gotox_tmp_buf;
+	struct bpf_kinsn_region *kinsns;
+	u32 kinsn_cnt;
 };
 
 static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
@@ -1201,6 +1207,13 @@ static inline void mark_jump_target(struct bpf_verifier_env *env, int idx)
 static inline bool bpf_is_jump_target(struct bpf_verifier_env *env, int insn_idx)
 {
 	return env->insn_aux_data[insn_idx].jump_target;
+}
+
+/* Control flowing from @from to @to leaves the instructions of a kinsn call. */
+static inline bool bpf_kinsn_exit(struct bpf_verifier_env *env, int from, int to)
+{
+	return env->insn_aux_data[from].kinsn &&
+	       (!env->insn_aux_data[to].kinsn || env->insn_aux_data[to].kinsn_entry);
 }
 
 static inline struct bpf_func_state *cur_func(struct bpf_verifier_env *env)
@@ -1794,13 +1807,40 @@ enum bpf_reg_arg_type {
 #define MAX_KFUNC_CALL_DESCS (MAX_KFUNC_DESCS * 2)
 static_assert(MAX_KFUNC_CALL_DESCS <= S16_MAX + 1);
 
+/* A kinsn call that the verifier replaced by its instructions */
+struct bpf_kinsn_region {
+	struct bpf_insn call;
+	const struct bpf_kinsn *kinsn;
+	unsigned long addr;		/* of the compiled kfunc */
+	struct bpf_kinsn_operands ops;	/* R0-R5 in BPF registers, constants */
+	u8 *image;			/* native code for the JIT */
+	u32 start;
+	u8 image_len;
+	u8 nargs;
+	u8 imm_mask;	/* R1-R5 that hold constant (__k) arguments */
+	bool entered;	/* the verifier reached the instructions */
+	bool imm_differ; /* ... with different constants on different paths */
+	bool ret;	/* the kfunc returns a value */
+	bool copy;	/* the native code is a copy of the compiled kfunc */
+};
+
 struct bpf_kfunc_desc {
 	struct btf_func_model func_model;
 	struct bpf_func_proto proto;
+	const struct bpf_kinsn *kinsn;
 	u32 func_id;
 	u16 offset;
+	u8 kinsn_imm;	/* mask of R1-R5 that are constant (__k) arguments */
 	unsigned long addr;
 };
+
+struct bpf_kfunc_desc *bpf_find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset);
+int bpf_lower_kinsns(struct bpf_verifier_env *env);
+int bpf_mark_kinsn_regs(struct bpf_verifier_env *env, int prev_insn_idx,
+			const struct bpf_insn_aux_data *aux);
+void bpf_restore_kinsns(struct bpf_verifier_env *env);
+void bpf_free_kinsns(struct bpf_verifier_env *env);
+const struct bpf_kinsn_region *bpf_kinsn_native(const struct bpf_verifier_env *env, int idx);
 
 struct bpf_kfunc_desc_tab {
 	u32 nr_descs;

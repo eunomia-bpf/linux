@@ -3299,6 +3299,14 @@ bool __weak bpf_jit_inlines_helper_call(s32 imm)
 	return false;
 }
 
+/* Write the native code of a kinsn call to @buf, see struct bpf_kinsn, for
+ * the JIT to copy. Return its length, or an error to keep the instructions.
+ */
+int __weak bpf_jit_emit_kinsn(const struct bpf_kinsn_region *r, u8 *buf)
+{
+	return -EOPNOTSUPP;
+}
+
 /* Return TRUE if the JIT backend supports mixing bpf2bpf and tailcalls. */
 bool __weak bpf_jit_supports_subprog_tailcalls(void)
 {
