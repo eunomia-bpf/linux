@@ -1,0 +1,215 @@
+From 9816c1da3fc09792aa8aef24cac3dbcba4ed22ee Mon Sep 17 00:00:00 2001
+From: Yusheng Zheng <yunwei356@gmail.com>
+Date: Tue, 20 Oct 2026 08:02:44 +0000
+Subject: [RFC PATCH bpf-next v2 1/6] bpf: Let JITs inline KF_FASTCALL kfuncs
+
+With the bpf_fastcall convention, LLVM keeps the registers R1-R5 that
+are not arguments live across a call by spilling them before the call
+and filling them after it. The verifier removes these spills and fills
+when the call does not clobber the registers. For kfuncs it does that
+for every KF_FASTCALL kfunc, which is right only because the two in the
+tree, bpf_cast_to_kern_ctx() and bpf_rdonly_cast(), are replaced by
+the verifier.
+
+Let the JIT inline KF_FASTCALL kfuncs too. bpf_add_kfunc_call() asks
+it with bpf_jit_inlines_kfunc_call() and sets BTF_FMODEL_JIT_INLINE in
+the func_model of the kfunc if it does. A call is then treated as
+bpf_fastcall only if the verifier or the JIT inlines it. Otherwise the
+spills and fills stay and the kfunc is called as before.
+
+The verifier also records which registers it removed the spills and
+fills of, and bpf_fastcall_spilled_regs() tells the JIT, so that it
+saves only the registers that are live after the call.
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/DM6P2S5E5F3M.3RB3ECL75G1PJ@gmail.com/
+---
+ include/linux/bpf.h          |  5 +++++
+ include/linux/bpf_verifier.h |  4 ++++
+ include/linux/filter.h       |  1 +
+ kernel/bpf/core.c            | 23 +++++++++++++++++++++++
+ kernel/bpf/verifier.c        | 26 +++++++++++++++++++++-----
+ 5 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index ff0436781293..5d37301ca1a7 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1257,6 +1257,9 @@ struct bpf_prog_offload {
+ /* The argument is nullable. */
+ #define BTF_FMODEL_NULLABLE_ARG		BIT(3)
+ 
++/* In ret_flags: the JIT inlines calls of this kfunc. */
++#define BTF_FMODEL_JIT_INLINE		BIT(4)
++
+ struct btf_func_model {
+ 	u8 ret_size;
+ 	u8 ret_flags;
+@@ -1696,6 +1699,8 @@ void bpf_jit_uncharge_modmem(u32 size);
+ bool bpf_prog_has_trampoline(const struct bpf_prog *prog);
+ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
+ 				 int insn_idx);
++u32 bpf_fastcall_spilled_regs(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
++			      int insn_idx);
+ u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog);
+ #else
+ static inline int bpf_trampoline_link_prog(struct bpf_tramp_node *node,
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 7baeb831281f..5171d31103b2 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -793,6 +793,10 @@ struct bpf_insn_aux_data {
+ 	 * bpf_fastcall pattern.
+ 	 */
+ 	u64 fastcall_spills_num:3;
++	/* for CALL instructions, the registers whose spill/fill pairs in the
++	 * bpf_fastcall pattern are removed and must survive the call.
++	 */
++	u64 fastcall_spilled_regs:6;
+ 	u64 arg_prog:4;
+ 	/*
+ 	 * What a load found, on any path: an __arena pointer member of a
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 904ac8613098..fff96a529b89 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1308,6 +1308,7 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
+ void bpf_jit_compile(struct bpf_prog *prog);
+ bool bpf_jit_needs_zext(void);
+ bool bpf_jit_inlines_helper_call(s32 imm);
++bool bpf_jit_inlines_kfunc_call(unsigned long addr, const struct btf_func_model *m);
+ bool bpf_jit_supports_subprog_tailcalls(void);
+ bool bpf_jit_supports_percpu_insn(void);
+ bool bpf_jit_supports_kfunc_call(void);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index e6593febbc35..46f88f9c4348 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1658,6 +1658,20 @@ bool bpf_insn_is_indirect_target(const struct bpf_verifier_env *env, const struc
+ 	return env->insn_aux_data[insn_idx].indirect_target;
+ }
+ 
++/*
++ * The caller saved registers that must survive a bpf_fastcall call that the
++ * JIT inlines: the ones whose spill/fill the verifier removed, or all of R1-R5
++ * without the verifier.
++ */
++u32 bpf_fastcall_spilled_regs(const struct bpf_verifier_env *env, const struct bpf_prog *prog,
++			      int insn_idx)
++{
++	if (!env)
++		return GENMASK(BPF_REG_5, BPF_REG_1);
++	insn_idx += prog->aux->subprog_start;
++	return env->insn_aux_data[insn_idx].fastcall_spilled_regs;
++}
++
+ u16 bpf_out_stack_arg_cnt(const struct bpf_verifier_env *env, const struct bpf_prog *prog)
+ {
+ 	const struct bpf_subprog_info *sub;
+@@ -3409,6 +3423,15 @@ bool __weak bpf_jit_inlines_helper_call(s32 imm)
+ 	return false;
+ }
+ 
++/* Return TRUE if the JIT backend inlines the KF_FASTCALL kfunc at @addr
++ * without clobbering registers that bpf_fastcall contract doesn't allow.
++ * Otherwise the kfunc is called and spills/fills around the call stay.
++ */
++bool __weak bpf_jit_inlines_kfunc_call(unsigned long addr, const struct btf_func_model *m)
++{
++	return false;
++}
++
+ /* Return TRUE if the JIT backend supports mixing bpf2bpf and tailcalls. */
+ bool __weak bpf_jit_supports_subprog_tailcalls(void)
+ {
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 1b6c0674ff6a..caf1e67fcfa0 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -3180,6 +3180,8 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
+ 	meta.func_proto = kfunc.proto;
+ 	meta.func_name = kfunc.name;
+ 	meta.kfunc_flags = kfunc.flags ? *kfunc.flags : 0;
++	if ((meta.kfunc_flags & KF_FASTCALL) && bpf_jit_inlines_kfunc_call(addr, &func_model))
++		func_model.ret_flags |= BTF_FMODEL_JIT_INLINE;
+ 
+ 	tab = krealloc(tab, struct_size(tab, descs, tab->nr_descs + 1), GFP_KERNEL_ACCOUNT);
+ 	if (!tab)
+@@ -19668,6 +19670,13 @@ bool bpf_verifier_inlines_helper_call(struct bpf_verifier_env *env, s32 imm)
+ 	}
+ }
+ 
++/* True if bpf_fixup_kfunc_call() replaces calls to the kfunc */
++static bool verifier_inlines_kfunc_call(u32 func_id)
++{
++	return func_id == special_kfunc_list[KF_bpf_cast_to_kern_ctx] ||
++	       func_id == special_kfunc_list[KF_bpf_rdonly_cast];
++}
++
+ /* If @call is a kfunc or helper call, fills @cs and returns true,
+  * otherwise returns false.
+  */
+@@ -19696,14 +19705,18 @@ bool bpf_get_call_summary(struct bpf_verifier_env *env, struct bpf_insn *call,
+ 	}
+ 
+ 	if (bpf_pseudo_kfunc_call(call)) {
++		struct bpf_kfunc_desc *desc;
+ 		int err;
+ 
+ 		err = bpf_fetch_kfunc_arg_meta(env, call->imm, call->off, &meta);
+ 		if (err < 0)
+ 			/* error would be reported later */
+ 			return false;
++		desc = find_kfunc_desc(env->prog, call->imm, call->off);
+ 		cs->arg_slot_cnt = btf_proto_slots(meta.btf, meta.func_proto);
+-		cs->fastcall = meta.kfunc_flags & KF_FASTCALL;
++		cs->fastcall = (meta.kfunc_flags & KF_FASTCALL) &&
++			       (verifier_inlines_kfunc_call(meta.func_id) ||
++				(desc && (desc->func_model.ret_flags & BTF_FMODEL_JIT_INLINE)));
+ 		cs->is_void = btf_type_is_void(btf_type_by_id(meta.btf, meta.func_proto->type));
+ 		return true;
+ 	}
+@@ -19798,6 +19811,7 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
+ 	u32 clobbered_regs_mask;
+ 	struct bpf_call_summary cs;
+ 	u32 expected_regs_mask;
++	u32 spilled_regs = 0;
+ 	s16 off;
+ 	int i;
+ 
+@@ -19851,6 +19865,7 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
+ 		if (stx->off != off || ldx->off != off)
+ 			break;
+ 		expected_regs_mask &= ~BIT(stx->src_reg);
++		spilled_regs |= BIT(stx->src_reg);
+ 		env->insn_aux_data[insn_idx - i].fastcall_pattern = 1;
+ 		env->insn_aux_data[insn_idx + i].fastcall_pattern = 1;
+ 	}
+@@ -19873,10 +19888,12 @@ static void mark_fastcall_pattern_for_call(struct bpf_verifier_env *env,
+ 	 * don't set 'fastcall_spills_num' for call B so that remove_fastcall_spills_fills()
+ 	 * does not remove spill/fill pair {4,6}.
+ 	 */
+-	if (cs.fastcall)
++	if (cs.fastcall) {
+ 		env->insn_aux_data[insn_idx].fastcall_spills_num = i - 1;
+-	else
++		env->insn_aux_data[insn_idx].fastcall_spilled_regs = spilled_regs;
++	} else {
+ 		subprog->keep_fastcall_stack = 1;
++	}
+ 	subprog->fastcall_stack_off = min(subprog->fastcall_stack_off, off);
+ }
+ 
+@@ -23541,8 +23558,7 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 
+ 		__fixup_collection_insert_kfunc(&env->insn_aux_data[insn_idx], struct_meta_reg,
+ 						node_offset_reg, insn, insn_buf, cnt);
+-	} else if (desc->func_id == special_kfunc_list[KF_bpf_cast_to_kern_ctx] ||
+-		   desc->func_id == special_kfunc_list[KF_bpf_rdonly_cast]) {
++	} else if (verifier_inlines_kfunc_call(desc->func_id)) {
+ 		insn_buf[0] = BPF_MOV64_REG(BPF_REG_0, BPF_REG_1);
+ 		*cnt = 1;
+ 	} else if (desc->func_id == special_kfunc_list[KF_bpf_session_is_return] &&
+-- 
+2.51.1
+

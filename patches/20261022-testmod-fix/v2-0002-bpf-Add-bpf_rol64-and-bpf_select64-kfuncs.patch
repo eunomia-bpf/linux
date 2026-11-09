@@ -1,0 +1,53 @@
+From 3430355df0a45ad674b15fc4d47fb9558822b8c3 Mon Sep 17 00:00:00 2001
+From: Yusheng Zheng <yunwei356@gmail.com>
+Date: Tue, 20 Oct 2026 08:02:44 +0000
+Subject: [RFC PATCH bpf-next v2 2/6] bpf: Add bpf_rol64() and bpf_select64()
+ kfuncs
+
+BPF has no rotate and no conditional select, so programs spell them out
+with shifts and or, and with branches. Add KF_FASTCALL kfuncs for both.
+A JIT that copies KF_FASTCALL kfuncs turns a call into the rotate or
+the conditional move that the compiler generated for them. Elsewhere
+they are calls.
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/DM6P2S5E5F3M.3RB3ECL75G1PJ@gmail.com/
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ kernel/bpf/helpers.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 648abe1ba63a..800a58d2bdc3 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -3386,6 +3386,16 @@ __bpf_kfunc void *bpf_rdonly_cast(const void *obj__ign, u32 btf_id__k)
+ 	return (void *)obj__ign;
+ }
+ 
++__bpf_kfunc u64 bpf_rol64(u64 x, u32 n)
++{
++	return rol64(x, n);
++}
++
++__bpf_kfunc u64 bpf_select64(u64 cond, u64 a, u64 b)
++{
++	return cond ? a : b;
++}
++
+ __bpf_kfunc void bpf_rcu_read_lock(void)
+ {
+ 	rcu_read_lock();
+@@ -5150,6 +5160,8 @@ BTF_ID(func, bpf_cgroup_release_dtor)
+ BTF_KFUNCS_START(common_btf_ids)
+ BTF_ID_FLAGS(func, bpf_cast_to_kern_ctx, KF_FASTCALL)
+ BTF_ID_FLAGS(func, bpf_rdonly_cast, KF_FASTCALL | KF_PERFMON)
++BTF_ID_FLAGS(func, bpf_rol64, KF_FASTCALL)
++BTF_ID_FLAGS(func, bpf_select64, KF_FASTCALL)
+ BTF_ID_FLAGS(func, bpf_rcu_read_lock)
+ BTF_ID_FLAGS(func, bpf_rcu_read_unlock)
+ BTF_ID_FLAGS(func, bpf_dynptr_slice, KF_RET_NULL)
+-- 
+2.51.1
+

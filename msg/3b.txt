@@ -1,0 +1,31 @@
+bpf, x86: Inline KF_FASTCALL kfuncs by copying them
+
+A small kfunc often compiles to a few moves and ALU instructions that
+take the arguments from rdi, rsi, rdx, rcx and r8, where the JIT keeps
+R1-R5, and leave the result in rax, where it keeps R0. Copy that code
+into the program instead of calling it. For bpf_rol64():
+
+  r1 = x                 movabs $x,%rdi
+  r2 = 8                 mov    $0x8,%esi
+  call bpf_rol64         mov    %rdi,%rax
+                         mov    %esi,%ecx
+                         rol    %cl,%rax
+
+emit_kfunc_inline() skips ENDBR and the ftrace site and decodes the
+kfunc up to 'ret' or the jump to the return thunk. It copies the code if
+it is at most 64 bytes long and has only moves, ALU operations, cmov,
+setcc and zero or sign extensions, without prefixes or rip-relative
+operands, and if no instruction has an exception table entry, whose
+fixup would not cover the copy. bpf_fastcall lets the code clobber R0
+and the arguments, and r10 and r11 are the JIT's temporaries. Of the
+other registers, the code may use r9 and those of R0-R5 that hold no
+argument; the ones that are live, R0 of a void kfunc and the registers
+whose spills and fills the verifier removed, are pushed and popped
+around it. Above, if R4 is live, rcx is pushed and popped.
+
+The code is read into a buffer once, then decoded and copied from
+there, so that a kprobe armed meanwhile cannot put an int3 into the
+program.
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/DM6P2S5E5F3M.3RB3ECL75G1PJ@gmail.com/

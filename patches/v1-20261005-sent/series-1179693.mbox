@@ -1,0 +1,3416 @@
+From patchwork Mon Oct  5 14:22:13 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868157
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wm2-f12.google.com (mail-wm2-f12.google.com
+ [74.125.225.140])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id BF9064A2A7D
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:34 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.140
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210160; cv=none;
+ b=NkQU/36wiBWqWncbiarctVwS9HwnCmpX3iWzSlQrrO2UXmSnS88dXi2Jb08AOqpK5EqJKFIoNzB8ytjsAJMeSKywMpZT8IzZ0MTU0uktOmGOd9wgl09ONKpn+/gGbB56ztAEE/x08oWBs8zCYe5vWXntII77qj590xVZZYhCpdM=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210160; c=relaxed/simple;
+	bh=N4XdGhWuHxNHH/DH5/s1/NTOoPGDS5vDWXrFZ1DW+1c=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=c82teaYui0PS/378CJUiuFdb7Kw3gYRSN9NsEXciLBd0//v4UUtuJ42hSyHnlw8PTLLUX/Ue7JfGcqvXbbKC5jrBnwmKBecu4jL5SJbJ/+wA6Yn9oGDb9V+oOiBcTVr4MKWO++XZksW6EWpsFtilisqMQjrQSMJ92jUGbmpnP8g=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=dK0auxcp; arc=none smtp.client-ip=74.125.225.140
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="dK0auxcp"
+Received: by mail-wm2-f12.google.com with SMTP id
+ 5b1f17b1804b1-4a01ff8c098so12280275e9.3
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:33 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210151; x=1791814951;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=OHnqMyBZA28OVgMK+xzMpR+Ee/alSC2HkxUl5T7L3m8=;
+        b=dK0auxcpBg7qJMnaNbaBXry+0X/lKFIhJurAJZCU1LJoYAuuyab7TWLPrx7WEsZoJX
+         6JxTlA9wrsFlPVzlZiS1WY3iqpgaNYxT1qoEC5w6+3M/6iabXrSQmIkIvcHqtSD/jMzd
+         07DajEam8glV4fa1tPTXFid3Oy01BHmBgDDhRwtXfwo0J5DOkvNGU2HiYl/f/mz0Sssh
+         cfrfttDyue9oLb1VtYD4LOWIASjJ1how2+pn0wY5HnexDN/hn7rMO7HdR3ZRpGow/poZ
+         bUBgi3IGo5lUhkLlKDMlV9sl3i0Vi2DFuqCZvUW4cWJjWEI7JjT473Mzglva1l96WUBo
+         utPQ==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210151; x=1791814951;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=OHnqMyBZA28OVgMK+xzMpR+Ee/alSC2HkxUl5T7L3m8=;
+        b=v9jFs+/FsDxxRTmYcH6auSdiKyIPBzPzjPxJyLKxp1Mzwmqb7raDM0uYZM7Lv3gNun
+         g0in/pvE3Omn1AfMmAX0SE240qiiO5stmilUlnouARzdnkzUyIUhvKSvKcGugoshDFCe
+         art+pVwK3uRH1H6Ps1fs5fGbT8shGO2xg12a9zixnI3i6Q8uGu6A6XhDFzrYZnjq30Ri
+         c0EnijIGqU/xfFnQSfLZ+jQsrwC3PWw0zXWv0GxMls/G0GGTbF71Jx3kxF5gNiaMIXrK
+         15W9NpTez3yk0PDEWQ3Yn9mb3WtycZO3wysEXgBeS2dq2i7cU/kIb63jcNYhos3wAbTq
+         mWvg==
+X-Gm-Message-State: AFuF++mRgdZMm3+ChPcHFZo/a3XHfgct41ULY3GoeIeJBo2ZYqvcRfnr
+	6QdQzeI92Igsq6JFcEbEXLUJXb5QjRjJ49T6W1msg/HSCasmn786Regf2hYvW9x+ZEV+1z8t
+X-Gm-Gg: AYBFou03Zg2Jzm1ESdLeo5fP/+sn583+I4JWL9wKBuRUTnDH8mfZn20R774pY9xSPNg
+	v8Ojec1HGsF8Xw59wgHEUd14GpMLlylBW9VmRE6+YHW/2HRc1JutNnGRCBAyfE4DdHIxNXBjd0i
+	VM+vpK9jYiOMFrHSm0ffbUrvgxRLQTV3lwo5ATPRZl147/+wzLYEDfqcM+WICql+zOjLW22CJIe
+	X0nBtjci9VJ2f5TFafoWYg/MxBN0RU8fW5Lg0LzX6QnNPcrF+6jaOA0P++f4KptnFGAozSFT5Yk
+	bCb9Fxwblpf7EijtRyZCN3HR2E1mx6//mn3JCipciedipp74BVzHgwE1TOxC1WZWKZSbjWt2mJU
+	x+taDjCnw+wgsK73CiqexLVVzJgNi9XLVxc/XQH1ar/uYZoqXlL+UVkDfPxkHwgRDj/ZhcMOonQ
+	jTawbi8pvXZ6TLB0FYwnuTmYhhWVEFaiBE+xNgbjQ0LsoMcqv+bckKhVZ5luod6RAxZIVIQr2hu
+	C/ckfowzNoPpxz8FoD2Vb62RfLZgghKBzPWor+gGmC4H7TdQms4BfOd9wIoAMvvDKOgPIASHEYp
+	a3BeRdJzAoXWfTuF7r3spr0mlqWvKIv4Z3p0oQ==
+X-Received: by 2002:a05:600c:a00f:b0:4a0:1a18:b742 with SMTP id
+ 5b1f17b1804b1-4a0274e9a97mr189541035e9.2.1791210142474;
+        Mon, 05 Oct 2026 07:22:22 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.21
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:21 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 1/7] bpf: Let kfunc sets give kfuncs a BPF body
+Date: Mon,  5 Oct 2026 07:22:13 -0700
+Message-ID: <20261005142219.33451-2-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+Let a kfunc set give some of its kfuncs a body: a few BPF instructions
+that compute the kfunc from its arguments in R1-R5 into R0. The
+following patches make the verifier check each call of such a kfunc as
+its body and the JIT inline native code for the call, so that small
+kfuncs such as a rotate can be used like instructions while the
+verifier knows what they compute.
+
+A kfunc set lists the bodies in .bodies and .body_cnt, next to its BTF
+ID set. A body may also have an emit callback that writes native code
+for a call, so that the native code of a kfunc comes with the kfunc and
+not from the JIT; a following patch makes the x86-64 JIT use it.
+Registration checks that each kfunc with a body is in the set and has
+no kfunc flags, that it takes each argument and returns its value in
+one register, with constant (__k) arguments in 32 bits, and that the
+body uses only R0-R5, ALU instructions, loads, stores and forward jumps
+that land within it, leaving out the cpu v4 instructions that not every
+JIT has. btf_find_kfunc_body() finds the body of a kfunc.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ include/linux/btf.h |  27 ++++++++++
+ kernel/bpf/btf.c    | 126 ++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 153 insertions(+)
+
+diff --git a/include/linux/btf.h b/include/linux/btf.h
+index 4b63bb91550a1..1e7e52e778d82 100644
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -120,10 +120,36 @@ struct bpf_prog;
+ 
+ typedef int (*btf_kfunc_filter_t)(const struct bpf_prog *prog, u32 kfunc_id);
+ 
++#define BPF_KFUNC_BODY_MAX_INSNS	32
++#define BPF_KFUNC_INLINE_MAX		128
++
++/*
++ * The body of a kfunc: len BPF instructions that compute the kfunc from its
++ * arguments in R1-R5 into R0. The verifier analyzes each call of the kfunc as
++ * the body, and the body runs in place of the call unless the JIT has native
++ * code for it, see kernel/bpf/kfunc_inline.c.
++ *
++ * emit, if set, writes native code for a call to buf, at most
++ * BPF_KFUNC_INLINE_MAX bytes, and returns its length, or an error if it has
++ * no code, for example because the CPU lacks a feature; the JIT then copies
++ * the compiled kfunc. reg[i] is the native register that the verifier bound
++ * Ri to, for R0-R5, and those of R1-R5 that are not arguments are free to
++ * use. imm[i] is the value of Ri if it is a constant (__k) argument. Like the
++ * rest of the JIT, native code is trusted to compute what the body computes.
++ */
++struct bpf_kfunc_body {
++	const u32 *id;
++	const struct bpf_insn *insns;
++	u32 len;
++	int (*emit)(const u8 *reg, const s32 *imm, u8 *buf);
++};
++
+ struct btf_kfunc_id_set {
+ 	struct module *owner;
+ 	struct btf_id_set8 *set;
+ 	btf_kfunc_filter_t filter;
++	const struct bpf_kfunc_body *bodies;
++	u32 body_cnt;
+ };
+ 
+ struct btf_id_dtor_kfunc {
+@@ -604,6 +630,7 @@ const char *btf_str_by_offset(const struct btf *btf, u32 offset);
+ struct btf *btf_parse_vmlinux(void);
+ struct btf *bpf_prog_get_target_btf(const struct bpf_prog *prog);
+ u32 *btf_kfunc_flags(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
++const struct bpf_kfunc_body *btf_find_kfunc_body(const struct btf *btf, u32 kfunc_btf_id);
+ int btf_kfunc_check_flag(const struct btf *btf, u32 kfunc_btf_id, u32 flag);
+ bool btf_kfunc_is_allowed(const struct btf *btf, u32 kfunc_btf_id, const struct bpf_prog *prog);
+ u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
+diff --git a/kernel/bpf/btf.c b/kernel/bpf/btf.c
+index 0630675377aaa..4b729d0367bb2 100644
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@ -246,6 +246,14 @@ struct btf_id_dtor_kfunc_tab {
+ 	struct btf_id_dtor_kfunc dtors[];
+ };
+ 
++struct btf_kfunc_body_tab {
++	u32 cnt;
++	struct {
++		u32 id;
++		const struct bpf_kfunc_body *body;
++	} bodies[];
++};
++
+ struct btf_struct_ops_tab {
+ 	u32 cnt;
+ 	u32 capacity;
+@@ -269,6 +277,7 @@ struct btf {
+ 	struct rcu_head rcu;
+ 	struct btf_kfunc_set_tab *kfunc_set_tab;
+ 	struct btf_id_dtor_kfunc_tab *dtor_kfunc_tab;
++	struct btf_kfunc_body_tab *kfunc_body_tab;
+ 	struct btf_struct_metas *struct_meta_tab;
+ 	struct btf_struct_ops_tab *struct_ops_tab;
+ 	struct btf_layout *layout;
+@@ -1883,6 +1892,7 @@ static void btf_free(struct btf *btf)
+ 	btf_free_struct_meta_tab(btf);
+ 	btf_free_dtor_kfunc_tab(btf);
+ 	btf_free_kfunc_set_tab(btf);
++	kfree(btf->kfunc_body_tab);
+ 	btf_free_struct_ops_tab(btf);
+ 	kvfree(btf->types);
+ 	kvfree(btf->resolved_sizes);
+@@ -9695,6 +9705,118 @@ u32 *btf_kfunc_is_modify_return(const struct btf *btf, u32 kfunc_btf_id,
+ 	return btf_kfunc_id_set_contains(btf, BTF_KFUNC_HOOK_FMODRET, kfunc_btf_id);
+ }
+ 
++const struct bpf_kfunc_body *btf_find_kfunc_body(const struct btf *btf, u32 kfunc_btf_id)
++{
++	const struct btf_kfunc_body_tab *tab = btf->kfunc_body_tab;
++	u32 i;
++
++	for (i = 0; tab && i < tab->cnt; i++)
++		if (tab->bodies[i].id == kfunc_btf_id)
++			return tab->bodies[i].body;
++	return NULL;
++}
++
++/* a scalar or a pointer of one register */
++static bool btf_kfunc_reg_type(const struct btf *btf, u32 id)
++{
++	const struct btf_type *t = btf_type_skip_modifiers(btf, id, NULL);
++
++	return btf_type_is_ptr(t) ||
++	       ((btf_type_is_int(t) || btf_is_any_enum(t)) && t->size <= sizeof(u64));
++}
++
++/*
++ * A kfunc with a body takes each argument in one of R1-R5, constant (__k)
++ * ones in 32 bits for native code, and returns in R0. Its body uses R0-R5,
++ * no instruction of cpu v4, which not every JIT has, and jumps only forward
++ * within it, so that it ends by falling through the last instruction. The
++ * verifier checks the rest.
++ */
++static bool btf_check_kfunc_body(const struct btf *btf, const struct btf_type *func,
++				 const struct bpf_kfunc_body *b)
++{
++	const struct btf_type *proto = btf_type_by_id(btf, func->type);
++	const struct btf_param *args = btf_params(proto);
++	int i, n = btf_type_vlen(proto), len = b->len;
++	const struct bpf_insn *insn;
++	u8 op;
++
++	if (n > MAX_BPF_FUNC_REG_ARGS || !b->insns || !len || len > BPF_KFUNC_BODY_MAX_INSNS ||
++	    (proto->type && !btf_kfunc_reg_type(btf, proto->type)))
++		return false;
++	for (i = 0; i < n; i++)
++		if (!btf_kfunc_reg_type(btf, args[i].type) ||
++		    (btf_param_match_suffix(btf, &args[i], "__k") &&
++		     btf_type_skip_modifiers(btf, args[i].type, NULL)->size > sizeof(s32)))
++			return false;
++	for (i = 0; i < len; i++) {
++		insn = &b->insns[i];
++		op = BPF_OP(insn->code);
++		if (insn->dst_reg > BPF_REG_5 || insn->src_reg > BPF_REG_5)
++			return false;
++		switch (BPF_CLASS(insn->code)) {
++		case BPF_ALU:
++		case BPF_ALU64:		/* not movsx, sdiv, smod or bswap */
++			if (insn->off || (BPF_CLASS(insn->code) == BPF_ALU64 && op == BPF_END))
++				return false;
++			break;
++		case BPF_LDX:
++		case BPF_ST:
++		case BPF_STX:		/* not ldsx or atomics */
++			if (BPF_MODE(insn->code) != BPF_MEM)
++				return false;
++			break;
++		case BPF_JMP:
++		case BPF_JMP32:		/* forward jumps within the body, not gotol */
++			if (op == BPF_CALL || op == BPF_EXIT || op == BPF_JCOND ||
++			    (op == BPF_JA && insn->code != (BPF_JMP | BPF_JA)) ||
++			    insn->off < 0 || insn->off >= len - i - 1)
++				return false;
++			break;
++		default:		/* not ld_imm64 */
++			return false;
++		}
++	}
++	return true;
++}
++
++static int btf_add_kfunc_bodies(struct btf *btf, const struct btf_kfunc_id_set *kset)
++{
++	u32 i, id, cnt = btf->kfunc_body_tab ? btf->kfunc_body_tab->cnt : 0;
++	struct btf_kfunc_body_tab *tab;
++	const struct bpf_kfunc_body *b;
++	const struct btf_type *t;
++	u32 *pair;
++
++	if (!kset->body_cnt)
++		return 0;
++	tab = krealloc(btf->kfunc_body_tab, struct_size(tab, bodies, cnt + kset->body_cnt),
++		       GFP_KERNEL | __GFP_NOWARN);
++	if (!tab)
++		return -ENOMEM;
++	tab->cnt = cnt;
++	btf->kfunc_body_tab = tab;
++	for (i = 0; i < kset->body_cnt; i++) {
++		b = &kset->bodies[i];
++		id = btf_relocate_id(btf, *b->id);
++		t = btf_type_by_id(btf, id);
++		pair = btf_id_set8_contains(kset->set, *b->id);
++		/* the body stands for the call, so no kfunc flags apply */
++		if (!pair || pair[1] || !t || !btf_type_is_func(t) ||
++		    !btf_check_kfunc_body(btf, t, b)) {
++			/* a set that fails to register leaves no bodies */
++			tab->cnt = cnt;
++			return -EINVAL;
++		}
++		/* a set registered for several hooks adds its bodies once */
++		if (!btf_find_kfunc_body(btf, id)) {
++			tab->bodies[tab->cnt].id = id;
++			tab->bodies[tab->cnt++].body = b;
++		}
++	}
++	return 0;
++}
++
+ static int __register_btf_kfunc_id_set(enum btf_kfunc_hook hook,
+ 				       const struct btf_kfunc_id_set *kset)
+ {
+@@ -9714,6 +9836,10 @@ static int __register_btf_kfunc_id_set(enum btf_kfunc_hook hook,
+ 			goto err_out;
+ 	}
+ 
++	ret = btf_add_kfunc_bodies(btf, kset);
++	if (ret)
++		goto err_out;
++
+ 	ret = btf_populate_kfunc_set(btf, hook, kset);
+ 
+ err_out:
+
+From patchwork Mon Oct  5 14:22:14 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868155
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wr2-f12.google.com (mail-wr2-f12.google.com
+ [74.125.225.76])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id 030714A3D2D
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:27 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.76
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210154; cv=none;
+ b=QrnjgUO5tcX4Cry4M1pVwxaVPD5/z7vdWcmpaeY3bYM6keeaykLThdNbakmXQuhzWfrA36xZ+mh20fsCVJ8k4nJ/5EsUgMekexuUVCes4cazSAszL+p4SmtSFNed7fz2ycghk0NqV21QRSN15XAhOT90obj4fy//f4NMhcMKEiU=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210154; c=relaxed/simple;
+	bh=qZS13CR+L1RvbKtViG3egj7ZBI6mDQm+zKiFck9xzY8=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=eTfIC6hXhOF1fLRS9rAHomrI8aqpNA/K73GXfCH9vD/idR4AA68HZVHxcabu8UaTTsdhJw8dq13zspiB8JK6kOH6u/8bDU4BOnkeZnIH3mO4S/JA+ft5W6XLbje3dohSGK95RntDzt9xeSE6i5I8N7u7c+i+8Shj7e614QCSH5M=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=mbfgZc/W; arc=none smtp.client-ip=74.125.225.76
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="mbfgZc/W"
+Received: by mail-wr2-f12.google.com with SMTP id
+ ffacd0b85a97d-482f635552aso1361158f8f.2
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:27 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210144; x=1791814944;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=c0A2P3uHeV0Wbx+Y2jeNEQ0NRpILN8oxk3ghUGfef5I=;
+        b=mbfgZc/WrTgzsrLaRUOjAPnGttzqC0r95oTjAgnuWegGIYn5YWYGd0frkwekwU+Udo
+         xGVIS/LEtWrwg7naIofpGAKrtAjMYlF9RAmYxKk6icby4/5RvJMll5jfNarw2RDz062v
+         NvSVNpGi56MlEkQPiY9amZIFbE1M03kSABa7Tx50fY8X15Awd9jl2H5kq4dPsMjak5Cu
+         OEEl2lMk7KADDJDmWApZaluDn4Yzs4BOZZzZvSlarjjFpnAQRSMryPlVBZHE1DgSywnQ
+         +gyLFew1crc5KxfldRvESycOxy+mLlhFSfWJnawYAa7W35JAMyhG8gt5tDQhkyg2/NiG
+         E8jw==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210144; x=1791814944;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=c0A2P3uHeV0Wbx+Y2jeNEQ0NRpILN8oxk3ghUGfef5I=;
+        b=YqS3nruJIMkxyGm9Yho8tGJTtNnHjEF2Zw1kWUPcBxHB09Zujx5LfklisZ5pz01q++
+         SIUqqZ7wEGinlHvDUtlZUySBBR8OmGEnWBL1d48kxv9WGF+WyYXmvFIvgS7mzvnw7VEr
+         hXTABMfC5gPQsMNBd8F78AlBM8Tj+SjHpgqiopznPaJbxWnqtOaYZPC0FSGGeSih9REE
+         lkUaF3wcy3qv1WdAuTmakHR3rSX1y/Uw2xU3iaD9BSdik5i4oDBZ/MNyjlHMelMo+Kr4
+         prN0Qi27W8nQjCUzvZ5SMwttkZZ2EIm4NaPlLT5R3HIr55j7CjiSlI0SbNB8/A17ORMW
+         rYTw==
+X-Gm-Message-State: AFq9FYIFT1wmbcIpLjAASBtowsG8t/nF/lGagStwcQZRSrw9aqcVyxrG
+	rDxqIur5DNpZtxgZ1boemQAKIu3EZEBIDTGy/fYnVOfrxm/25FDv5g3iT+0bFfBIokGn3mtG
+X-Gm-Gg: AYBFou2XDBbRKAFD6OFRhoP9vCASePzPrDjcrCY+f64YNnGS9cpeZcq1yw2zbMX9fy/
+	erD001RuWWMJpfXOae9tim84MR2soQfFct9gLwWDKPyfnIYyyORr4wzZSKMGBNjp6hTEExEVlvn
+	EjKvT76UrBEbWdOACXzMvpN1iP/fb8pE0m1KJaU2+qf6vdQm0RfrDaNqvBSpQB6tRekFoVe4Bez
+	ZW+2pCDOWj7fxJyPSwsWYzeOUoPSRcFnLBOsPsIqPWHaCA4YHlauQUlnF6GWnVdu3x0X8p14j1g
+	38u11N3AFC2BPhudOQ6jtgjIu44g/Jpti20+IxRBRpZfhyxzkSwmOxrMo8o8N+ssOqWQLX/WaPJ
+	E92N6LAV3Cmsu+vJ5mEDML2h6+cHqUHakbo4zJrmRZ+MAyv492vg+GFNDiyfmgzjWB0a2vj0DIO
+	IibKH0psLQ9gbdBpPL9HOSldmA4a8nvAyjxPE+9/W5jKnYzT8JCoddXFMa3KeJEsLpHP3QxGCfJ
+	tUB3zp+XvgcW+yiy/62E492DfXqrzSVlG1PfjpQ9HMnkphNfMshgE4QDOWLQJKiR+qkVsXCPqov
+	Lb7YoCSu6HgtieYvQjCC9VO6jup3OG5o+U9r2g==
+X-Received: by 2002:a05:6000:38d:b0:486:f856:1975 with SMTP id
+ ffacd0b85a97d-48b12729cc2mr19784943f8f.22.1791210143797;
+        Mon, 05 Oct 2026 07:22:23 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.22
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:23 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 2/7] bpf: Verify calls of kfuncs with a body
+ through the body
+Date: Mon,  5 Oct 2026 07:22:14 -0700
+Message-ID: <20261005142219.33451-3-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+Before the CFG check, replace each call of a kfunc that has a body with
+the body, using bpf_patch_insn_data() like the other inlining in the
+verifier, so that the verifier analyzes the result in the caller's
+context. The entry and exit of the body have the register effects of
+the call: only the arguments are readable at the entry, and R1-R5 are
+not readable after the exit. Constant folding takes R0-R5 as unknown
+after each instruction of the body. Constant (__k) arguments must be
+known at the entry; they are marked precise, and their values are kept
+for native code. A kfunc that the program may not call keeps its call,
+which check_kfunc_call() then rejects as before.
+
+After verification, restore a call if the JIT has native code for it,
+from bpf_jit_inline_kfunc(), and the verifier did not rewrite the body
+later: no constant blinding, speculation barriers, sanitation or arena
+conversion, and memory accesses only to the stack, map values, memory
+and packets, and only to the stack when the JIT adds KASAN checks.
+When liveness allows, the moves of arguments from R6-R9 right before
+the call and the move of the result to R6-R9 right after it are
+removed, and the native code uses those registers directly. The removed
+instructions become nops for bpf_opt_remove_nops(). Otherwise the body
+stays, so the program runs on every JIT.
+
+The new code is in kernel/bpf/kfunc_inline.c; verifier.c only calls it.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ include/linux/bpf_verifier.h |  34 +++++
+ include/linux/filter.h       |   2 +
+ kernel/bpf/Makefile          |   2 +-
+ kernel/bpf/const_fold.c      |   4 +
+ kernel/bpf/core.c            |   9 ++
+ kernel/bpf/kfunc_inline.c    | 273 +++++++++++++++++++++++++++++++++++
+ kernel/bpf/verifier.c        |  53 +++++--
+ 7 files changed, 360 insertions(+), 17 deletions(-)
+ create mode 100644 kernel/bpf/kfunc_inline.c
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index c51083c761cf2..571c8d4da3271 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -634,6 +634,7 @@ struct bpf_insn_aux_data {
+ 		enum bpf_reg_type ptr_type;	/* pointer type for load/store insns */
+ 		struct bpf_map_ptr_state map_ptr_state;
+ 		s32 call_imm;			/* saved imm field of call insn */
++		u32 kfunc_inline;		/* 1 + index into env->kfunc_inlines, at a call */
+ 		u32 alu_limit;			/* limit for add/sub register with pointer */
+ 		struct {
+ 			u32 map_index;		/* index into used_maps[] */
+@@ -683,6 +684,9 @@ struct bpf_insn_aux_data {
+ 	 */
+ 	u8 fastcall_spills_num:3;
+ 	u8 arg_prog:4;
++	/* insn belongs to the body of a kfunc call, see bpf_inline_kfunc_bodies() */
++	u8 kfunc_body:1;
++	u8 kfunc_body_entry:1;
+ 
+ 	/* below fields are initialized once */
+ 	unsigned int orig_idx; /* original instruction index */
+@@ -1083,6 +1087,8 @@ struct bpf_verifier_env {
+ 	u32 scc_cnt;
+ 	struct bpf_iarray *succ;
+ 	struct bpf_iarray *gotox_tmp_buf;
++	struct bpf_kfunc_inline *kfunc_inlines;
++	u32 kfunc_inline_cnt;
+ };
+ 
+ static inline struct bpf_func_info_aux *subprog_aux(struct bpf_verifier_env *env, int subprog)
+@@ -1794,14 +1800,42 @@ enum bpf_reg_arg_type {
+ #define MAX_KFUNC_CALL_DESCS (MAX_KFUNC_DESCS * 2)
+ static_assert(MAX_KFUNC_CALL_DESCS <= S16_MAX + 1);
+ 
++/* A call of a kfunc with a body, which the verifier replaced by the body */
++struct bpf_kfunc_inline {
++	struct bpf_insn call;
++	const struct bpf_kfunc_body *body;
++	unsigned long addr;		/* of the compiled kfunc */
++	u8 *image;			/* native code for the JIT */
++	u32 start;
++	/* the BPF registers that R0-R5 are bound to, and the constant arguments */
++	u8 reg[MAX_BPF_FUNC_REG_ARGS + 1];
++	s32 imm[MAX_BPF_FUNC_REG_ARGS + 1];
++	u8 image_len;
++	u8 nargs;
++	u8 imm_mask;	/* R1-R5 that hold constant (__k) arguments */
++	bool entered;	/* the verifier reached the body */
++	bool ret;	/* the kfunc returns a value */
++	bool copy;	/* the native code is a copy of the compiled kfunc */
++};
++
+ struct bpf_kfunc_desc {
+ 	struct btf_func_model func_model;
+ 	struct bpf_func_proto proto;
++	const struct bpf_kfunc_body *body;
+ 	u32 func_id;
+ 	u16 offset;
++	u8 body_imm;	/* R1-R5 that are constant (__k) arguments of the body */
+ 	unsigned long addr;
+ };
+ 
++struct bpf_kfunc_desc *bpf_find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset);
++int bpf_inline_kfunc_bodies(struct bpf_verifier_env *env);
++int bpf_mark_kfunc_body_regs(struct bpf_verifier_env *env, int prev_insn_idx,
++			     const struct bpf_insn_aux_data *aux);
++void bpf_restore_kfunc_calls(struct bpf_verifier_env *env);
++void bpf_free_kfunc_inlines(struct bpf_verifier_env *env);
++const struct bpf_kfunc_inline *bpf_kfunc_native(const struct bpf_verifier_env *env, int idx);
++
+ struct bpf_kfunc_desc_tab {
+ 	u32 nr_descs;
+ 	u32 nr_base_descs;
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 9339c6131f8ff..d93629eb40cd3 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1239,6 +1239,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_verifier_env *env, struct bpf_pr
+ void bpf_jit_compile(struct bpf_prog *prog);
+ bool bpf_jit_needs_zext(void);
+ bool bpf_jit_inlines_helper_call(s32 imm);
++struct bpf_kfunc_inline;
++int bpf_jit_inline_kfunc(const struct bpf_kfunc_inline *in, u8 *buf);
+ bool bpf_jit_supports_subprog_tailcalls(void);
+ bool bpf_jit_supports_percpu_insn(void);
+ bool bpf_jit_supports_kfunc_call(void);
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index c1f9b0d3468d3..ae3d04dae2d33 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -11,7 +11,7 @@ obj-$(CONFIG_BPF_SYSCALL) += bpf_iter.o map_iter.o task_iter.o prog_iter.o link_
+ obj-$(CONFIG_BPF_SYSCALL) += hashtab.o arraymap.o percpu_freelist.o bpf_lru_list.o lpm_trie.o map_in_map.o bloom_filter.o
+ obj-$(CONFIG_BPF_SYSCALL) += local_storage.o queue_stack_maps.o ringbuf.o bpf_insn_array.o
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_local_storage.o bpf_task_storage.o
+-obj-$(CONFIG_BPF_SYSCALL) += fixups.o cfg.o states.o backtrack.o check_btf.o
++obj-$(CONFIG_BPF_SYSCALL) += fixups.o cfg.o states.o backtrack.o check_btf.o kfunc_inline.o
+ obj-${CONFIG_BPF_LSM}	  += bpf_inode_storage.o
+ obj-$(CONFIG_BPF_SYSCALL) += disasm.o mprog.o
+ obj-$(CONFIG_BPF_JIT) += trampoline.o
+diff --git a/kernel/bpf/const_fold.c b/kernel/bpf/const_fold.c
+index b1528adbeb79d..8fa745e62e7ee 100644
+--- a/kernel/bpf/const_fold.c
++++ b/kernel/bpf/const_fold.c
+@@ -268,6 +268,10 @@ int bpf_compute_const_regs(struct bpf_verifier_env *env)
+ 		memcpy(ci_out, ci, sizeof(ci_out));
+ 
+ 		const_reg_xfer(env, ci_out, insn, insns, idx);
++		/* the body of a kfunc call leaves R0-R5 unknown, like the call */
++		if (insn_aux[idx].kfunc_body)
++			for (r = BPF_REG_0; r <= BPF_REG_5; r++)
++				ci_out[r] = unknown;
+ 
+ 		succ = bpf_insn_successors(env, idx);
+ 		for (int s = 0; s < succ->cnt; s++)
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 05c89396119ad..68665ea2499e9 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -3299,6 +3299,15 @@ bool __weak bpf_jit_inlines_helper_call(s32 imm)
+ 	return false;
+ }
+ 
++/* Write native code for an inlined kfunc call, see struct bpf_kfunc_inline,
++ * to @buf for the JIT to copy. Return its length, or an error to keep the
++ * body of the kfunc.
++ */
++int __weak bpf_jit_inline_kfunc(const struct bpf_kfunc_inline *in, u8 *buf)
++{
++	return -EOPNOTSUPP;
++}
++
+ /* Return TRUE if the JIT backend supports mixing bpf2bpf and tailcalls. */
+ bool __weak bpf_jit_supports_subprog_tailcalls(void)
+ {
+diff --git a/kernel/bpf/kfunc_inline.c b/kernel/bpf/kfunc_inline.c
+new file mode 100644
+index 0000000000000..daf92c3ad512c
+--- /dev/null
++++ b/kernel/bpf/kfunc_inline.c
+@@ -0,0 +1,273 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Calls of kfuncs that have a BPF body, see struct bpf_kfunc_body */
++#include <linux/bpf.h>
++#include <linux/bpf_verifier.h>
++#include <linux/filter.h>
++#include <linux/slab.h>
++
++#define verbose(env, fmt, args...) bpf_verifier_log_write(env, fmt, ##args)
++
++static struct bpf_kfunc_desc *body_desc(struct bpf_verifier_env *env,
++					const struct bpf_insn *insn)
++{
++	struct bpf_kfunc_desc *desc;
++
++	if (!bpf_pseudo_kfunc_call(insn))
++		return NULL;
++	desc = bpf_find_kfunc_desc(env->prog, insn->imm, insn->off);
++	return desc && desc->body ? desc : NULL;
++}
++
++/*
++ * Replace each call of a kfunc with a body by the body, so that the verifier
++ * analyzes the operation in the caller's context. The entry and exit of the
++ * body get the register effects of the call, see bpf_mark_kfunc_body_regs().
++ * After verification bpf_restore_kfunc_calls() puts the call back if the JIT
++ * has native code for it, and keeps the body otherwise.
++ */
++int bpf_inline_kfunc_bodies(struct bpf_verifier_env *env)
++{
++	struct bpf_kfunc_desc *desc;
++	struct bpf_kfunc_inline *r;
++	struct bpf_prog *prog;
++	u32 i, j, cnt = 0;
++
++	for (i = 0; i < env->prog->len; i++)
++		cnt += !!body_desc(env, &env->prog->insnsi[i]);
++	if (!cnt)
++		return 0;
++	env->kfunc_inlines = kvzalloc_objs(*env->kfunc_inlines, cnt, GFP_KERNEL_ACCOUNT);
++	if (!env->kfunc_inlines)
++		return -ENOMEM;
++
++	for (i = 0; i < env->prog->len; i++) {
++		desc = body_desc(env, &env->prog->insnsi[i]);
++		if (!desc)
++			continue;
++		r = &env->kfunc_inlines[env->kfunc_inline_cnt++];
++		r->call = env->prog->insnsi[i];
++		r->body = desc->body;
++		r->addr = desc->addr;
++		r->start = i;
++		r->nargs = desc->func_model.nr_args;
++		r->imm_mask = desc->body_imm;
++		r->ret = desc->func_model.ret_size;
++		prog = bpf_patch_insn_data(env, i, r->body->insns, r->body->len);
++		if (!prog)
++			return -ENOMEM;
++		env->prog = prog;
++		for (j = i; j < i + r->body->len; j++)
++			env->insn_aux_data[j].kfunc_body = 1;
++		env->insn_aux_data[i].kfunc_body_entry = 1;
++		i += r->body->len - 1;
++	}
++	return 0;
++}
++
++/*
++ * The body of a kfunc gets only the arguments of the call and leaves R1-R5
++ * like it. The constant (__k) arguments must be known, and native code may
++ * use their values.
++ */
++int bpf_mark_kfunc_body_regs(struct bpf_verifier_env *env, int prev_insn_idx,
++			     const struct bpf_insn_aux_data *aux)
++{
++	struct bpf_kfunc_inline *r = env->kfunc_inlines;
++	struct bpf_reg_state *regs = cur_regs(env);
++	u32 clobber = 0;
++	int i, err;
++
++	/* leaving the body */
++	if (prev_insn_idx >= 0 && env->insn_aux_data[prev_insn_idx].kfunc_body &&
++	    (!aux->kfunc_body || aux->kfunc_body_entry))
++		clobber |= GENMASK(BPF_REG_5, BPF_REG_1);
++	if (aux->kfunc_body_entry) {
++		while (r->start != env->insn_idx)
++			r++;
++		for (i = BPF_REG_1; i <= BPF_REG_5 && !env->cur_state->speculative; i++) {
++			if (!(r->imm_mask & BIT(i)))
++				continue;
++			if (regs[i].type != SCALAR_VALUE || !tnum_is_const(regs[i].var_off)) {
++				verbose(env, "R%d must be a known constant\n", i);
++				return -EINVAL;
++			}
++			err = mark_chain_precision(env, i);
++			if (err)
++				return err;
++			/* emitted code needs the same constants on every path */
++			if (r->entered && r->imm[i] != (s32)regs[i].var_off.value)
++				r->copy = true;
++			r->imm[i] = regs[i].var_off.value;
++		}
++		r->entered = true;
++		clobber |= BIT(BPF_REG_0) | (GENMASK(BPF_REG_5, BPF_REG_0) &
++					     ~GENMASK(r->nargs, BPF_REG_0));
++	}
++	for (i = BPF_REG_0; i <= BPF_REG_5; i++) {
++		if (!(clobber & BIT(i)))
++			continue;
++		bpf_mark_reg_not_init(env, &regs[i]);
++		mark_reg_scratched(env, i);
++	}
++	return 0;
++}
++
++/*
++ * Native code can replace the body of a kfunc call that the verifier reached
++ * and does not rewrite later: no speculation barriers, sanitation or arena
++ * conversion, and memory accesses only to memory that the JIT accesses as is.
++ */
++static bool kfunc_native_ok(struct bpf_verifier_env *env, const struct bpf_kfunc_inline *r)
++{
++	u32 i;
++
++	if (env->prog->blinding_requested || (r->imm_mask && !r->entered))
++		return false;
++	for (i = 0; i < r->body->len; i++) {
++		const struct bpf_insn_aux_data *aux = &env->insn_aux_data[r->start + i];
++		u8 class = BPF_CLASS(r->body->insns[i].code);
++
++		if (aux->nospec || aux->nospec_result || aux->alu_state || aux->needs_zext ||
++		    aux->arena_scalar)
++			return false;
++		if (class != BPF_LDX && class != BPF_STX && class != BPF_ST)
++			continue;
++		if (type_flag(aux->ptr_type) & ~MEM_RDONLY)
++			return false;
++		switch (base_type(aux->ptr_type)) {
++		case PTR_TO_STACK:
++			break;
++		case PTR_TO_MAP_VALUE:
++		case PTR_TO_MEM:
++		case PTR_TO_PACKET:
++		case PTR_TO_PACKET_META:
++			/* the JIT checks these accesses with KASAN, native code does not */
++			if (IS_ENABLED(CONFIG_BPF_JIT_KASAN))
++				return false;
++			break;
++		default:
++			return false;
++		}
++	}
++	return true;
++}
++
++/*
++ * Bind the operands of a kfunc call in r->reg and return the moves that this
++ * makes unnecessary in @drop:
++ * - an argument copied from R6-R9 by a 64-bit move right before the call is
++ *   used in place if that register is dead after the call;
++ * - emitted native code has the constant arguments as immediates;
++ * - the result goes straight to its R6-R9 destination.
++ * No jump may land between such a move and the call. Only emitted code may
++ * share the result register with an argument.
++ */
++static int kfunc_bind(struct bpf_verifier_env *env, struct bpf_kfunc_inline *r, u32 *drop)
++{
++	struct bpf_insn_aux_data *aux = env->insn_aux_data;
++	struct bpf_insn *insns = env->prog->insnsi, *mov;
++	u32 end = r->start + r->body->len, i;
++	bool emit = !r->copy;
++	u16 used = 0, written = 0;
++	u8 dst, src;
++	int n = 0;
++
++	for (i = 0; i <= MAX_BPF_FUNC_REG_ARGS; i++)
++		r->reg[i] = i;
++
++	/* walk back over moves into R1-R5 that do not read R0-R5 */
++	for (i = r->start; i-- > 0 && !bpf_is_jump_target(env, i + 1);) {
++		mov = &insns[i];
++		dst = mov->dst_reg;
++		src = mov->src_reg;
++		if ((BPF_CLASS(mov->code) != BPF_ALU64 && BPF_CLASS(mov->code) != BPF_ALU) ||
++		    BPF_OP(mov->code) != BPF_MOV || dst < BPF_REG_1 || dst > BPF_REG_5 ||
++		    aux[i].kfunc_body ||
++		    (BPF_SRC(mov->code) == BPF_X && (src < BPF_REG_6 || src > BPF_REG_9)))
++			break;
++		if (dst <= r->nargs && !(written & BIT(dst)) && !mov->off) {
++			if (BPF_SRC(mov->code) == BPF_K && (r->imm_mask & BIT(dst)) && emit) {
++				drop[n++] = i;
++			} else if (mov->code == (BPF_ALU64 | BPF_MOV | BPF_X) &&
++				   !(used & BIT(src)) &&
++				   !(aux[end].live_regs_before & BIT(src))) {
++				r->reg[dst] = src;
++				used |= BIT(src);
++				drop[n++] = i;
++			}
++		}
++		written |= BIT(dst);
++	}
++
++	mov = &insns[end];
++	dst = mov->dst_reg;
++	/* the result register must be live so that the JIT saves it */
++	if (r->ret && !bpf_is_jump_target(env, end) && end + 1 < env->prog->len &&
++	    mov->code == (BPF_ALU64 | BPF_MOV | BPF_X) && !mov->off &&
++	    mov->src_reg == BPF_REG_0 && dst >= BPF_REG_6 && dst <= BPF_REG_9 &&
++	    (emit || !(used & BIT(dst))) &&
++	    (aux[end + 1].live_regs_before & BIT(dst)) &&
++	    !(aux[end + 1].live_regs_before & BIT(BPF_REG_0))) {
++		r->reg[BPF_REG_0] = dst;
++		drop[n++] = end;
++	}
++	return n;
++}
++
++/*
++ * Put back the calls that the JIT has native code for: the code from the
++ * kfunc's emit callback, or else a copy of the compiled kfunc. The rest of
++ * the body and the moves that binding makes unnecessary become nops, which
++ * bpf_opt_remove_nops() removes. Other calls keep their body.
++ */
++void bpf_restore_kfunc_calls(struct bpf_verifier_env *env)
++{
++	struct bpf_insn *insns = env->prog->insnsi;
++	u32 drop[MAX_BPF_FUNC_REG_ARGS + 1];
++	u8 code[BPF_KFUNC_INLINE_MAX];
++	int i, j, n, len;
++
++	for (i = 0; i < env->kfunc_inline_cnt; i++) {
++		struct bpf_kfunc_inline *r = &env->kfunc_inlines[i];
++
++		if (!kfunc_native_ok(env, r))
++			continue;
++		n = kfunc_bind(env, r, drop);
++		len = bpf_jit_inline_kfunc(r, code);
++		if (len <= 0 && !r->copy) {
++			r->copy = true;
++			n = kfunc_bind(env, r, drop);
++			len = bpf_jit_inline_kfunc(r, code);
++		}
++		r->image = len > 0 ? kmemdup(code, len, GFP_KERNEL_ACCOUNT) : NULL;
++		if (!r->image)
++			continue;
++		r->image_len = len;
++		for (j = 0; j < n; j++)
++			insns[drop[j]] = BPF_JMP_A(0);
++		insns[r->start] = r->call;
++		for (j = r->start + 1; j < r->start + r->body->len; j++)
++			insns[j] = BPF_JMP_A(0);
++		env->insn_aux_data[r->start].kfunc_inline = i + 1;
++	}
++}
++
++/* The inlined kfunc call at @idx, if the JIT puts native code there */
++const struct bpf_kfunc_inline *bpf_kfunc_native(const struct bpf_verifier_env *env, int idx)
++{
++	u32 i = env && env->insn_aux_data[idx].kfunc_body_entry ?
++		env->insn_aux_data[idx].kfunc_inline : 0;
++
++	if (!i || i > env->kfunc_inline_cnt || !env->kfunc_inlines[i - 1].image)
++		return NULL;
++	return &env->kfunc_inlines[i - 1];
++}
++
++void bpf_free_kfunc_inlines(struct bpf_verifier_env *env)
++{
++	u32 i;
++
++	for (i = 0; i < env->kfunc_inline_cnt; i++)
++		kfree(env->kfunc_inlines[i].image);
++	kvfree(env->kfunc_inlines);
++}
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index fd3c0206bd67d..2f58794784100 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -2569,8 +2569,8 @@ static int kfunc_btf_cmp_by_off(const void *a, const void *b)
+ 	return d0->offset - d1->offset;
+ }
+ 
+-static struct bpf_kfunc_desc *
+-find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
++struct bpf_kfunc_desc *
++bpf_find_kfunc_desc(const struct bpf_prog *prog, u32 func_id, u16 offset)
+ {
+ 	struct bpf_kfunc_desc desc = {
+ 		.func_id = func_id,
+@@ -2877,10 +2877,11 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
+ 	struct btf_func_model func_model;
+ 	struct bpf_kfunc_desc_tab *tab;
+ 	struct bpf_prog_aux *prog_aux;
++	const struct bpf_kfunc_body *body;
+ 	struct bpf_kfunc_meta kfunc;
+ 	struct bpf_kfunc_desc *desc;
+ 	unsigned long addr;
+-	int err;
++	int err, i;
+ 
+ 	prog_aux = env->prog->aux;
+ 	tab = prog_aux->kfunc_tab;
+@@ -2930,7 +2931,7 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
+ 		prog_aux->kfunc_btf_tab = btf_tab;
+ 	}
+ 
+-	if (find_kfunc_desc(env->prog, func_id, offset))
++	if (bpf_find_kfunc_desc(env->prog, func_id, offset))
+ 		return 0;
+ 
+ 	if (tab->nr_base_descs == MAX_KFUNC_DESCS) {
+@@ -2990,7 +2991,10 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
+ 	desc = &tab->descs[tab->nr_descs];
+ 	memset(desc, 0, sizeof(*desc));
+ 
+-	err = gen_kfunc_arg_proto(env, &meta, &func_model, &desc->proto);
++	/* the body of a kfunc that the program may call checks its arguments */
++	body = kfunc.flags && btf_kfunc_is_allowed(kfunc.btf, func_id, env->prog) ?
++	       btf_find_kfunc_body(kfunc.btf, func_id) : NULL;
++	err = body ? 0 : gen_kfunc_arg_proto(env, &meta, &func_model, &desc->proto);
+ 	if (err)
+ 		return err;
+ 
+@@ -2998,6 +3002,10 @@ int bpf_add_kfunc_call(struct bpf_verifier_env *env, u32 func_id, u16 offset)
+ 	desc->offset = offset;
+ 	desc->addr = addr;
+ 	desc->func_model = func_model;
++	desc->body = body;
++	for (i = 0; body && i < func_model.nr_args; i++)
++		if (btf_param_match_suffix(kfunc.btf, &btf_params(kfunc.proto)[i], "__k"))
++			desc->body_imm |= BIT(BPF_REG_1 + i);
+ 	tab->nr_descs++;
+ 	tab->nr_base_descs++;
+ 	sort(tab->descs, tab->nr_base_descs, sizeof(tab->descs[0]),
+@@ -14762,7 +14770,7 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 	func_name = meta.func_name;
+ 	insn_aux = &env->insn_aux_data[insn_idx];
+ 
+-	desc = find_kfunc_desc(env->prog, insn->imm, insn->off);
++	desc = bpf_find_kfunc_desc(env->prog, insn->imm, insn->off);
+ 	if (!desc) {
+ 		verifier_bug(env, "kfunc descriptor not found for func_id %u", insn->imm);
+ 		return -EFAULT;
+@@ -19527,6 +19535,9 @@ static int do_check(struct bpf_verifier_env *env)
+ 
+ 		state->last_insn_idx = env->prev_insn_idx;
+ 		state->insn_idx = env->insn_idx;
++		err = bpf_mark_kfunc_body_regs(env, prev_insn_idx, insn_aux);
++		if (err)
++			return err;
+ 		/*
+ 		 * Record the incoming edge so active and queued paths use the same
+ 		 * branch-recording path. A zero-offset conditional has identical
+@@ -22180,7 +22191,7 @@ int bpf_fixup_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 	 * __bpf_call_base, unless the JIT needs to call functions that are
+ 	 * further than 32 bits away (bpf_jit_supports_far_kfunc_call()).
+ 	 */
+-	desc = find_kfunc_desc(env->prog, insn->imm, insn->off);
++	desc = bpf_find_kfunc_desc(env->prog, insn->imm, insn->off);
+ 	if (!desc) {
+ 		verifier_bug(env, "kernel function descriptor not found for func_id %u",
+ 			     insn->imm);
+@@ -22655,15 +22666,6 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
+ 	env->test_reg_invariants = attr->prog_flags & BPF_F_TEST_REG_INVARIANTS;
+ 	env->arena_scalar = attr->prog_flags & BPF_F_ARENA_SCALAR;
+ 
+-	env->explored_states = kvzalloc_objs(struct list_head,
+-					     state_htab_size(env),
+-					     GFP_KERNEL_ACCOUNT);
+-	ret = -ENOMEM;
+-	if (!env->explored_states)
+-		goto skip_full_check;
+-
+-	for (i = 0; i < state_htab_size(env); i++)
+-		INIT_LIST_HEAD(&env->explored_states[i]);
+ 	INIT_LIST_HEAD(&env->free_list);
+ 
+ 	/* Prepare BTF and func_info needed to discover all subprograms. */
+@@ -22707,6 +22709,21 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
+ 	if (ret < 0)
+ 		goto skip_full_check;
+ 
++	ret = bpf_inline_kfunc_bodies(env);
++	if (ret < 0)
++		goto skip_full_check;
++
++	/* sized by the program length, so after the lowering */
++	env->explored_states = kvzalloc_objs(struct list_head,
++					     state_htab_size(env),
++					     GFP_KERNEL_ACCOUNT);
++	ret = -ENOMEM;
++	if (!env->explored_states)
++		goto skip_full_check;
++
++	for (i = 0; i < state_htab_size(env); i++)
++		INIT_LIST_HEAD(&env->explored_states[i]);
++
+ 	if (bpf_prog_is_offloaded(env->prog->aux)) {
+ 		ret = bpf_prog_offload_verifier_prep(env->prog);
+ 		if (ret)
+@@ -22771,6 +22788,9 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
+ skip_full_check:
+ 	kvfree(env->explored_states);
+ 
++	if (ret == 0)
++		bpf_restore_kfunc_calls(env);
++
+ 	/* might decrease stack depth, keep it before passes that
+ 	 * allocate additional slots.
+ 	 */
+@@ -22900,6 +22920,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr,
+ err_free_env:
+ 	bpf_free_subprog_jts(env);
+ 	vfree(env->insn_aux_data);
++	bpf_free_kfunc_inlines(env);
+ 	kvfree(env->fd_array);
+ 	bpf_stack_liveness_free(env);
+ 	kvfree(env->cfg.insn_postorder);
+
+From patchwork Mon Oct  5 14:22:15 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868154
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wm2-f12.google.com (mail-wm2-f12.google.com
+ [74.125.225.140])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id A5E0E4A2058
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:28 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.140
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210154; cv=none;
+ b=sgznFdjaqnvQk3JM9vBshEfr15NCJ8kimnphIZLWo5AxnoEd+HnBjLkFuREnG0VlkZiupgXNq0FCP9m2dJzz6gVdxoCRlCNFV+rukG1l9oxKd2dflVzwMOYG9LnXFdAy67VTshLbtHVsS1Fn2Ol1Rl/HIQQkMoTU3ghdr3NJGAA=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210154; c=relaxed/simple;
+	bh=HGySkkqkcUB5ZsEbCbFXGPiIwtoi51qtiiXjK4UZ22c=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=X53qxL4LhyICteW/QNyi5mCI++xtAad6WeLasv3BGjNZaJUS5n+yAEervAfaOEvaT4uP/1AekVgrbgCgalBi6pYPbs7qPo6PFg/ZmLwfnvMpfqOx7s5rmR6bFJA+zKZhCv29K7cTlw/O+13zGEGBUQLf0MnE6a1k9SG+u4tYvwo=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=aicL9xN3; arc=none smtp.client-ip=74.125.225.140
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="aicL9xN3"
+Received: by mail-wm2-f12.google.com with SMTP id
+ 5b1f17b1804b1-49fff72474fso12930045e9.3
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:28 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210145; x=1791814945;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=vcd5l84Bv4wvuYRs0EIOYmiHfU0ix2FZOVrqGnFtaW0=;
+        b=aicL9xN3RPQUzHAq0SQkLNvIrhbqTkMVuS+El9QtWzxVX2SbBKXXZMgsKHzdM2lLzi
+         uGKx8iLvXZ+VpH7okN7EnE2bnc64FjRK8JL/KvhGBFVTz5zdeS/4UftH+Lg1axZrnkjc
+         j6Xyhhl3K3pkf8GKEHnBpePa1qPnUDgAxjeF/oHwMcMQWCid3zwe+eR4u76B3UQ4UVrd
+         uTZ9CumXO9fjBPHZp2pjDqpVKD+wv5wf+bPKfNuTh4Cn3dBkmVXAqcKyY6gFS7VBJbFM
+         pM+yqzplxp1Ns4O/zDbw8hoGu19BYFFwXB7uVeng6eLfX2n6tSb2NdW3Zzyoulsrn/lk
+         9ZvA==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210145; x=1791814945;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=vcd5l84Bv4wvuYRs0EIOYmiHfU0ix2FZOVrqGnFtaW0=;
+        b=sZ15xfz1rTRNFs30x5KpnENBzqdhHIaU48EA/gsSPgS5UbxELeVa9/hBQI80QhluyT
+         uc89AGMGUuRsZl/yB52u9PUTl1y6po8BQbZLNpXs+p7Rg9W7NRMPBkNWIrss0oS8wVgO
+         uEpTDuPiTPHPg2kX6jPVFu3AUokLMjDCtxZLCBkOUzMOVpr52rpm5yHv5HcQR38SVvFu
+         DDOl27aUw2Z2F7r9fxBu9ad0o1jPQr4smCDXJ6aQawtr31WcovGFPyHk2Vx3PZFxL/8A
+         05POxHQ+Ab2WUfnnMA/P6Vl0Tl8l0xAc3So32Qg3ByVHkgT40OuPsBAnocad+zAiZs99
+         Jscw==
+X-Gm-Message-State: AFuF++n1ByjuNb5/jEBxTYR1AMBTugqNKHcSSOD37ZTM0YrCwbEY2bMn
+	KcL0TQALLn7TqEHQnDnJaRSAEVq70xLyCpCUPxUeJP8WQzxc62GBOc1GVj9l5u3PuV1cOsOC
+X-Gm-Gg: AYBFou3MUlBdPxseX2pX4OJ7wYoDrIh/hzz/0PmcQrt124ry+6Bd/2jso3l1XWZNWtE
+	my9AhkWESR7Wi8LA4o2mxG78qf+DGs0lJdbba+YEsxdbuHEVrXL+MuKbCfYEBoy2cbOAb67YRC+
+	FoqyMv2JuVcvg2sOM1s5h4BMWjG9fEDIjl1YA+EDgdOgQVtUU9LIUc0k/oVnTxfRNq2n2mxEPe8
+	AM9yTwa1pOcX8w9p5DsjmVuzO2B3RLFyhiAdSbVthoYAHGP4N5XkmW9kOjJYL/KNc8soQmo66vQ
+	NxQZGv/B5ZS1wdzOnGW3aDAQyxUBauS06Rzgmu8N79OMtVLUXx/bui+fZM3c5KkoG+m5rT0sfPH
+	tNog6UiV3iuRMl8AXzMEb/gTZX1v9BxhED+PTKO8EO64dS8xIeGxcV8KjXfdTjSsagM1LSHO1kv
+	Grj1nb5Z5sh/3mCfzLIBQ5/NYSrtcJyMFfhCMOS52b5pKGS2is3Em7Vt/qHtvMNVMgt5ZuLhBdy
+	7Dweu0L3T2ABDvJXZNweeA+U6qd34/ZVSuUMok45oS6irqQFRVH6DP5jEiFN8WE/d8qBD3ukEDj
+	UVDgvZKza3TuAV2JXL0O58V/gj2XL4ImWhYcPw==
+X-Received: by 2002:a05:600c:3510:b0:49f:ff32:803c with SMTP id
+ 5b1f17b1804b1-4a02758653cmr173182795e9.16.1791210145095;
+        Mon, 05 Oct 2026 07:22:25 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.24
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:24 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 3/7] bpf,
+ x86: Inline native code for kfuncs that have a body
+Date: Mon,  5 Oct 2026 07:22:15 -0700
+Message-ID: <20261005142219.33451-4-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+Implement bpf_jit_inline_kfunc() for x86-64. The native code for a call
+comes from the emit callback of the kfunc's body, which gets the x86
+registers that the operands are bound to and the values of the constant
+arguments. Without a callback, when it returns an error, or when the
+constant arguments differ between paths, the JIT copies the code that
+the compiler produced for the kfunc, as was suggested for the bitops
+kfuncs [1], with the registers of R0-R5 renamed. Only straight-line
+moves, ALU instructions, cmovcc, bswap, prefetch and lea up to the
+return are copied: no control flow, rip-relative addressing or
+division, no registers but those of R0-R5, r10 and r11, and no implicit
+operand, such as %rax in "and $imm, %eax", in a renamed register.
+Otherwise the body stays. Copying needs the instruction decoder.
+
+The JIT has no code for any particular kfunc.
+
+[1] https://lore.kernel.org/bpf/CAADnVQLNmQGKf5S5ZNwHYzScYBhnWFmnzLg=5Xxy4SgYKE3EfQ@mail.gmail.com/
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ arch/x86/net/bpf_jit_comp.c | 181 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 181 insertions(+)
+
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index 083fcd6cf15b7..6a57109caa97a 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -15,8 +15,12 @@
+ #include <linux/memory.h>
+ #include <linux/sort.h>
+ #include <linux/execmem.h>
++#include <linux/kallsyms.h>
++#include <linux/uaccess.h>
+ #include <asm/extable.h>
+ #include <asm/ftrace.h>
++#include <asm/insn.h>
++#include <asm/insn-eval.h>
+ #include <asm/set_memory.h>
+ #include <asm/nospec-branch.h>
+ #include <asm/text-patching.h>
+@@ -2000,6 +2004,174 @@ static int emit_kfunc_arena_args(struct bpf_prog *bpf_prog,
+ 	return prog - start;
+ }
+ 
++/*
++ * Registers that copied kfunc code may use: those of R0-R5, which hold the
++ * arguments and the result as for a call, and the scratch registers r10 and
++ * r11. r9 can hold the private frame pointer.
++ */
++#define KFUNC_COPY_REGS	(BIT(0) | BIT(1) | BIT(2) | BIT(6) | BIT(7) | BIT(8) | \
++			 BIT(10) | BIT(11))
++
++/*
++ * Write an instruction of a compiled kfunc with the registers of R0-R5
++ * renamed by @map to those that the verifier bound them to. It must be a
++ * move, ALU or address computation without control flow, prefixes other than
++ * operand size, rip-relative addressing or registers other than
++ * KFUNC_COPY_REGS, and no division, which can trap.
++ */
++static u8 *kfunc_copy_insn(u8 *p, const struct insn *insn, const u8 *c, const u8 *map)
++{
++	u8 op = insn->opcode.bytes[insn->opcode.nbytes - 1], rex = insn->rex_prefix.bytes[0];
++	u8 modrm = insn->modrm.value, sib = insn->sib.value, ext = X86_MODRM_REG(modrm);
++	u8 mod = X86_MODRM_MOD(modrm), reg = ext, rm = 0, idx = 4;
++	bool two = insn->opcode.nbytes == 2, group, opreg, disp8, implicit;
++	u16 regs = 0;
++	int head;
++
++	if (insn->vex_prefix.nbytes || insn->opcode.nbytes > 2 || insn->prefixes.nbytes > 1 ||
++	    (insn->prefixes.nbytes && insn->prefixes.bytes[0] != 0x66))
++		return NULL;
++	if (two) {
++		/* cmovcc, imul, movzx/movsx of words, bswap, prefetch */
++		group = op == 0x18;
++		if ((op & 0xf0) != 0x40 && op != 0xaf && op != 0xb7 && op != 0xbf &&
++		    (op & 0xf8) != 0xc8 && !(group && ext < 4))
++			return NULL;
++	} else {
++		/* add, or, and, sub, xor, cmp, mov, lea, test, imul, shifts, not, neg, mul */
++		group = op == 0x81 || op == 0x83 || op == 0xc1 || op == 0xc7 ||
++			op == 0xd1 || op == 0xd3 || op == 0xf7;
++		if (!(op < 0x40 && (op & 0xf0) != 0x10 && (op & 7) % 2 && (op & 7) < 6) &&
++		    op != 0x63 && op != 0x69 && op != 0x6b && op != 0x85 && op != 0x89 &&
++		    op != 0x8b && op != 0x8d && op != 0x98 && op != 0x99 && op != 0xa9 &&
++		    (op & 0xf8) != 0xb8 &&
++		    !(group && op != 0xc7 && op != 0xf7 && ext != 2 && ext != 3) &&
++		    !(op == 0xc7 && !ext) && !(op == 0xf7 && ext != 1 && ext < 6))
++			return NULL;
++	}
++
++	/* uses %rax, %rcx or %rdx without naming it, as in "and $imm, %eax" */
++	implicit = !two && ((op < 0x40 && (op & 7) == 5) || op == 0x98 || op == 0x99 ||
++			    op == 0xa9 || op == 0xd3 || (op == 0xf7 && (ext == 4 || ext == 5)));
++
++	opreg = (op & 0xf8) == (two ? 0xc8 : 0xb8);
++	if (opreg)
++		rm = (op & 7) + (X86_REX_B(rex) ? 8 : 0);
++	if (insn->modrm.nbytes) {
++		reg = group ? ext : ext + (X86_REX_R(rex) ? 8 : 0);
++		rm = (insn->sib.nbytes ? X86_SIB_BASE(sib) : X86_MODRM_RM(modrm)) +
++		     (X86_REX_B(rex) ? 8 : 0);
++		if (insn->sib.nbytes)
++			idx = X86_SIB_INDEX(sib) + (X86_REX_X(rex) ? 8 : 0);
++		/* rip-relative or absolute */
++		if (!mod && (rm & 7) == 5)
++			return NULL;
++		regs = (group ? 0 : BIT(reg)) | (idx != 4 ? BIT(idx) : 0);
++	}
++	if ((regs | (opreg || insn->modrm.nbytes ? BIT(rm) : 0)) & ~KFUNC_COPY_REGS)
++		return NULL;
++	/* which cannot be renamed, so they must hold their operands as for a call */
++	if (implicit && (map[0] != 0 || map[1] != 1 || map[2] != 2))
++		return NULL;
++
++	/* the instruction again, with the registers renamed */
++	if (!group)
++		reg = map[reg];
++	rm = map[rm];
++	idx = idx != 4 ? map[idx] : 4;
++	if (insn->prefixes.nbytes)
++		*p++ = 0x66;
++	rex = 0x40 | X86_REX_W(rex) | (reg & 8 ? 4 : 0) | (idx & 8 ? 2 : 0) | (rm & 8 ? 1 : 0);
++	if (rex != 0x40)
++		*p++ = rex;
++	if (two)
++		*p++ = 0x0f;
++	*p++ = opreg ? (op & 0xf8) | (rm & 7) : op;
++	if (insn->modrm.nbytes) {
++		/* a base of r13 needs a displacement */
++		disp8 = !mod && (rm & 7) == 5;
++		*p++ = (disp8 ? 1 : mod) << 6 | (reg & 7) << 3 | (insn->sib.nbytes ? 4 : rm & 7);
++		if (insn->sib.nbytes)
++			*p++ = (sib & 0xc0) | (idx & 7) << 3 | (rm & 7);
++		if (disp8)
++			*p++ = 0;
++	}
++	head = insn->prefixes.nbytes + insn->rex_prefix.nbytes + insn->opcode.nbytes +
++	       insn->modrm.nbytes + insn->sib.nbytes;
++	memcpy(p, c + head, insn->length - head);
++	return p + insn->length - head;
++}
++
++/*
++ * Copy the compiled kfunc of an inlined call up to its return, without the
++ * ENDBR and NOPs at its entry, with the operands renamed by @map.
++ */
++static int kfunc_copy(const struct bpf_kfunc_inline *in, const u8 *map, u8 *buf)
++{
++	u8 code[BPF_KFUNC_INLINE_MAX + MAX_INSN_SIZE], *c, *p = buf;
++	unsigned long size, off, ret;
++	struct insn insn;
++	int pos;
++
++	if (!kallsyms_lookup_size_offset(in->addr, &size, &off) || off)
++		return -EINVAL;
++	size = min(size, sizeof(code));
++	if (copy_from_kernel_nofault(code, (void *)in->addr, size))
++		return -EFAULT;
++	for (pos = 0; pos < size; pos += insn.length) {
++		if (insn_decode(&insn, code + pos, size - pos, INSN_MODE_64))
++			return -EINVAL;
++		c = code + pos;
++		/* ret, or a jump to the return thunk */
++		ret = in->addr + pos + insn.length + insn.immediate.value;
++		if ((insn.length == 1 && c[0] == 0xc3) ||
++		    (c[0] == 0xe9 && (ret == (unsigned long)x86_return_thunk ||
++				      ret == (unsigned long)__x86_return_thunk)))
++			return p > buf ? p - buf : -EINVAL;
++		if ((insn.length == 4 && is_endbr((u32 *)c)) || insn_is_nop(&insn))
++			continue;
++		if (insn_is_rex2(&insn))
++			return -EINVAL;
++		/* renaming adds at most a REX prefix and a displacement */
++		if (p - buf + insn.length + 2 > BPF_KFUNC_INLINE_MAX)
++			return -E2BIG;
++		p = kfunc_copy_insn(p, &insn, c, map);
++		if (!p)
++			return -EINVAL;
++	}
++	return -EINVAL;
++}
++
++static u8 x86_reg(u32 reg)
++{
++	return reg2hex[reg] + (is_ereg(reg) ? 8 : 0);
++}
++
++/*
++ * Get native code for an inlined kfunc call, with the operands in the x86
++ * registers that the verifier bound them to: the code from the emit callback
++ * of the kfunc's body, or else a copy of the compiled kfunc.
++ */
++int bpf_jit_inline_kfunc(const struct bpf_kfunc_inline *in, u8 *buf)
++{
++	u8 reg[MAX_BPF_FUNC_REG_ARGS + 1], map[16];
++	int i, len;
++
++	for (i = 0; i < ARRAY_SIZE(map); i++)
++		map[i] = i;
++	for (i = BPF_REG_0; i <= BPF_REG_5; i++) {
++		reg[i] = x86_reg(in->reg[i]);
++		map[x86_reg(i)] = reg[i];
++	}
++	/* copying needs the instruction decoder */
++	if (in->copy && IS_ENABLED(CONFIG_INSTRUCTION_DECODER))
++		return kfunc_copy(in, map, buf);
++	if (in->copy || !in->body->emit)
++		return -EOPNOTSUPP;
++	len = in->body->emit(reg, in->imm, buf);
++	return len > 0 && len <= BPF_KFUNC_INLINE_MAX ? len : -EINVAL;
++}
++
+ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *addrs, u8 *image,
+ 		  u8 *rw_image, int oldproglen, struct jit_context *ctx, bool jmp_padding)
+ {
+@@ -2952,6 +3124,15 @@ static int do_jit(struct bpf_verifier_env *env, struct bpf_prog *bpf_prog, int *
+ 			if (!imm32)
+ 				return -EINVAL;
+ 			if (src_reg == BPF_PSEUDO_KFUNC_CALL) {
++				const struct bpf_kfunc_inline *in;
++
++				/* an inlined kfunc call gets its native code */
++				in = bpf_kfunc_native(env, insn_idx);
++				if (in) {
++					memcpy(prog, in->image, in->image_len);
++					prog += in->image_len;
++					break;
++				}
+ 				fm = bpf_jit_find_kfunc_model(bpf_prog, insn);
+ 				if (!fm)
+ 					return -EINVAL;
+
+From patchwork Mon Oct  5 14:22:16 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868159
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wr2-f35.google.com (mail-wr2-f35.google.com
+ [74.125.225.99])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id 9344D4A3F2E
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:37 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.99
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210165; cv=none;
+ b=tm9S8RoDGzyeFPYBNBQprp2Lb9ZAIwftcqVeq5PVxfwrN+0YDlNOTZL6RZdNvHUQXq54dOxB1tdz5L+Bg4MV8eImEtdxBqc4Mso/GrrPbfZMM3T5BPmZH95QvkMIO/OgiWitaj4dpSsa9Zu2eA5oSkU91jBfwYJgLPAoiDSJ038=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210165; c=relaxed/simple;
+	bh=n4s7MlEsUo00XAftSPMghfNVJGRQRpi8uEPqCQA1gMs=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=cXblMLTrquKj+UJ18Jc5Yfk0e5JFp+WVMtBOYsL8AGAnThKBFwlbiOVazXwlVUX1LkQIzjza0RvraHgZ+QzWqMmv9LkMtQLdqWIwRv1fYSnOAldp6T56EqI8WauwJzY91IhIFR8xoo3XBsMJbWcKrdbUzBIZ12cLZQcaYfnE0kA=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=YZ3/XCWc; arc=none smtp.client-ip=74.125.225.99
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="YZ3/XCWc"
+Received: by mail-wr2-f35.google.com with SMTP id
+ ffacd0b85a97d-48b042e00f7so959074f8f.0
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:36 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210154; x=1791814954;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=RJM6wG6rWxjrMH1I/Utc3TiaeCB0SkgfdzSdr61wbxM=;
+        b=YZ3/XCWc3qXM3SU48Y/OP7OiXScPzHrwAsLs70TMtaXwsaQZamaKrIYiP+/KIWiMp7
+         7EOvU1LlP7xBh+2je3UyiRxDImCWxq6vBviV03fHrmcl1bCkLenODzietj0LtgFyrKCr
+         RLPeADM6HCjhpiG09KjEE8g9hJplBKVtuMYcKq7iHud7xDdpbM4qA1e2D4lmH5kTia1Y
+         4Vas7xSiYh1c+o1j0ZQyKAYew7kjnr4AJwgKQ1CYEbijNGZE/0oFKOkSBZs5W9uq26SK
+         NC0Iq+/J0E21QArIRYyj83s0DTo2NtaiDfmlPuqeCrI1JZl2yz9d/LMbl6YXvo55/vsO
+         k3Uw==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210154; x=1791814954;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=RJM6wG6rWxjrMH1I/Utc3TiaeCB0SkgfdzSdr61wbxM=;
+        b=i8fCYfSMgDqDDTP8JJJ3UQzruEm+r2ncX+TNYJ36c4rhBpiWMZrNLzBh3KTutqnqOJ
+         n//ZikVmgI7NjZcjfW4lkHmrE6u7XsZYmirMu3BUXPU9Hcr2+iGH9x8hdblD16YZlhCO
+         iNgFEGgGYFdw4VuvFfrPnhrvJODy5LswDC/s5+r1baN1ApcBSSg56TgrnFubwXMGZgBt
+         zudUF6lyVqEQYh8O4iXlhKuOFbmSuJWmYqJJ2SCj7Yukg5XavLp/d+NYsldouKHLe9UN
+         tcUYvGx4iwHUZtGvJVLFJWbUsKA172y6KHK54UW3WSDGnZHJQC68SIgEeKn3CRgL9/5K
+         t1Sg==
+X-Gm-Message-State: AFq9FYIk/Sm/kfqXwq5H2xLofpOrZxkS1QkMkunmCNg3jmv1p3eZb5hi
+	Leg5B0FTivS4+Ff6EbxUO79DSi9HfPuhXy6eTLS6PTAdVIkDuCUW/kTEX/+nwKgw8vW6NPdj
+X-Gm-Gg: AYBFou36/qFnq0YI9TTUi06RU0gxGu2VYje1UBBqT80zpVyHWRh/aO4n2VeU/QHAFen
+	M0AQ2DgTj0+/AcP+MKXvRPxBJN7N4RivClNbg1z/84C9estztfF6QfupKYSwsq0lPTKj6a9Xr/x
+	IAWTO16lEFWD4qlkZI4VW1egGYx4IA7qDxG4qTDQqnWfnkkW252HJA+qidaW34hSFsigz3N+VaF
+	6chdvfJw89Oxu0M7hCh7maZWVK/VUmQd85F+kfTItCUKE128/cnh3vwQOmUp3Jh2eG3Sh+QDJni
+	s2aebNeSGE0l6WDoa9EHSE1W1N2Jh/DaPaNLUG7qmzOuqdqXGhSIIsnUe+Quk7V10gL3w6Hj0+I
+	Blzj4xW0EG6Qd11AkrYVc4qxj2Eh2Pdoj60/QX/UOxpu1cG+3NX0JupdCNUsPYvEaC4xQ0+YYFC
+	ev8DVcCrsYLr/lPCrZ4LRRNYd+MKD2OIRMTW05hMnbn6GurBYM8u/hF9/wcKbzMkEiAB30hbAw3
+	kRw136m8qUSbCLDz4QeQTxd/OgUESEQETRJIy3k+dljldjmZJvo1I/js/8pl+nuaQ8C5XZTNqzM
+	7vwz2SYa+OACUxd5VZPD593QQIPh2YZAGqWG4w==
+X-Received: by 2002:a05:6000:605:b0:488:89ad:56c0 with SMTP id
+ ffacd0b85a97d-48b1270fbb0mr19700006f8f.11.1791210146929;
+        Mon, 05 Oct 2026 07:22:26 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.25
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:26 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 4/7] bpf: Add kfuncs with bodies for common
+ operations
+Date: Mon,  5 Oct 2026 07:22:16 -0700
+Message-ID: <20261005142219.33451-5-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+Add kfuncs with bodies for the operation families evaluated in [1]:
+bpf_rol64() (rotate), bpf_select64() (conditional select),
+bpf_extract64() (bit field extract), bpf_load_be64() (big-endian load),
+bpf_prefetch(), bpf_copy16() (16-byte copy) and bpf_lea64() (address
+computation). They are in kernel/bpf/insn_kfuncs/, apart from the
+verifier and the JITs, under the new CONFIG_BPF_INSN_KFUNCS, which can
+be built in or as a module. The x86-64 JIT inlines copies of their
+compiled code.
+
+A prefetch is a load whose value is not used, so the verifier checks the
+address like that of any load. bpf_copy16() loads both halves before it
+stores them, like its body, so that a copy of it and the body agree
+when the buffers overlap.
+
+[1] https://arxiv.org/abs/2606.24213
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ kernel/bpf/Kconfig                       |   1 +
+ kernel/bpf/Makefile                      |   1 +
+ kernel/bpf/insn_kfuncs/Kconfig           |  11 ++
+ kernel/bpf/insn_kfuncs/Makefile          |   2 +
+ kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c | 173 +++++++++++++++++++++++
+ 5 files changed, 188 insertions(+)
+ create mode 100644 kernel/bpf/insn_kfuncs/Kconfig
+ create mode 100644 kernel/bpf/insn_kfuncs/Makefile
+ create mode 100644 kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
+
+diff --git a/kernel/bpf/Kconfig b/kernel/bpf/Kconfig
+index 98493e32db2ad..ca0dbfa1f81c5 100644
+--- a/kernel/bpf/Kconfig
++++ b/kernel/bpf/Kconfig
+@@ -101,6 +101,7 @@ config BPF_CRYPTO
+ 	  data. The supported algorithms are AES-CBC and AES-ECB.
+ 
+ source "kernel/bpf/preload/Kconfig"
++source "kernel/bpf/insn_kfuncs/Kconfig"
+ 
+ config BPF_LSM
+ 	bool "Enable BPF LSM Instrumentation"
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index ae3d04dae2d33..94c81491a8e65 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -60,6 +60,7 @@ obj-${CONFIG_BPF_LSM} += bpf_lsm_proto.o bpf_lsm.o
+ endif
+ obj-$(CONFIG_BPF_CRYPTO) += crypto.o
+ obj-$(CONFIG_BPF_PRELOAD) += preload/
++obj-$(CONFIG_BPF_INSN_KFUNCS) += insn_kfuncs/
+ 
+ obj-$(CONFIG_BPF_SYSCALL) += relo_core.o
+ obj-$(CONFIG_BPF_SYSCALL) += btf_iter.o
+diff --git a/kernel/bpf/insn_kfuncs/Kconfig b/kernel/bpf/insn_kfuncs/Kconfig
+new file mode 100644
+index 0000000000000..b2469853899dc
+--- /dev/null
++++ b/kernel/bpf/insn_kfuncs/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0-only
++config BPF_INSN_KFUNCS
++	tristate "Kfuncs for CPU instructions that BPF lacks"
++	depends on BPF_SYSCALL && BPF_JIT && DEBUG_INFO_BTF
++	help
++	  Provide kfuncs for rotate, conditional select, bit field extract,
++	  big-endian load, prefetch, 16-byte copy and address computation.
++	  The verifier checks each call as the kfunc's BPF body, and the JIT
++	  puts native code in its place where it can.
++
++	  If unsure, say N.
+diff --git a/kernel/bpf/insn_kfuncs/Makefile b/kernel/bpf/insn_kfuncs/Makefile
+new file mode 100644
+index 0000000000000..e397f626a17a8
+--- /dev/null
++++ b/kernel/bpf/insn_kfuncs/Makefile
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_BPF_INSN_KFUNCS) += bpf_insn_kfuncs.o
+diff --git a/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c b/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
+new file mode 100644
+index 0000000000000..1bcc049a5603f
+--- /dev/null
++++ b/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
+@@ -0,0 +1,173 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Kfuncs for CPU instructions that BPF lacks, with BPF bodies, see struct
++ * bpf_kfunc_body. Arguments named __k must be known constants.
++ */
++#include <linux/bitops.h>
++#include <linux/btf.h>
++#include <linux/btf_ids.h>
++#include <linux/filter.h>
++#include <linux/module.h>
++#include <linux/unaligned.h>
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc u64 bpf_rol64(u64 x, u32 n__k)
++{
++	return rol64(x, n__k);
++}
++
++__bpf_kfunc u64 bpf_select64(u64 cond, u64 a, u64 b)
++{
++	return cond ? a : b;
++}
++
++__bpf_kfunc u64 bpf_extract64(u64 x, u32 start__k, u32 len__k)
++{
++	return x << (64 - start__k - len__k) >> (64 - len__k);
++}
++
++__bpf_kfunc u64 bpf_load_be64(const void *p, s32 off__k)
++{
++	return get_unaligned_be64(p + off__k);
++}
++
++__bpf_kfunc void bpf_prefetch(const void *p)
++{
++	/* not prefetch(), which boot-time alternatives may rewrite */
++	__builtin_prefetch(p);
++}
++
++__bpf_kfunc void bpf_copy16(void *dst, const void *src)
++{
++	/* both loads first, as in the body, in case the buffers overlap */
++	u64 lo = get_unaligned((const u64 *)src);
++	u64 hi = get_unaligned((const u64 *)(src + 8));
++
++	put_unaligned(lo, (u64 *)dst);
++	put_unaligned(hi, (u64 *)(dst + 8));
++}
++
++__bpf_kfunc u64 bpf_lea64(u64 base, u64 index, u32 scale__k, s32 disp__k)
++{
++	return base + index * scale__k + disp__k;
++}
++
++__bpf_kfunc_end_defs();
++
++/* x << n | x >> (-n & 63) */
++static const struct bpf_insn rol64_body[] = {
++	BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 63),
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++	BPF_ALU64_REG(BPF_LSH, BPF_REG_0, BPF_REG_2),
++	BPF_ALU64_IMM(BPF_NEG, BPF_REG_2, 0),
++	BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 63),
++	BPF_ALU64_REG(BPF_RSH, BPF_REG_1, BPF_REG_2),
++	BPF_ALU64_REG(BPF_OR, BPF_REG_0, BPF_REG_1),
++};
++
++/* the jump lands within the body, here on its last instruction */
++static const struct bpf_insn select64_body[] = {
++	BPF_JMP_IMM(BPF_JNE, BPF_REG_1, 0, 1),
++	BPF_MOV64_REG(BPF_REG_2, BPF_REG_3),
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_2),
++};
++
++/* x << (64 - start - len) >> (64 - len) */
++static const struct bpf_insn extract64_body[] = {
++	BPF_MOV32_IMM(BPF_REG_4, 64),
++	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_2),
++	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_3),
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++	BPF_ALU64_REG(BPF_LSH, BPF_REG_0, BPF_REG_4),
++	BPF_MOV32_IMM(BPF_REG_4, 64),
++	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_3),
++	BPF_ALU64_REG(BPF_RSH, BPF_REG_0, BPF_REG_4),
++};
++
++/* the offset is an s32 */
++static const struct bpf_insn load_be64_body[] = {
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 32),
++	BPF_ALU64_IMM(BPF_ARSH, BPF_REG_2, 32),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0),
++	BPF_ENDIAN(BPF_TO_BE, BPF_REG_0, 64),
++};
++
++/* a load whose value is not used, of memory that the program may read */
++static const struct bpf_insn prefetch_body[] = {
++	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_1, 0),
++};
++
++/* two loads, then two stores */
++static const struct bpf_insn copy16_body[] = {
++	BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_2, 0),
++	BPF_LDX_MEM(BPF_DW, BPF_REG_5, BPF_REG_2, 8),
++	BPF_STX_MEM(BPF_DW, BPF_REG_1, BPF_REG_4, 0),
++	BPF_STX_MEM(BPF_DW, BPF_REG_1, BPF_REG_5, 8),
++};
++
++/* base + index * scale + disp, scale a u32 and disp an s32 */
++static const struct bpf_insn lea64_body[] = {
++	BPF_MOV32_REG(BPF_REG_3, BPF_REG_3),
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_2),
++	BPF_ALU64_REG(BPF_MUL, BPF_REG_0, BPF_REG_3),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
++	BPF_ALU64_IMM(BPF_LSH, BPF_REG_4, 32),
++	BPF_ALU64_IMM(BPF_ARSH, BPF_REG_4, 32),
++	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_4),
++};
++
++BTF_KFUNCS_START(insn_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_rol64)
++BTF_ID_FLAGS(func, bpf_select64)
++BTF_ID_FLAGS(func, bpf_extract64)
++BTF_ID_FLAGS(func, bpf_load_be64)
++BTF_ID_FLAGS(func, bpf_prefetch)
++BTF_ID_FLAGS(func, bpf_copy16)
++BTF_ID_FLAGS(func, bpf_lea64)
++BTF_KFUNCS_END(insn_kfunc_ids)
++
++BTF_ID_LIST(body_ids)
++BTF_ID(func, bpf_rol64)
++BTF_ID(func, bpf_select64)
++BTF_ID(func, bpf_extract64)
++BTF_ID(func, bpf_load_be64)
++BTF_ID(func, bpf_prefetch)
++BTF_ID(func, bpf_copy16)
++BTF_ID(func, bpf_lea64)
++
++#define BODY(i, op, emit)	{ &body_ids[i], op##_body, ARRAY_SIZE(op##_body), emit }
++
++static const struct bpf_kfunc_body bodies[] = {
++	BODY(0, rol64, NULL),
++	BODY(1, select64, NULL),
++	BODY(2, extract64, NULL),
++	BODY(3, load_be64, NULL),
++	BODY(4, prefetch, NULL),
++	BODY(5, copy16, NULL),
++	BODY(6, lea64, NULL),
++};
++
++static const struct btf_kfunc_id_set insn_kfunc_set = {
++	.owner    = THIS_MODULE,
++	.set      = &insn_kfunc_ids,
++	.bodies   = bodies,
++	.body_cnt = ARRAY_SIZE(bodies),
++};
++
++static int __init insn_kfuncs_init(void)
++{
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &insn_kfunc_set);
++}
++
++/* the kfunc set goes away with the module's BTF */
++static void __exit insn_kfuncs_exit(void)
++{
++}
++
++module_init(insn_kfuncs_init);
++module_exit(insn_kfuncs_exit);
++
++MODULE_DESCRIPTION("Kfuncs for CPU instructions that BPF lacks");
++MODULE_LICENSE("GPL");
+
+From patchwork Mon Oct  5 14:22:17 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868156
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wm2-f13.google.com (mail-wm2-f13.google.com
+ [74.125.225.141])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id 25789492E20
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:35 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.141
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210159; cv=none;
+ b=AZjYLTNYSOK0LXA57Zrl2MZy8OJ8xXof5KX+5bMguudNQW5+6sOufQiy+9TLlGO0aUl7iM+cL2hZcC/ydzz89tk7cKqesJ3VwB5B16XU7M7Zu10Iaul/KjA8+VrzBojMifAHruYPPaddLzCQZZ5nVjrzVUNoRXUbrwwFchxlYDA=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210159; c=relaxed/simple;
+	bh=Lt7G/mknfW9u87mpXqyhK0xm1w2okf4RGX7PbZG/JOg=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=CTLuDM6X8A7b6iQ6cQvfugeVSldAskwgAVbqObksBOLCOW6YAnw3JGcvNM/eqW2+ii5fPZMERpkDYT+B8WCMwzIifqLiOxfWVuF1d/LHdddGMIbs4GgD5fsQHjpENOI98dYrpwm3ah3DnC5OMENiNPZd4n6b5ZiO2+cidSMYAjQ=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=KP1pv7vt; arc=none smtp.client-ip=74.125.225.141
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="KP1pv7vt"
+Received: by mail-wm2-f13.google.com with SMTP id
+ 5b1f17b1804b1-49fe8bf173aso11161215e9.3
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:34 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210149; x=1791814949;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=mZQZDqoTxehiXIWg6WfJWmUQf7d3lEZqs6KGqhPBbaI=;
+        b=KP1pv7vtWbUVkq8DXoIaAYTfsz6SICz42TOdQ2qg6q16yiIh4kQueo/n0GZDQJ3ryO
+         XAK/NKh0yf/5orlQJSC7IxXZiD198Uz5ouG6Dbkqp6h36+8ugsyViXqa4uSshi1fHdgX
+         6LqxQTnzpOr0h9GnFFi5kQ8u88Dx12ACDhpInMQxGtHC7m0qpsr47nTbR/LO2FPcka23
+         pLGSSVZW3kVNx12G//qQ85EXY9dvEO55ktwSGTAu1iY3LqdCAfz7XdYDTIa8EZ4GMsZ7
+         sQR+X8Ud+9ZvnEYNE9E0XgVXSrTIAZv4jB0xQ+W8Mar0VTL83TWYKCnYE/w9ad2CRxUT
+         3NZw==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210149; x=1791814949;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=mZQZDqoTxehiXIWg6WfJWmUQf7d3lEZqs6KGqhPBbaI=;
+        b=rMqHkwL9fLGya60C6h9cCrwWeBaeGhqtGHsyi0xPYpnDGzcrG/+ucNRpHqYvryxU4g
+         T7O3KJEzxRzO4QcO59EZgIeAfO79XIokVrD6XVkSyG4LDIPzGQ0D8XiOKEhuLM/0JoVN
+         NXqp06yCJ8loPCFxArbbXd4HU4e/HhXNJaJgitRRTLT+ccLQosR1xrFLNB6jtIcmd4e3
+         7Uo4bCsgkjmUn2HelJ0z0pthwl4wdKkAN0yy03TjvyM1pqmHok5hREAPZxDpx475RHjS
+         xihuncQ3HdsTYDO4um+UirDKUSkILOsCzYckSzPJi7GArWGP85qI6PlJap4+ebR4eKMN
+         /N3A==
+X-Gm-Message-State: AFuF++kuj7QDx4XE0QyxF0QkbAookNEUV+lWdeA+lvvBN/9qPC3izIDc
+	v0LOm8GSVx9KGpccOsTsyBRbIfBqm1ouVpoYDcPMYlrw72ogZ223qDHDlsnCf6TEQ5nTCn+T
+X-Gm-Gg: AYBFou0nZ48DqPDDVXq3NPFAZeozaRBPVHjzNFQ2L5E0ScBjNgWmINtVxbIAo5VPRe1
+	MnBxM1rzsnI/suq7qdVwgTah0mGAV83qbL+bnqqCc1qshChMIt9cBNhrF314pW/dho2GTP6UsoI
+	+J8YK33PLsd1KzVs6cziDkhg3QCd3GdrURycYWQ++oFjHzkOhFqWL50zjbZcSt5YB8yWKoGC/Cg
+	zdpuPB8kKT18CIiALI5/jwFmxw2g676YvxbR8pzRNJINhTm6YThkmhyZSvX6tbtqNckdPJCGlQO
+	uvtVO4u5p/74hms8hTPR8cd3AYA2e2RPkHwHhbYBzi/1MZI2zqQzi3zfyWmcwhEWQDIWjjxidXc
+	MaonqMz1QGUcq+ggHfIsG3M33/kxy4jn73Gh6Jhivyncsu081TQCJrm5HHZ7gRELAchMt8Z7L8V
+	UcPHxrgui3jzCM6/wQUM1zospBAyuJjgSGmC0i6x9VPRlha5q6SGL0LgsTbC/Dxv3mda+TQI5OH
+	mx1Y+B3khqqetSOMyBbuEjkPWJcou52uwhUYumu1AqRE8jm6W/5VFca/loTOnXSTquSFWuaSufQ
+	UsjjzGu8lp3YmGl9hiBXxShkX4GBR7HC2fbaCJ8=
+X-Received: by 2002:a05:600c:3b9f:b0:4a0:c2a:485e with SMTP id
+ 5b1f17b1804b1-4a1780acb17mr1960815e9.33.1791210148329;
+        Mon, 05 Oct 2026 07:22:28 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.27
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:28 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 5/7] bpf,
+ x86: Add native code for some inline kfuncs
+Date: Mon,  5 Oct 2026 07:22:17 -0700
+Message-ID: <20261005142219.33451-6-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+A copy of a compiled kfunc keeps constant arguments in registers and
+cannot put the result in the register of an argument. Give five of the
+kfuncs in insn_kfuncs an emit callback that writes x86-64 code: rol by
+an immediate, or rorx with BMI2 into another register; test and cmovcc,
+with the inverse condition when the result is in the register of the
+first value; mov of the control word and bextr with BMI1; movbe; and
+lea. Rotating a register in place by 13 is then "rol $13, %rbx" where a
+copy takes five instructions. Without BMI1 or MOVBE, or with constants
+that the instruction cannot take, the callback returns an error and the
+JIT copies the kfunc.
+
+The code is in insn_kfuncs/x86/insn_kfuncs.h, which bpf_insn_kfuncs.c
+includes under CONFIG_BPF_INSN_KFUNCS_ARCH, as lib/crc includes the code
+for each architecture. The prefetch and the 16-byte copy compile to the
+instructions themselves, so they have no callback.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ kernel/bpf/insn_kfuncs/Kconfig           |   5 +
+ kernel/bpf/insn_kfuncs/Makefile          |   3 +
+ kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c |  21 ++-
+ kernel/bpf/insn_kfuncs/x86/insn_kfuncs.h | 155 +++++++++++++++++++++++
+ 4 files changed, 179 insertions(+), 5 deletions(-)
+ create mode 100644 kernel/bpf/insn_kfuncs/x86/insn_kfuncs.h
+
+diff --git a/kernel/bpf/insn_kfuncs/Kconfig b/kernel/bpf/insn_kfuncs/Kconfig
+index b2469853899dc..179236855d652 100644
+--- a/kernel/bpf/insn_kfuncs/Kconfig
++++ b/kernel/bpf/insn_kfuncs/Kconfig
+@@ -9,3 +9,8 @@ config BPF_INSN_KFUNCS
+ 	  puts native code in its place where it can.
+ 
+ 	  If unsure, say N.
++
++config BPF_INSN_KFUNCS_ARCH
++	bool
++	depends on BPF_INSN_KFUNCS
++	default y if X86_64
+diff --git a/kernel/bpf/insn_kfuncs/Makefile b/kernel/bpf/insn_kfuncs/Makefile
+index e397f626a17a8..31e7ef567c90f 100644
+--- a/kernel/bpf/insn_kfuncs/Makefile
++++ b/kernel/bpf/insn_kfuncs/Makefile
+@@ -1,2 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ obj-$(CONFIG_BPF_INSN_KFUNCS) += bpf_insn_kfuncs.o
++ifeq ($(CONFIG_BPF_INSN_KFUNCS_ARCH),y)
++CFLAGS_bpf_insn_kfuncs.o += -I$(src)/$(SRCARCH)
++endif
+diff --git a/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c b/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
+index 1bcc049a5603f..1fcd0d7d0690c 100644
+--- a/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
++++ b/kernel/bpf/insn_kfuncs/bpf_insn_kfuncs.c
+@@ -118,6 +118,16 @@ static const struct bpf_insn lea64_body[] = {
+ 	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_4),
+ };
+ 
++#ifdef CONFIG_BPF_INSN_KFUNCS_ARCH
++#include "insn_kfuncs.h" /* $(SRCARCH)/insn_kfuncs.h */
++#else
++#define rol64_emit	NULL
++#define select64_emit	NULL
++#define extract64_emit	NULL
++#define load_be64_emit	NULL
++#define lea64_emit	NULL
++#endif
++
+ BTF_KFUNCS_START(insn_kfunc_ids)
+ BTF_ID_FLAGS(func, bpf_rol64)
+ BTF_ID_FLAGS(func, bpf_select64)
+@@ -139,14 +149,15 @@ BTF_ID(func, bpf_lea64)
+ 
+ #define BODY(i, op, emit)	{ &body_ids[i], op##_body, ARRAY_SIZE(op##_body), emit }
+ 
++/* without emit, the JIT copies the kfunc, whose code is the instruction itself */
+ static const struct bpf_kfunc_body bodies[] = {
+-	BODY(0, rol64, NULL),
+-	BODY(1, select64, NULL),
+-	BODY(2, extract64, NULL),
+-	BODY(3, load_be64, NULL),
++	BODY(0, rol64, rol64_emit),
++	BODY(1, select64, select64_emit),
++	BODY(2, extract64, extract64_emit),
++	BODY(3, load_be64, load_be64_emit),
+ 	BODY(4, prefetch, NULL),
+ 	BODY(5, copy16, NULL),
+-	BODY(6, lea64, NULL),
++	BODY(6, lea64, lea64_emit),
+ };
+ 
+ static const struct btf_kfunc_id_set insn_kfunc_set = {
+diff --git a/kernel/bpf/insn_kfuncs/x86/insn_kfuncs.h b/kernel/bpf/insn_kfuncs/x86/insn_kfuncs.h
+new file mode 100644
+index 0000000000000..5809bb69b4cd6
+--- /dev/null
++++ b/kernel/bpf/insn_kfuncs/x86/insn_kfuncs.h
+@@ -0,0 +1,155 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* x86-64 code for the kfuncs in bpf_insn_kfuncs.c, see struct bpf_kfunc_body */
++#include <linux/cpufeature.h>
++#include <linux/log2.h>
++#include <linux/unaligned.h>
++
++static u8 *x86_rex(u8 *p, bool w, u8 reg, u8 rm)
++{
++	u8 b = 0x40 | (w ? 8 : 0) | (reg & 8 ? 4 : 0) | (rm & 8 ? 1 : 0);
++
++	if (b != 0x40)
++		*p++ = b;
++	return p;
++}
++
++/* 64-bit op %reg, %rm */
++static u8 *x86_op_rr(u8 *p, u8 op, u8 reg, u8 rm)
++{
++	p = x86_rex(p, true, reg, rm);
++	*p++ = op;
++	*p++ = 0xc0 | (reg & 7) << 3 | (rm & 7);
++	return p;
++}
++
++/*
++ * ModRM, SIB and displacement of disp(%base, %index, 1 << scale), with @reg in
++ * the reg field. An @index of 4 (%rsp) is none.
++ */
++static u8 *x86_mem(u8 *p, u8 reg, u8 base, u8 index, u8 scale, s32 disp)
++{
++	u8 mod = !disp && (base & 7) != 5 ? 0 : disp == (s8)disp ? 1 : 2;
++	bool sib = index != 4 || (base & 7) == 4;
++
++	*p++ = mod << 6 | (reg & 7) << 3 | (sib ? 4 : base & 7);
++	if (sib)
++		*p++ = scale << 6 | (index & 7) << 3 | (base & 7);
++	if (mod == 1)
++		*p++ = disp;
++	if (mod == 2) {
++		put_unaligned_le32(disp, p);
++		p += 4;
++	}
++	return p;
++}
++
++static int rol64_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 dst = reg[0], src = reg[1], n = imm[BPF_REG_2] & 63, *p = buf;
++
++	if (n && dst != src && cpu_feature_enabled(X86_FEATURE_BMI2)) {
++		/* rorx $(64 - n), %src, %dst */
++		*p++ = 0xc4;
++		*p++ = (dst & 8 ? 0 : 0x80) | 0x40 | (src & 8 ? 0 : 0x20) | 0x03;
++		*p++ = 0xfb;
++		*p++ = 0xf0;
++		*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
++		*p++ = 64 - n;
++		return p - buf;
++	}
++	if (dst != src || !n)
++		p = x86_op_rr(p, 0x89, src, dst);	/* mov %src, %dst */
++	if (n) {
++		/* rol $n, %dst */
++		p = x86_rex(p, true, 0, dst);
++		*p++ = 0xc1;
++		*p++ = 0xc0 | (dst & 7);
++		*p++ = n;
++	}
++	return p - buf;
++}
++
++/* cmovcc %src, %dst */
++static u8 *x86_cmov(u8 *p, u8 cc, u8 dst, u8 src)
++{
++	p = x86_rex(p, true, dst, src);
++	*p++ = 0x0f;
++	*p++ = 0x40 | cc;
++	*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
++	return p;
++}
++
++/*
++ * dst = cc ? a : b, after the test or compare at @p. The flags come first, so
++ * the result may take the register of an operand they read. A result in the
++ * register of a takes b with the inverse condition, which a copy of the
++ * compiled kfunc cannot do.
++ */
++static int x86_select(u8 *buf, u8 *p, u8 cc, u8 dst, u8 a, u8 b)
++{
++	if (dst == a)
++		return x86_cmov(p, cc ^ 1, dst, b) - buf;
++	if (dst != b)
++		p = x86_op_rr(p, 0x89, b, dst);	/* mov %b, %dst */
++	return x86_cmov(p, cc, dst, a) - buf;
++}
++
++static int select64_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 cond = reg[1];
++
++	/* test %cond, %cond; cmovne */
++	return x86_select(buf, x86_op_rr(buf, 0x85, cond, cond), 0x5, reg[0],
++			   reg[2], reg[3]);
++}
++
++/* R4 is free for the control word, as there are three arguments */
++static int extract64_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 dst = reg[0], src = reg[1], ctl = dst != src ? dst : reg[4];
++	u32 start = imm[BPF_REG_2], len = imm[BPF_REG_3];
++	u8 *p = buf;
++
++	if (!cpu_feature_enabled(X86_FEATURE_BMI1) || start > 63 || !len || len > 64 - start)
++		return -EOPNOTSUPP;
++	/* mov $(start | len << 8), %ctl */
++	p = x86_rex(p, false, 0, ctl);
++	*p++ = 0xb8 | (ctl & 7);
++	put_unaligned_le32(start | len << 8, p);
++	p += 4;
++	/* bextr %ctl, %src, %dst */
++	*p++ = 0xc4;
++	*p++ = (dst & 8 ? 0 : 0x80) | 0x40 | (src & 8 ? 0 : 0x20) | 0x02;
++	*p++ = 0x80 | (~ctl & 0xf) << 3;
++	*p++ = 0xf7;
++	*p++ = 0xc0 | (dst & 7) << 3 | (src & 7);
++	return p - buf;
++}
++
++static int load_be64_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 dst = reg[0], base = reg[1], *p = buf;
++
++	if (!cpu_feature_enabled(X86_FEATURE_MOVBE))
++		return -EOPNOTSUPP;
++	/* movbe off(%base), %dst */
++	p = x86_rex(p, true, dst, base);
++	*p++ = 0x0f;
++	*p++ = 0x38;
++	*p++ = 0xf0;
++	return x86_mem(p, dst, base, 4, 0, imm[BPF_REG_2]) - buf;
++}
++
++static int lea64_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 dst = reg[0], base = reg[1], index = reg[2], *p = buf;
++	u32 scale = imm[BPF_REG_3];
++
++	/* %rsp cannot be an index, and the scale is 1, 2, 4 or 8 */
++	if (index == 4 || !is_power_of_2(scale) || scale > 8)
++		return -EOPNOTSUPP;
++	/* lea disp(%base, %index, scale), %dst */
++	*p++ = 0x48 | (dst & 8 ? 4 : 0) | (index & 8 ? 2 : 0) | (base & 8 ? 1 : 0);
++	*p++ = 0x8d;
++	return x86_mem(p, dst, base, index, ilog2(scale), imm[BPF_REG_4]) - buf;
++}
+
+From patchwork Mon Oct  5 14:22:18 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868158
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wr2-f35.google.com (mail-wr2-f35.google.com
+ [74.125.225.99])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id 7BBFF4A092D
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:36 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=74.125.225.99
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210164; cv=none;
+ b=CyLMD7Ii8KC8B0Q8PPZsJkAh+ILwanTQ7zAbXy6NEhT0YNbnegHGTT+hNV6pClqZaA6nLNsBIoKQRSQRR9SihYkscLOinUG7egy4Mm7PwA5sURuaLM+19OqxXyu38azgJg+opXDZZEDq3BjlvKJv9YKhKIn7xP6dPhnf3q1LOXQ=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210164; c=relaxed/simple;
+	bh=At363QlKvyLYE2nGLYQwG3CRGYFTuUUCSrxaswjwRCY=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=EM/RSGL8Mqdy/IqQ8rUFMlEBkVGf1kZT+HL0ad3495qPDgi1XS4N5PVpXLA75aO7TUhxssfNuCRbkDEqEYyOm+wFhDgVLujrGVNDl0TO4d9bll/2IliPOGyhiDpAanSnMhI8OULf2WE08UmcGFBR7RobOTYjg8srqn0UWR+cQRo=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=Xb+5IUhK; arc=none smtp.client-ip=74.125.225.99
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="Xb+5IUhK"
+Received: by mail-wr2-f35.google.com with SMTP id
+ ffacd0b85a97d-488811c9ebaso955309f8f.2
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:35 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210150; x=1791814950;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=zuTHseKMpjlRmTdYLMIfTT9GWgnURCxzCnJaQz5UrpY=;
+        b=Xb+5IUhKYOC4QKPxcvaXWRyU6UsyalpojDcZk/eMy80WGSS8kQACRtpxUX12Bc13D1
+         6Rc/ELqBGbitNOY9jIEr30vXMa+AKgOhJA59yNWWi4v0tQoRpJU8xVzHAj9ZpwyxPVdJ
+         IX1/cxIgsiIflCFeD5Kb7Ih37NvRD8Lk7ZQ3AERqIttDORvIeBFh7yHe/KxeXUlhQzYR
+         IdPrES8K+cLCDQEEwWLZtVz+ncHzcbFPCXHCxpl3g807KP7QoNmB4falA0CKC8fxpy4S
+         irYkpyOB+BWdaP4dMo6vWBtYLg/5kBKLnvb/0bXP2FR2+OYAj6N97pxRLUaGqm8bFZko
+         iviA==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210150; x=1791814950;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=zuTHseKMpjlRmTdYLMIfTT9GWgnURCxzCnJaQz5UrpY=;
+        b=2zU/Q73I/IfD2c50WJ15mPgXISsg+bHgtgzmRS+y3ZCsRXFMR6m8fH3lJcc06vZwkb
+         h0K8U9rH0s/xpM3k8xiFdGAELO/hetOsEH5knXPh/t58ka0o/49ggdKjGzLe9YmUn9dw
+         xe2g+4G3BzH44mH1MsG+4Kz6YWCZeOMWOC9J2kBnnd1jWzluk159ZWfafo17PQto9VIC
+         +hxqPbTGVQyunBv31Z+ps4KYawPXw6tOakdkJU627Orro1XiI+zLmIDCJmw9sNA8LMEh
+         Up8cpiMbctgWP+7vSp6BAdh0VQ6f/jlijwBsWHvOD7i1U/Rmjax7kQgrt0Wik9PVpC1Z
+         wWJg==
+X-Gm-Message-State: AFq9FYKLpQBXCpVps09wb7wQs1cTbq1SiQ0JSbceoii9H3uyxkCMd0y2
+	T2Fmp/4Qmh8D0+d7wTfwcDUS5g6hhPOtb867HOIbCJuUDm1jsxLWZYSshUlGLBFXsEDSf3ZA
+X-Gm-Gg: AYBFou04oNsNIiMkPvL5Cwq6cW9nrEM5jouij4a8WkQgjOu8OLAqGXKOaUb4WYnO81b
+	HPkqK0M82GvXNMrQ667JBozFNMlMhYCS++s2KcXjJ5CJKNgbunegeQYzh/vJ/2Vb9KRNavAeJjs
+	0m4IpySFUG1n3NHpwcEj+cBFWE9fPuvLAalYezODks+NtfB7ZRnDJp6MaENV+PL4f1hIv4l3wlR
+	c4+VpH+stXfd6n2IoAGOle6cPfOCi3HNOMdyJ3oGUTsgH0tIoOoPEXJemAgdPK8njVwxIH3/tBo
+	QTzWfYY93uCDd7+tfpzMRFKggnZnwOMnFMFc3Yk3s0YAlroARrEfUNrWCnn0UfBJTX+pLHgUnfm
+	LM/1Ab1is6jBgh7BEQPA5D/xRBkxyUce7LWuVMGZ6UdBxIXG2TL8QVKYyY1T1OONLykk2qHDbCn
+	yALDJHzBnyaXcJqc8Wsfdlpeb8UQ9AIvIctddqExjRk+8VkBMsD0/IKee/1zQfqR9cUADjCNDJG
+	JdvP54HGR/tuFL0gMHMST0/3tFScQ5MO6FcKwaESaRePBx37GXcaw0gxfjb9OTzL+KfHZ3ZtX7M
+	jPPtIUnjmP9fel3y9+6p52O99srWEuLQulfmM3cPEi8feaDb
+X-Received: by 2002:a05:6000:61b:b0:48a:fc9d:fbba with SMTP id
+ ffacd0b85a97d-48b126f15e8mr20156055f8f.1.1791210149794;
+        Mon, 05 Oct 2026 07:22:29 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.28
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:29 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 6/7] selftests/bpf: Test inline kfuncs
+Date: Mon,  5 Oct 2026 07:22:18 -0700
+Message-ID: <20261005142219.33451-7-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+verifier_kfunc_inline checks:
+  - the x86-64 native code of each kfunc with a body, emitted or
+    copied, and the binding of operands;
+  - the precision of results, the register effects at the entry and
+    exit of the body, constant arguments and a prefetch through a
+    scalar;
+  - kfuncs with a body from a module: with native code from the module,
+    copied, kept for a division, and rejected in a program type that
+    may not call them;
+  - that the kfuncs agree with plain BPF on random inputs.
+
+bpf_test_kfunc_body.ko checks that registration rejects bad bodies. The
+config enables CONFIG_BPF_INSN_KFUNCS.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ tools/testing/selftests/bpf/Makefile          |   2 +-
+ tools/testing/selftests/bpf/config            |   1 +
+ .../bpf/prog_tests/kfunc_body_registration.c  |  18 +
+ .../selftests/bpf/prog_tests/verifier.c       |   2 +
+ .../bpf/progs/verifier_kfunc_inline.c         | 543 ++++++++++++++++++
+ .../testing/selftests/bpf/test_kmods/Makefile |   2 +-
+ .../bpf/test_kmods/bpf_test_kfunc_body.c      | 121 ++++
+ .../selftests/bpf/test_kmods/bpf_testmod.c    |  77 +++
+ .../bpf/test_kmods/bpf_testmod_kfunc.h        |   4 +
+ 9 files changed, 768 insertions(+), 2 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/kfunc_body_registration.c
+ create mode 100644 tools/testing/selftests/bpf/progs/verifier_kfunc_inline.c
+ create mode 100644 tools/testing/selftests/bpf/test_kmods/bpf_test_kfunc_body.c
+
+diff --git a/tools/testing/selftests/bpf/Makefile b/tools/testing/selftests/bpf/Makefile
+index a22be7efd1fa2..7a5dd7fcd3d14 100644
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@ -48,7 +48,7 @@ TEST_PROGS_EXTENDED := \
+ 	ima_setup.sh verify_sig_setup.sh
+ 
+ TEST_KMODS := bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
+-	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
++	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko bpf_test_kfunc_body.ko
+ TEST_KMOD_TARGETS = $(addprefix $(OUTPUT)/,$(TEST_KMODS))
+ 
+ # Compile but not part of 'make run_tests'
+diff --git a/tools/testing/selftests/bpf/config b/tools/testing/selftests/bpf/config
+index 2b883b388f90c..abc4e79d42a01 100644
+--- a/tools/testing/selftests/bpf/config
++++ b/tools/testing/selftests/bpf/config
+@@ -3,6 +3,7 @@ CONFIG_BOOTPARAM_HARDLOCKUP_PANIC=y
+ CONFIG_BOOTPARAM_SOFTLOCKUP_PANIC=1
+ CONFIG_BPF=y
+ CONFIG_BPF_EVENTS=y
++CONFIG_BPF_INSN_KFUNCS=y
+ CONFIG_BPF_JIT=y
+ CONFIG_BPF_KPROBE_OVERRIDE=y
+ CONFIG_BPF_LIRC_MODE2=y
+diff --git a/tools/testing/selftests/bpf/prog_tests/kfunc_body_registration.c b/tools/testing/selftests/bpf/prog_tests/kfunc_body_registration.c
+new file mode 100644
+index 0000000000000..3aa1f614b508e
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/kfunc_body_registration.c
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <test_progs.h>
++#include <testing_helpers.h>
++
++/* bpf_test_kfunc_body.ko fails to load unless bad kfunc bodies are rejected */
++void test_kfunc_body_registration(void)
++{
++	int fd, err;
++
++	fd = open("bpf_test_kfunc_body.ko", O_RDONLY);
++	if (!ASSERT_GE(fd, 0, "open"))
++		return;
++	err = finit_module(fd, "", 0);
++	close(fd);
++	if (!ASSERT_OK(err, "finit_module"))
++		return;
++	ASSERT_OK(delete_module("bpf_test_kfunc_body", 0), "delete_module");
++}
+diff --git a/tools/testing/selftests/bpf/prog_tests/verifier.c b/tools/testing/selftests/bpf/prog_tests/verifier.c
+index 460ad10ddc020..ad7baf3afa248 100644
+--- a/tools/testing/selftests/bpf/prog_tests/verifier.c
++++ b/tools/testing/selftests/bpf/prog_tests/verifier.c
+@@ -60,6 +60,7 @@
+ #include "verifier_iterating_callbacks.skel.h"
+ #include "verifier_jeq_infer_not_null.skel.h"
+ #include "verifier_jit_convergence.skel.h"
++#include "verifier_kfunc_inline.skel.h"
+ #include "verifier_kfunc_packet_access.skel.h"
+ #include "verifier_kfunc_uninit.skel.h"
+ #include "verifier_kfunc_uninit_multi.skel.h"
+@@ -245,6 +246,7 @@ void test_verifier_int_ptr(void)              { RUN(verifier_int_ptr); }
+ void test_verifier_iterating_callbacks(void)  { RUN(verifier_iterating_callbacks); }
+ void test_verifier_jeq_infer_not_null(void)   { RUN(verifier_jeq_infer_not_null); }
+ void test_verifier_jit_convergence(void)      { RUN(verifier_jit_convergence); }
++void test_verifier_kfunc_inline(void)         { RUN_TESTS(verifier_kfunc_inline); }
+ void test_verifier_kfunc_packet_access(void)  { RUN_TESTS(verifier_kfunc_packet_access); }
+ void test_verifier_kfunc_uninit(void)         { RUN_TESTS(verifier_kfunc_uninit); }
+ void test_verifier_kfunc_uninit_multi(void)   { RUN_TESTS(verifier_kfunc_uninit_multi); }
+diff --git a/tools/testing/selftests/bpf/progs/verifier_kfunc_inline.c b/tools/testing/selftests/bpf/progs/verifier_kfunc_inline.c
+new file mode 100644
+index 0000000000000..b525e7cf7a0f4
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/verifier_kfunc_inline.c
+@@ -0,0 +1,543 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <vmlinux.h>
++#include <bpf/bpf_helpers.h>
++#include "bpf_misc.h"
++#include "../test_kmods/bpf_testmod_kfunc.h"
++
++extern u64 bpf_rol64(u64 x, u32 n) __ksym;
++extern u64 bpf_select64(u64 cond, u64 a, u64 b) __ksym;
++extern u64 bpf_extract64(u64 x, u32 start, u32 len) __ksym;
++extern u64 bpf_load_be64(const void *p, s32 off) __ksym;
++extern void bpf_prefetch(const void *p) __ksym;
++extern void bpf_copy16(void *dst, const void *src) __ksym;
++extern u64 bpf_lea64(u64 base, u64 index, u32 scale, s32 disp) __ksym;
++
++/* r6 = rol(r6, 13) is one rol, the moves around the call go away */
++SEC("tc")
++__success __retval(8192)
++__xlated("0: r6 = 1")
++__xlated("1: call")
++__xlated("2: r0 = r6")
++__arch_x86_64
++__jited("{{.*}}movl\t$0x1, %ebx")
++__jited("{{.*}}rolq\t$0xd, %rbx")
++__jited("{{.*}}movq\t%rbx, %rax")
++__naked void inline_rol64_in_place(void)
++{
++	asm volatile (
++	"r6 = 1;"
++	"r1 = r6;"
++	"r2 = 13;"
++	"call %[bpf_rol64];"
++	"r6 = r0;"
++	"r0 = r6;"
++	"exit;"
++	:
++	: __imm(bpf_rol64)
++	: __clobber_all);
++}
++
++/* r7 = rol(r6, 8) keeps r6 */
++SEC("tc")
++__success __retval(255)
++__arch_x86_64
++__jited("{{.*}}{{rorxq\t\\$0x38, %rdi, %r13|rolq\t\\$0x8, %r13}}")
++__naked void inline_rol64_copy(void)
++{
++	asm volatile (
++	"r6 = 1;"
++	"r1 = r6;"
++	"r2 = 8;"
++	"call %[bpf_rol64];"
++	"r7 = r0;"
++	"r0 = r7;"
++	"r0 -= r6;"
++	"exit;"
++	:
++	: __imm(bpf_rol64)
++	: __clobber_all);
++}
++
++/* a 32-bit move of the constant goes away as well */
++SEC("tc")
++__success __retval(16)
++__xlated("1: call")
++__arch_x86_64
++__jited("{{.*}}rolq\t$0x4, %rbx")
++__naked void inline_rol_w2(void)
++{
++	asm volatile (
++	"r6 = 1;"
++	"r1 = r6;"
++	"w2 = 4;"
++	"call %[bpf_rol64];"
++	"r6 = r0;"
++	"r0 = r6;"
++	"exit;"
++	:
++	: __imm(bpf_rol64)
++	: __clobber_all);
++}
++
++SEC("tc")
++__success __retval(42)
++__arch_x86_64
++__jited("{{.*}}testq\t%rbx, %rbx")
++__jited("{{.*}}movq\t%r14, %r15")
++__jited("{{.*}}cmovneq\t%r13, %r15")
++__naked void inline_select(void)
++{
++	asm volatile (
++	"r6 = 1;"
++	"r7 = 42;"
++	"r8 = 7;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"r3 = r8;"
++	"call %[bpf_select64];"
++	"r9 = r0;"
++	"r0 = r9;"
++	"exit;"
++	:
++	: __imm(bpf_select64)
++	: __clobber_all);
++}
++
++/* r9 = r6 ? r7 : r9 is a test and a cmov */
++SEC("tc")
++__success __retval(7)
++__arch_x86_64
++__jited("{{.*}}testq\t%rbx, %rbx")
++__jited("{{.*}}cmovneq\t%r13, %r15")
++__naked void inline_select_in_place(void)
++{
++	asm volatile (
++	"r6 = 0;"
++	"r7 = 42;"
++	"r9 = 7;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"r3 = r9;"
++	"call %[bpf_select64];"
++	"r9 = r0;"
++	"r0 = r9;"
++	"exit;"
++	:
++	: __imm(bpf_select64)
++	: __clobber_all);
++}
++
++SEC("tc")
++__success __retval(0x56)
++__arch_x86_64
++__jited("{{.*}}{{bextrq\t%r13, %rbx, %r13|shlq\t%cl, %rbx}}")
++__naked void inline_extract(void)
++{
++	asm volatile (
++	"r6 = 0x12345678;"
++	"r1 = r6;"
++	"r2 = 8;"
++	"r3 = 8;"
++	"call %[bpf_extract64];"
++	"r7 = r0;"
++	"r0 = r7;"
++	"exit;"
++	:
++	: __imm(bpf_extract64)
++	: __clobber_all);
++}
++
++/* the bytes 01..08 on the stack, read as big endian */
++SEC("tc")
++__success __retval(0x05060708)
++__arch_x86_64
++__jited("{{.*}}{{movbeq\t\\(%rbx\\), %rax|bswapq\t%rax}}")
++__naked void inline_load_be64(void)
++{
++	asm volatile (
++	"*(u32 *)(r10 - 8) = 0x04030201;"
++	"*(u32 *)(r10 - 4) = 0x08070605;"
++	"r6 = r10;"
++	"r6 += -8;"
++	"r1 = r6;"
++	"r2 = 0;"
++	"call %[bpf_load_be64];"
++	"exit;"
++	:
++	: __imm(bpf_load_be64)
++	: __clobber_all);
++}
++
++SEC("tc")
++__success __retval(0)
++__arch_x86_64
++__jited("{{.*}}prefetcht0\t{{.*}}%r13)")
++__naked void inline_prefetch(void)
++{
++	asm volatile (
++	"*(u64 *)(r10 - 8) = 0;"
++	"r7 = r10;"
++	"r7 += -8;"
++	"r1 = r7;"
++	"call %[bpf_prefetch];"
++	"r0 = 0;"
++	"exit;"
++	:
++	: __imm(bpf_prefetch)
++	: __clobber_all);
++}
++
++/* the instructions of a prefetch load, so the address must be readable */
++SEC("tc")
++__failure __msg("R1 invalid mem access 'scalar'")
++__naked void inline_prefetch_scalar(void)
++{
++	asm volatile (
++	"r1 = 0;"
++	"call %[bpf_prefetch];"
++	"r0 = 0;"
++	"exit;"
++	:
++	: __imm(bpf_prefetch)
++	: __clobber_all);
++}
++
++/* copy 16 bytes from fp-16 to fp-32: the JIT copies the compiled kfunc */
++SEC("tc")
++__success __retval(0x22)
++__arch_x86_64
++__xlated("6: call")
++__jited("{{.*}}movq\t(%r13), %{{.*}}")
++__naked void inline_copy16(void)
++{
++	asm volatile (
++	"*(u64 *)(r10 - 16) = 0x11;"
++	"*(u64 *)(r10 - 8) = 0x22;"
++	"r6 = r10;"
++	"r6 += -32;"
++	"r7 = r10;"
++	"r7 += -16;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"call %[bpf_copy16];"
++	"r0 = *(u64 *)(r10 - 24);"
++	"exit;"
++	:
++	: __imm(bpf_copy16)
++	: __clobber_all);
++}
++
++/* the verifier checks the memory that the copy touches */
++SEC("tc")
++__failure __msg("off=0 size=8")
++__naked void inline_copy16_out_of_bounds(void)
++{
++	asm volatile (
++	"*(u64 *)(r10 - 8) = 0;"
++	"r1 = r10;"
++	"r1 += -16;"
++	"r2 = r10;"
++	"r2 += -8;"
++	"call %[bpf_copy16];"
++	"r0 = 0;"
++	"exit;"
++	:
++	: __imm(bpf_copy16)
++	: __clobber_all);
++}
++
++/* 100 + 3 * 4 + 16 */
++SEC("tc")
++__success __retval(128)
++__arch_x86_64
++__jited("{{.*}}leaq\t0x10(%rbx,%r13,4), %r14")
++__naked void inline_lea(void)
++{
++	asm volatile (
++	"r6 = 100;"
++	"r7 = 3;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"r3 = 4;"
++	"r4 = 16;"
++	"call %[bpf_lea64];"
++	"r8 = r0;"
++	"r0 = r8;"
++	"exit;"
++	:
++	: __imm(bpf_lea64)
++	: __clobber_all);
++}
++
++/* the instructions bound the result, a call would not */
++SEC("tc")
++__success __retval(0)
++__naked void inline_precision(void)
++{
++	asm volatile (
++	"call %[bpf_get_prandom_u32];"
++	"r1 = r0;"
++	"r2 = 0;"
++	"r3 = 3;"
++	"call %[bpf_extract64];"
++	"r6 = r10;"
++	"r6 += -8;"
++	"r6 += r0;"
++	"r0 = 0;"
++	"*(u8 *)(r6 + 0) = r0;"
++	"exit;"
++	:
++	: __imm(bpf_get_prandom_u32), __imm(bpf_extract64)
++	: __clobber_all);
++}
++
++/* arguments cannot be read after the instructions, as after a call */
++SEC("tc")
++__failure __msg("R1 !read_ok")
++__naked void inline_clobber(void)
++{
++	asm volatile (
++	"r1 = 1;"
++	"r2 = 42;"
++	"r3 = 7;"
++	"call %[bpf_select64];"
++	"r0 = r1;"
++	"exit;"
++	:
++	: __imm(bpf_select64)
++	: __clobber_all);
++}
++
++/* a kfunc that returns nothing leaves R0 unreadable after its body */
++SEC("tc")
++__failure __msg("R0 !read_ok")
++__naked void inline_void_r0(void)
++{
++	asm volatile (
++	"r1 = r10;"
++	"r1 += -8;"
++	"call %[bpf_prefetch];"
++	"exit;"
++	:
++	: __imm(bpf_prefetch)
++	: __clobber_all);
++}
++
++SEC("tc")
++__failure __msg("R2 must be a known constant")
++__naked void inline_not_constant(void)
++{
++	asm volatile (
++	"call %[bpf_get_prandom_u32];"
++	"r1 = 1;"
++	"r2 = r0;"
++	"call %[bpf_rol64];"
++	"exit;"
++	:
++	: __imm(bpf_get_prandom_u32), __imm(bpf_rol64)
++	: __clobber_all);
++}
++
++/* r1 = r6 is skipped by a jump, so it must stay */
++SEC("tc")
++__success __retval(42)
++__naked void inline_bind_jump(void)
++{
++	asm volatile (
++	"r9 = *(u32 *)(r1 + %[len]);"
++	"r6 = 0;"
++	"r7 = 42;"
++	"r8 = 7;"
++	"r1 = 1;"
++	"if r9 != 0 goto l0_%=;"
++	"r1 = r6;"
++"l0_%=:"
++	"r2 = r7;"
++	"r3 = r8;"
++	"call %[bpf_select64];"
++	"exit;"
++	:
++	: __imm(bpf_select64),
++	  __imm_const(len, offsetof(struct __sk_buff, len))
++	: __clobber_all);
++}
++
++#if __clang_major__ >= 18 || defined(__BPF_FEATURE_MOVSX)
++/* a sign-extending move is not a plain copy of R6 */
++SEC("tc")
++__success __retval(7)
++__naked void inline_bind_movsx(void)
++{
++	asm volatile (
++	"r6 = 0x100;"
++	"r7 = 42;"
++	"r8 = 7;"
++	"r1 = (s8)r6;"
++	"r2 = r7;"
++	"r3 = r8;"
++	"call %[bpf_select64];"
++	"exit;"
++	:
++	: __imm(bpf_select64)
++	: __clobber_all);
++}
++#endif
++
++/* the result takes the register of the condition */
++SEC("tc")
++__success __retval(42)
++__naked void inline_bind_shared(void)
++{
++	asm volatile (
++	"r6 = 1;"
++	"r7 = 42;"
++	"r8 = 7;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"r3 = r8;"
++	"call %[bpf_select64];"
++	"r6 = r0;"
++	"r0 = r6;"
++	"exit;"
++	:
++	: __imm(bpf_select64)
++	: __clobber_all);
++}
++
++/* native code from a module, with the result in the register of an argument */
++SEC("tc")
++__success __retval(6)
++__arch_x86_64
++__xlated("2: call")
++__jited("{{.*}}xorq\t%r13, %rbx")
++__naked void inline_module(void)
++{
++	asm volatile (
++	"r6 = 5;"
++	"r7 = 3;"
++	"r1 = r6;"
++	"r2 = r7;"
++	"call %[bpf_testmod_inline_xor];"
++	"r6 = r0;"
++	"r0 = r6;"
++	"exit;"
++	:
++	: __imm(bpf_testmod_inline_xor)
++	: __clobber_all);
++}
++
++/* without emit, the JIT copies the compiled kfunc, with the registers bound */
++SEC("tc")
++__success __retval(5)
++__arch_x86_64
++__xlated("1: call")
++__jited("{{.*}}movq\t%rbx, %r13")
++__naked void inline_copy(void)
++{
++	asm volatile (
++	"r6 = 5;"
++	"r1 = r6;"
++	"call %[bpf_testmod_inline_mov];"
++	"r7 = r0;"
++	"r0 = r7;"
++	"exit;"
++	:
++	: __imm(bpf_testmod_inline_mov)
++	: __clobber_all);
++}
++
++/* compiled code that branches or divides is not copied: the instructions stay */
++SEC("tc")
++__success __retval(0)
++__xlated("{{.*}}r0 /= r2")
++__naked void inline_copy_div(void)
++{
++	asm volatile (
++	"r1 = 9;"
++	"r2 = 0;"
++	"call %[bpf_testmod_inline_div];"
++	"exit;"
++	:
++	: __imm(bpf_testmod_inline_div)
++	: __clobber_all);
++}
++
++/* a kfunc that the program may not call keeps its call, which is rejected */
++SEC("xdp")
++__failure __msg("calling kernel function bpf_testmod_inline_mov is not allowed")
++__naked void inline_not_allowed(void)
++{
++	asm volatile (
++	"r1 = 1;"
++	"call %[bpf_testmod_inline_mov];"
++	"exit;"
++	:
++	: __imm(bpf_testmod_inline_mov)
++	: __clobber_all);
++}
++
++#define ROL(x, n) ((x) << ((n) & 63) | (x) >> (-(n) & 63))
++
++struct diff_state {
++	u64 bad;
++	u8 src[64], dst[64];
++};
++
++static u64 rand64(void)
++{
++	return (u64)bpf_get_prandom_u32() << 32 | bpf_get_prandom_u32();
++}
++
++/* a global function, so that the verifier checks it once and not per call */
++__noinline int diff_step(struct diff_state *s)
++{
++	u64 x = rand64(), y = rand64(), a = rand64(), b = rand64();
++	int i;
++
++	if (!s)
++		return 0;
++	s->bad |= (bpf_rol64(x, 1) ^ ROL(x, 1)) | (bpf_rol64(x, 13) ^ ROL(x, 13)) |
++		  (bpf_rol64(x, 63) ^ ROL(x, 63)) | (bpf_rol64(x, 64) ^ x);
++	s->bad |= bpf_select64(x & 1, a, b) ^ (x & 1 ? a : b);
++	s->bad |= bpf_extract64(x, 0, 64) ^ x;
++	s->bad |= bpf_extract64(x, 13, 7) ^ (x >> 13 & 0x7f);
++	s->bad |= bpf_extract64(x, 40, 24) ^ (x >> 40);
++	s->bad |= bpf_extract64(x, 63, 1) ^ (x >> 63);
++	s->bad |= bpf_lea64(x, y, 8, -12345) ^ (x + y * 8 - 12345);
++	for (i = 0; i < 8; i++) {
++		s->src[i] = x >> (8 * i);
++		s->src[8 + i] = y >> (8 * i);
++	}
++	s->bad |= bpf_load_be64(s->src, 0) ^ __builtin_bswap64(x);
++	s->bad |= bpf_load_be64(s->src + 16, -8) ^ __builtin_bswap64(y);
++	/* unaligned */
++	s->bad |= bpf_load_be64(s->src + 8, -7) ^ __builtin_bswap64(x >> 8 | y << 56);
++	bpf_copy16(s->dst + 8, s->src);
++	for (i = 0; i < 16; i++)
++		s->bad |= s->dst[8 + i] ^ s->src[i];
++	return 0;
++}
++
++/* native code and the instructions agree on random inputs */
++SEC("tc")
++__success __retval(0)
++int inline_differential(struct __sk_buff *skb)
++{
++	struct diff_state s = {};
++	int i;
++
++	for (i = 0; i < 256; i++)
++		diff_step(&s);
++	return s.bad != 0;
++}
++
++/* emits BTF for the kfuncs that only inline assembly calls */
++void __kfunc_btf_root(void)
++{
++	bpf_prefetch(0);
++	bpf_testmod_inline_mov(0);
++	bpf_testmod_inline_xor(0, 0);
++	bpf_testmod_inline_div(0, 0);
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/test_kmods/Makefile b/tools/testing/selftests/bpf/test_kmods/Makefile
+index 031c7454ce65f..1800a0cd7a771 100644
+--- a/tools/testing/selftests/bpf/test_kmods/Makefile
++++ b/tools/testing/selftests/bpf/test_kmods/Makefile
+@@ -19,7 +19,7 @@ Q = @
+ endif
+ 
+ MODULES = bpf_testmod.ko bpf_test_no_cfi.ko bpf_test_modorder_x.ko \
+-	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko
++	bpf_test_modorder_y.ko bpf_test_rqspinlock.ko bpf_test_kfunc_body.ko
+ 
+ $(foreach m,$(MODULES),$(eval obj-m += $(m:.ko=.o)))
+ 
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_test_kfunc_body.c b/tools/testing/selftests/bpf/test_kmods/bpf_test_kfunc_body.c
+new file mode 100644
+index 0000000000000..2149bbd683381
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_test_kfunc_body.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/btf_ids.h>
++#include <linux/filter.h>
++#include <linux/init.h>
++#include <linux/module.h>
++
++struct bpf_test_kfunc_body_pair {
++	u64 a, b;
++};
++
++__bpf_kfunc_start_defs();
++
++__bpf_kfunc u64 bpf_test_kfunc_body(u64 x)
++{
++	return x;
++}
++
++__bpf_kfunc u64 bpf_test_kfunc_body_unset(u64 x)
++{
++	return x;
++}
++
++__bpf_kfunc u64 bpf_test_kfunc_body_pair(struct bpf_test_kfunc_body_pair p)
++{
++	return p.a;
++}
++
++__bpf_kfunc u64 bpf_test_kfunc_body_sleepable(u64 x)
++{
++	return x;
++}
++
++__bpf_kfunc_end_defs();
++
++BTF_KFUNCS_START(test_body_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_test_kfunc_body)
++BTF_KFUNCS_END(test_body_kfunc_ids)
++
++/* never registered */
++BTF_KFUNCS_START(test_body_bad_kfunc_ids)
++BTF_ID_FLAGS(func, bpf_test_kfunc_body_pair)
++BTF_ID_FLAGS(func, bpf_test_kfunc_body_sleepable, KF_SLEEPABLE)
++BTF_KFUNCS_END(test_body_bad_kfunc_ids)
++
++BTF_ID_LIST(test_body_ids)
++BTF_ID(func, bpf_test_kfunc_body)
++BTF_ID(func, bpf_test_kfunc_body_unset)
++BTF_ID(func, bpf_test_kfunc_body_pair)
++BTF_ID(func, bpf_test_kfunc_body_sleepable)
++
++static const struct bpf_insn test_body_insns[] = {
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++};
++
++/* writes R6 */
++static const struct bpf_insn test_body_bad_insns[] = {
++	BPF_MOV64_REG(BPF_REG_6, BPF_REG_1),
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++};
++
++/* jumps past the last instruction */
++static const struct bpf_insn test_body_jump_insns[] = {
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++	BPF_JMP_IMM(BPF_JEQ, BPF_REG_1, 0, 1),
++	BPF_MOV64_IMM(BPF_REG_0, 0),
++};
++
++static struct bpf_kfunc_body test_body = { .id = &test_body_ids[0] };
++
++static struct btf_kfunc_id_set test_body_set = {
++	.owner = THIS_MODULE,
++	.set = &test_body_kfunc_ids,
++	.bodies = &test_body,
++	.body_cnt = 1,
++};
++
++static int test_body_rejected(struct btf_id_set8 *set, const u32 *id,
++			      const struct bpf_insn *insns, u32 len)
++{
++	test_body_set.set = set;
++	test_body.id = id;
++	test_body.insns = insns;
++	test_body.len = len;
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &test_body_set) == -EINVAL;
++}
++
++/*
++ * The module loads only if registration rejects a body without instructions,
++ * one with an instruction that writes R6, one with a jump past its last
++ * instruction, one for a kfunc outside the set, one with an argument of two
++ * registers and one for a kfunc with flags.
++ */
++static int bpf_test_kfunc_body_init(void)
++{
++	struct btf_id_set8 *good = &test_body_kfunc_ids, *bad = &test_body_bad_kfunc_ids;
++
++	if (!test_body_rejected(good, &test_body_ids[0], NULL, 0) ||
++	    !test_body_rejected(good, &test_body_ids[0], test_body_bad_insns,
++				ARRAY_SIZE(test_body_bad_insns)) ||
++	    !test_body_rejected(good, &test_body_ids[0], test_body_jump_insns,
++				ARRAY_SIZE(test_body_jump_insns)) ||
++	    !test_body_rejected(good, &test_body_ids[1], test_body_insns, 1) ||
++	    !test_body_rejected(bad, &test_body_ids[2], test_body_insns, 1) ||
++	    !test_body_rejected(bad, &test_body_ids[3], test_body_insns, 1))
++		return -EINVAL;
++	test_body_set.set = good;
++	test_body.id = &test_body_ids[0];
++	return register_btf_kfunc_id_set(BPF_PROG_TYPE_UNSPEC, &test_body_set);
++}
++
++static void bpf_test_kfunc_body_exit(void)
++{
++}
++
++module_init(bpf_test_kfunc_body_init);
++module_exit(bpf_test_kfunc_body_exit);
++
++MODULE_DESCRIPTION("BPF kfunc body registration test module");
++MODULE_LICENSE("GPL");
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c b/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
+index 93847ca6293b4..13d5abe249d25 100644
+--- a/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_testmod.c
+@@ -931,6 +931,78 @@ BTF_ID_LIST(bpf_testmod_dtor_ids)
+ BTF_ID(struct, bpf_testmod_ctx)
+ BTF_ID(func, bpf_testmod_ctx_release_dtor)
+ 
++/*
++ * Kfuncs with a body, in a set that XDP programs may not use: the JIT copies
++ * the first, the second has native code from this module, and the third,
++ * which divides, keeps its body.
++ */
++__bpf_kfunc u64 bpf_testmod_inline_mov(u64 x)
++{
++	return x;
++}
++
++__bpf_kfunc u64 bpf_testmod_inline_xor(u64 a, u64 b)
++{
++	return a ^ b;
++}
++
++__bpf_kfunc u64 bpf_testmod_inline_div(u64 a, u64 b)
++{
++	return b ? a / b : 0;
++}
++
++BTF_ID_LIST(bpf_testmod_body_ids)
++BTF_ID(func, bpf_testmod_inline_mov)
++BTF_ID(func, bpf_testmod_inline_xor)
++BTF_ID(func, bpf_testmod_inline_div)
++
++static const struct bpf_insn mov_body[] = {
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++};
++
++static const struct bpf_insn xor_body[] = {
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++	BPF_ALU64_REG(BPF_XOR, BPF_REG_0, BPF_REG_2),
++};
++
++static const struct bpf_insn div_body[] = {
++	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
++	BPF_ALU64_REG(BPF_DIV, BPF_REG_0, BPF_REG_2),
++};
++
++#ifdef CONFIG_X86_64
++/* op %src, %dst on 64-bit registers */
++static u8 *x86_op(u8 *p, u8 op, u8 src, u8 dst)
++{
++	*p++ = 0x48 | (src & 8 ? 4 : 0) | (dst & 8 ? 1 : 0);
++	*p++ = op;
++	*p++ = 0xc0 | (src & 7) << 3 | (dst & 7);
++	return p;
++}
++
++/* the result can take the register of an argument, which a copy cannot */
++static int xor_emit(const u8 *reg, const s32 *imm, u8 *buf)
++{
++	u8 dst = reg[0], a = reg[1], b = reg[2], *p = buf;
++
++	if (dst == b)
++		swap(a, b);
++	if (dst != a)
++		p = x86_op(p, 0x89, a, dst);	/* mov %a, %dst */
++	return x86_op(p, 0x31, b, dst) - buf;	/* xor %b, %dst */
++}
++#else
++#define xor_emit	NULL
++#endif
++
++#define BODY(i, op, emit)	{ &bpf_testmod_body_ids[i], op##_body, ARRAY_SIZE(op##_body), emit }
++
++static const struct bpf_kfunc_body bpf_testmod_bodies[] = {
++	BODY(0, mov, NULL),
++	BODY(1, xor, xor_emit),
++	BODY(2, div, NULL),
++};
++
+ static const struct btf_kfunc_id_set bpf_testmod_common_kfunc_set = {
+ 	.owner = THIS_MODULE,
+ 	.set   = &bpf_testmod_common_kfunc_ids,
+@@ -1827,6 +1899,9 @@ BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg, KF_IMPLICIT_ARGS)
+ BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg_legacy, KF_IMPLICIT_ARGS)
+ BTF_ID_FLAGS(func, bpf_kfunc_implicit_arg_legacy_impl)
+ BTF_ID_FLAGS(func, bpf_kfunc_trigger_ctx_check)
++BTF_ID_FLAGS(func, bpf_testmod_inline_mov)
++BTF_ID_FLAGS(func, bpf_testmod_inline_xor)
++BTF_ID_FLAGS(func, bpf_testmod_inline_div)
+ BTF_KFUNCS_END(bpf_testmod_check_kfunc_ids)
+ 
+ static int bpf_testmod_ops_init(struct btf *btf)
+@@ -1861,6 +1936,8 @@ static int bpf_testmod_ops_init_member(const struct btf_type *t,
+ static const struct btf_kfunc_id_set bpf_testmod_kfunc_set = {
+ 	.owner = THIS_MODULE,
+ 	.set   = &bpf_testmod_check_kfunc_ids,
++	.bodies = bpf_testmod_bodies,
++	.body_cnt = ARRAY_SIZE(bpf_testmod_bodies),
+ };
+ 
+ static const struct bpf_verifier_ops bpf_testmod_verifier_ops = {
+diff --git a/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h b/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
+index 67c02a421d133..2a55f1b145b42 100644
+--- a/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
++++ b/tools/testing/selftests/bpf/test_kmods/bpf_testmod_kfunc.h
+@@ -357,4 +357,8 @@ void bpf_testmod_test_hardirq_fn(void);
+ void bpf_testmod_test_softirq_fn(void);
+ void bpf_kfunc_trigger_ctx_check(void) __ksym;
+ 
++u64 bpf_testmod_inline_mov(u64 x) __ksym;
++u64 bpf_testmod_inline_xor(u64 a, u64 b) __ksym;
++u64 bpf_testmod_inline_div(u64 a, u64 b) __ksym;
++
+ #endif /* _BPF_TESTMOD_KFUNC_H */
+
+From patchwork Mon Oct  5 14:22:19 2026
+Content-Type: text/plain; charset="utf-8"
+MIME-Version: 1.0
+Content-Transfer-Encoding: 7bit
+X-Patchwork-Submitter: Yusheng Zheng <yunwei356@gmail.com>
+X-Patchwork-Id: 14868160
+X-Patchwork-Delegate: bpf@iogearbox.net
+Received: from mail-wr1-f52.google.com (mail-wr1-f52.google.com
+ [209.85.221.52])
+	(using TLSv1.2 with cipher ECDHE-RSA-AES128-GCM-SHA256 (128/128 bits))
+	(No client certificate requested)
+	by smtp.subspace.kernel.org (Postfix) with ESMTPS id DB4B54A3F08
+	for <bpf@vger.kernel.org>; Mon,  5 Oct 2026 14:22:34 +0000 (UTC)
+Authentication-Results: smtp.subspace.kernel.org;
+ arc=none smtp.client-ip=209.85.221.52
+ARC-Seal: i=1; a=rsa-sha256; d=subspace.kernel.org; s=arc-20240116;
+	t=1791210167; cv=none;
+ b=mgiU4X24giOLw56tBFSZ4k00p83qkVjGFyCTqOZSNp0mjbWvG36OGtHAdfF9skhWARfj3k1vkEGviE3SA6tlosv82JhBFaQCsSz+fITk2PUrJygNvuvAFL5xTktcO+ANxG7AaPQef4hbBZnp65kKTXJ60PaXQTD0Da06BQjeRF4=
+ARC-Message-Signature: i=1; a=rsa-sha256; d=subspace.kernel.org;
+	s=arc-20240116; t=1791210167; c=relaxed/simple;
+	bh=Al3Ou5xDIlDvOZsKbO404TDLybJtkzDi6cyyzqSInBc=;
+	h=From:To:Cc:Subject:Date:Message-ID:In-Reply-To:References:
+	 MIME-Version;
+ b=sctC0ELU5fLuWWzGy4wSesoxcgv4i+cR4tSLw2hx5+GK2l7J9GSptBc96vPS90FPBNioOZgC0VBnoNVKiYMXx/LTtDHX6fhCGFYc0lhwl3sgrjYZ+007EAzxKx0P1qv16nUp6Mj0Qz2XXZT06ik2UI/6Tt5C+znVYjfq9LIy4mI=
+ARC-Authentication-Results: i=1; smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com;
+ spf=pass smtp.mailfrom=gmail.com;
+ dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b=oOgrlhO6; arc=none smtp.client-ip=209.85.221.52
+Authentication-Results: smtp.subspace.kernel.org;
+ dmarc=pass (p=none dis=none) header.from=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+ spf=pass smtp.mailfrom=gmail.com
+Authentication-Results: smtp.subspace.kernel.org;
+	dkim=pass (2048-bit key) header.d=gmail.com header.i=@gmail.com
+ header.b="oOgrlhO6"
+Received: by mail-wr1-f52.google.com with SMTP id
+ ffacd0b85a97d-48b9d8055dfso1541377f8f.3
+        for <bpf@vger.kernel.org>; Mon, 05 Oct 2026 07:22:34 -0700 (PDT)
+DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=gmail.com; s=20251104; t=1791210151; x=1791814951;
+ darn=vger.kernel.org;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:from:to:cc:subject:date
+         :message-id:reply-to:content-type;
+        bh=USjY1SH6AnGCgxcS0SMAmMOnjMUJRvJrIX5TDxED82I=;
+        b=oOgrlhO6OmJ2FIkyq+JuyZ58InA++iNOh4R1xWUoQvxdBoraPSLz4LtPE54W5EvPiD
+         cALmvuDZdKLK9bMe4ygG39lMic0iDZQKfy1bOIGxMzidf+aGL6/m5HVxsfHS31YhzPLA
+         3iX8J8Qg26qJu5nhMNCae/AUZcKMnWFkIbfTIEQ/7djMpYxI0ALawm2xsJArT3s3v7Q2
+         RQ+LjM9T7DMiQujhz6ziQTPXYEGjkCRrUnA9v8/hT44aZSHDxTM0p0JGA5fA4dcQjczr
+         YaHD9hFggF4ZMQI784CSt4ygRQ3u1NC5k+2tWbN4Srn+MXSmbQD9LRZWJdb2AhH8mNm3
+         iUUA==
+X-Google-DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed;
+        d=1e100.net; s=20260707; t=1791210151; x=1791814951;
+        h=content-transfer-encoding:mime-version:references:in-reply-to
+         :message-id:date:subject:cc:to:from:x-gm-gg:x-gm-message-state:from
+         :to:cc:subject:date:message-id:reply-to:content-type;
+        bh=USjY1SH6AnGCgxcS0SMAmMOnjMUJRvJrIX5TDxED82I=;
+        b=NhoRicQ77XNZufAgSFL//MBkSLIalRc5t3sO2iXTPtJ1HHFHgi2TXBI3RXwRHhwnpJ
+         QvGaP207LW98C6zZU8aL1EHgrtkJf+KJQHnIQyy3F/xCf3VD0cJ3bK4HLR4zxRadFvMW
+         nt0FqZ0ENX66rMjPXeUZBxa63Q4v8pPY8x3xKUpYCp1eee+1f4xe2xHG2d14nq1YXIQg
+         W4nMrnKN1nta4bnZfyyuD35UA8t7hDV9J1apTpRU4Fg5in1Nloji2zej4pLf8fxLydrv
+         U/KrLD6A/fGk8oN+/dLFr1h1cb28A8UbCUtziU5tg5h563JTauOtgAUP0MmPcqm0B5A1
+         Mlng==
+X-Gm-Message-State: AFq9FYKXyT9f8xqKs4gRNDRnSt24aO/8+38DeGdwA9f99iqzeQOkzMJs
+	FR8+6/fWWNtiaHMm4i60uFo4HUsEPwqNURp5GHpoMvWOyI2OrTIHgwWqIivM0CYSKMqaZFck
+X-Gm-Gg: AYBFou2dyd/QkZua1yjAMV4ZEGzeroWNP/IY5T6ZZ/KgkOMIJKvlSPw+4IYO8lFmw/q
+	U7sTSlKSCG7eq/4D39KxNhDGevP0EbXnC5rvxR00T62n6bos+yr1ynNeEGctIHMMisSqu4b9TuH
+	eYoLMJ26x9dvzUl/czMNb9tdh+zMYZbf+0zqMjcHIQpFquCkIWLdhfyXPHcCwI7ZD8w1wMPi6c4
+	jg+m7sqsOe1K6d9AO1u3MYY1x3r2HBJFrA0Y9J80XC/xn+1mmOGbykkqyiftZ+2lAFZVcoRbYqS
+	eOQwdGKnvnEmVUTZgXD6w/VfrvYZkeDJX1rlpAKNyrKvNru03wcB8qGGZ6CVvJ2BsA8hmjwi9DR
+	ba8YpfdozIM5r3jXbYEsLTkwvUVd6MQ131YD2ybA+lwvAAbUXpTksEfii1ISpiC6gS//sBz5lIv
+	sTytIhfAs9KEWnb6WgtdgUABP5HrIjpzCNCAi1ajOSfW3tVVdYBldtEIf4X5i4ON7bKYAWVyOfp
+	bgTNygUN+88Yc39V1E4R/P1XEhk0dOcKzeDDuc/EfVH8WGjLu6QBjB9k2ABngptaWLggjvSG7gj
+	EkR6e4fq/ZCFsMrYjEu4VMJaqJXWNxxqxQnrXw==
+X-Received: by 2002:a05:6000:200e:b0:488:8411:1d08 with SMTP id
+ ffacd0b85a97d-48c4801c7f9mr11471589f8f.48.1791210151219;
+        Mon, 05 Oct 2026 07:22:31 -0700 (PDT)
+Received: from macbook (90-182-211-1.rcp.o2.cz. [90.182.211.1])
+        by smtp.gmail.com with ESMTPSA id
+ ffacd0b85a97d-48c622ab5a1sm3881623f8f.36.2026.10.05.07.22.30
+        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);
+        Mon, 05 Oct 2026 07:22:30 -0700 (PDT)
+From: Yusheng Zheng <yunwei356@gmail.com>
+To: bpf@vger.kernel.org
+Cc: Alexei Starovoitov <ast@kernel.org>,
+	Daniel Borkmann <daniel@iogearbox.net>,
+	Andrii Nakryiko <andrii@kernel.org>,
+	Eduard Zingerman <eddyz87@gmail.com>,
+	Kumar Kartikeya Dwivedi <memxor@gmail.com>,
+	Martin KaFai Lau <martin.lau@linux.dev>,
+	Song Liu <song@kernel.org>,
+	Yonghong Song <yonghong.song@linux.dev>,
+	Jiri Olsa <jolsa@kernel.org>,
+	John Fastabend <john.fastabend@gmail.com>,
+	Emil Tsalapatis <emil@etsalapatis.com>,
+	Ihor Solodrai <ihor.solodrai@linux.dev>,
+	x86@kernel.org,
+	Thomas Gleixner <tglx@kernel.org>,
+	Ingo Molnar <mingo@redhat.com>,
+	Borislav Petkov <bp@alien8.de>,
+	Dave Hansen <dave.hansen@linux.intel.com>,
+	"H . Peter Anvin" <hpa@zytor.com>,
+	Leon Hwang <leon.hwang@linux.dev>,
+	Puranjay Mohan <puranjay@kernel.org>,
+	Hao Sun <sunhao.th@gmail.com>,
+	Yusheng Zheng <yunwei356@gmail.com>
+Subject: [RFC PATCH bpf-next 7/7] Documentation/bpf: Describe inline kfuncs
+Date: Mon,  5 Oct 2026 07:22:19 -0700
+Message-ID: <20261005142219.33451-8-yunwei356@gmail.com>
+X-Mailer: git-send-email 2.54.0.windows.1
+In-Reply-To: <20261005142219.33451-1-yunwei356@gmail.com>
+References: <20261005142219.33451-1-yunwei356@gmail.com>
+Precedence: bulk
+X-Mailing-List: bpf@vger.kernel.org
+List-Id: <bpf.vger.kernel.org>
+List-Subscribe: <mailto:bpf+subscribe@vger.kernel.org>
+List-Unsubscribe: <mailto:bpf+unsubscribe@vger.kernel.org>
+MIME-Version: 1.0
+X-Patchwork-Delegate: bpf@iogearbox.net
+X-Patchwork-State: RFC
+
+Add a section on kfuncs with a body to kfuncs.rst: how the verifier
+handles their calls, where their native code comes from, and how a
+kfunc set gives a kfunc a body.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
+---
+ Documentation/bpf/kfuncs.rst | 53 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 53 insertions(+)
+
+diff --git a/Documentation/bpf/kfuncs.rst b/Documentation/bpf/kfuncs.rst
+index 73578a4c3b1fb..432e61a82aa9d 100644
+--- a/Documentation/bpf/kfuncs.rst
++++ b/Documentation/bpf/kfuncs.rst
+@@ -695,6 +695,59 @@ verified inline, so an unassigned R2 is simply passed back to the caller as
+ uninitialized and only a caller that reads it fails. A stack pointer left in
+ R2 is still rejected there, just as one in R0 is.
+ 
++2.10 Inline kfuncs
++------------------
++
++A kfunc can come with a body: a few BPF instructions that compute it from its
++arguments in R1-R5 into R0. The verifier then checks each call of the kfunc as
++its body, so it knows as much about the result as if the program had computed
++it in BPF, and the JIT puts native code in place of the call. Where the JIT has
++no native code, the body runs in place of the call. BPF programs call such
++kfuncs like any other, and arguments whose names end in ``__k`` must be known
++constants (see section 2.3.2). ``CONFIG_BPF_INSN_KFUNCS`` provides
++``bpf_rol64()``, ``bpf_select64()``, ``bpf_extract64()``, ``bpf_load_be64()``,
++``bpf_prefetch()``, ``bpf_copy16()`` and ``bpf_lea64()``.
++
++The verifier replaces each call with the body before it analyzes the program.
++Only the arguments are readable at the entry of the body, and R1-R5 are not
++readable after it, as after a call. After the analysis, a call goes back into
++the program if the JIT has native code for it, with its operands bound to the
++registers that the moves around the call copied them from or to. The body stays
++when the verifier rewrites it later, for example with speculation barriers,
++when it accesses memory other than the stack, map values, memory and packets,
++and when constant blinding is on.
++
++The native code comes from the kfunc set: an ``emit`` callback writes it for
++the architecture, such as ``rol $13`` or ``movbe 8(%rdi)`` on x86-64. Without
++``emit``, or when it has no code for the CPU, the x86-64 JIT copies the
++compiled kfunc with its registers renamed. It copies only straight-line moves,
++ALU instructions and address computations on the registers of a call, without
++division or rip-relative addressing. Native code is trusted like the rest of
++the JIT: it has to compute what the body computes, with the same memory
++accesses.
++
++A kfunc set gives bodies to some of its kfuncs::
++
++        static const struct bpf_insn rol64_body[] = { ... };
++
++        static const struct bpf_kfunc_body bodies[] = {
++                { &body_ids[0], rol64_body, ARRAY_SIZE(rol64_body), rol64_emit },
++        };
++
++        static const struct btf_kfunc_id_set kfunc_set = {
++                .set      = &kfunc_ids,
++                .bodies   = bodies,
++                .body_cnt = ARRAY_SIZE(bodies),
++        };
++
++Registration checks each body: it may use R0-R5, ALU instructions, loads and
++stores, and forward jumps that land within it, so that it ends by falling
++through its last instruction, but not the sign extension, signed division and
++byte swap of cpu v4, which not every JIT has. Each argument and the result must
++fit in one register, and the kfunc may have no kfunc flags. ``emit`` writes at
++most ``BPF_KFUNC_INLINE_MAX`` bytes. Modules give their kfuncs bodies and
++native code in the same way.
++
+ .. _BPF_kfunc_lifecycle_expectations:
+ 
+ 3. kfunc lifecycle expectations

@@ -1,0 +1,39 @@
+From 83ecbb7698d006fb2464a78770c03c79e1099dd3 Mon Sep 17 00:00:00 2001
+From: Yunwei 123 <yunwei356@gmail.com>
+Date: Tue, 27 Oct 2026 19:13:33 +0000
+Subject: [RFC PATCH bpf-next v2 0/6] *** SUBJECT HERE ***
+
+*** BLURB HERE ***
+
+Yusheng Zheng (6):
+  bpf: Let JITs inline KF_FASTCALL kfuncs
+  bpf: Add bpf_rol64() and bpf_select64() kfuncs
+  bpf, x86: Inline KF_FASTCALL kfuncs by copying them
+  bpf, arm64: Inline KF_FASTCALL kfuncs by copying them
+  selftests/bpf: Test KF_FASTCALL kfuncs that the JIT inlines
+  Documentation/bpf: Describe KF_FASTCALL
+
+ Documentation/bpf/kfuncs.rst                  |  26 ++
+ arch/arm64/net/bpf_jit_comp.c                 | 152 +++++++++++
+ arch/x86/net/bpf_jit_comp.c                   | 190 ++++++++++++++
+ include/linux/bpf.h                           |   5 +
+ include/linux/bpf_verifier.h                  |   4 +
+ include/linux/filter.h                        |   1 +
+ kernel/bpf/core.c                             |  23 ++
+ kernel/bpf/helpers.c                          |  12 +
+ kernel/bpf/verifier.c                         |  26 +-
+ .../selftests/bpf/prog_tests/kfunc_inline.c   |  63 +++++
+ .../selftests/bpf/progs/kfunc_inline.c        |  26 ++
+ .../selftests/bpf/progs/kfunc_inline_jit.c    | 235 ++++++++++++++++++
+ .../selftests/bpf/test_kmods/bpf_testmod.c    |  21 ++
+ .../bpf/test_kmods/bpf_testmod_kfunc.h        |   4 +
+ 14 files changed, 783 insertions(+), 5 deletions(-)
+ create mode 100644 tools/testing/selftests/bpf/prog_tests/kfunc_inline.c
+ create mode 100644 tools/testing/selftests/bpf/progs/kfunc_inline.c
+ create mode 100644 tools/testing/selftests/bpf/progs/kfunc_inline_jit.c
+
+
+base-commit: b116ac6087541d3d98031e786adbe9c733cd6df3
+-- 
+2.51.1
+

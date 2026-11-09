@@ -1,0 +1,20 @@
+selftests/bpf: Test KF_FASTCALL kfuncs that the JIT inlines
+
+Add three KF_FASTCALL kfuncs to bpf_testmod: a comparison, which
+compiles to setcc on x86-64 and to cset on arm64, a function whose code
+uses registers beyond its argument, and a division, which has a branch
+and is therefore called.
+
+kfunc_inline_jit checks that the verifier removes the spills and fills
+around calls that the JIT inlines and keeps them around the division,
+and what the x86-64 and arm64 JITs emit. It also checks that registers
+that are live after a call keep their values when the copied code uses
+them, and that they are not saved when they are dead. kfunc_inline
+compares the results of bpf_rol64(), bpf_select64() and the bpf_testmod
+kfuncs with their C definitions on random inputs.
+
+The tests are not in verifier.c, which drops CAP_SYS_ADMIN, which
+libbpf needs to find the kfuncs of bpf_testmod.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>

@@ -1,0 +1,25 @@
+bpf, arm64: Inline KF_FASTCALL kfuncs by copying them
+
+As on x86-64, copy the code of a small KF_FASTCALL kfunc into the
+program instead of calling it. The arguments are in x0-x4, where the
+JIT keeps R1-R5, so only the result needs a move, from x0 to x8, where
+it keeps R0. For bpf_rol64():
+
+  r1 = x                 mov  x0, #x
+  r2 = 8                 mov  x1, #0x8
+  call bpf_rol64         neg  w1, w1
+                         ror  x0, x0, x1
+                         mov  x8, x0
+
+emit_kfunc_inline() skips BTI and the ftrace patch site, which is
+"mov x9, x30; bl <caller>" while the kfunc is traced, and copies the
+kfunc up to 'ret' if it has at most 16 instructions and all of them are
+data processing on registers and immediates: no loads or stores,
+branches, PC-relative addressing, system instructions or sp. The code
+may clobber R0 and the arguments, and use x5-x7 and x9-x17, which hold
+no BPF register or only the JIT's temporaries. R0 of a void kfunc and
+the registers whose spills and fills the verifier removed are moved to
+some of x5-x7 and x9-x17 that the code does not use, and back.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>

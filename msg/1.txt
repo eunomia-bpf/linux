@@ -1,0 +1,24 @@
+bpf: Let JITs inline KF_FASTCALL kfuncs
+
+With the bpf_fastcall convention, LLVM keeps the registers R1-R5 that
+are not arguments live across a call by spilling them before the call
+and filling them after it. The verifier removes these spills and fills
+when the call does not clobber the registers. For kfuncs it does that
+for every KF_FASTCALL kfunc, which is right only because the two in the
+tree, bpf_cast_to_kern_ctx() and bpf_rdonly_cast(), are replaced by
+the verifier.
+
+Let the JIT inline KF_FASTCALL kfuncs too. bpf_add_kfunc_call() asks
+it with bpf_jit_inlines_kfunc_call() and sets BTF_FMODEL_JIT_INLINE in
+the func_model of the kfunc if it does. A call is then treated as
+bpf_fastcall only if the verifier or the JIT inlines it. Otherwise the
+spills and fills stay and the kfunc is called as before.
+
+The verifier also records which registers it removed the spills and
+fills of, and bpf_fastcall_spilled_regs() tells the JIT, so that it
+saves only the registers that are live after the call.
+
+Suggested-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/DM6P2S5E5F3M.3RB3ECL75G1PJ@gmail.com/
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>

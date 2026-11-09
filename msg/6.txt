@@ -1,0 +1,7 @@
+Documentation/bpf: Describe KF_FASTCALL
+
+KF_FASTCALL is not described in kfuncs.rst. Describe what it means for
+the calls of a kfunc and when the JIT copies the kfunc.
+
+Assisted-by: LLM
+Signed-off-by: Yusheng Zheng <yunwei356@gmail.com>
