@@ -440,7 +440,7 @@ static void push_callee_regs(struct jit_ctx *ctx)
 	 * Callee-saved registers as the exception callback needs to recover
 	 * all ARM64 Callee-saved registers in its epilogue.
 	 */
-	if (ctx->prog->aux->exception_boundary) {
+	if (ctx->native || ctx->prog->aux->exception_boundary) {
 		emit(A64_PUSH(A64_R(19), A64_R(20), A64_SP), ctx);
 		emit(A64_PUSH(A64_R(21), A64_R(22), A64_SP), ctx);
 		emit(A64_PUSH(A64_R(23), A64_R(24), A64_SP), ctx);
@@ -474,7 +474,7 @@ static void pop_callee_regs(struct jit_ctx *ctx)
 	 * program's stack frame, so recover these extra registers in the above
 	 * two cases.
 	 */
-	if (aux->exception_boundary || aux->exception_cb) {
+	if (ctx->native || aux->exception_boundary || aux->exception_cb) {
 		emit(A64_POP(A64_R(27), A64_R(28), A64_SP), ctx);
 		emit(A64_POP(A64_R(25), A64_R(26), A64_SP), ctx);
 		emit(A64_POP(A64_R(23), A64_R(24), A64_SP), ctx);
