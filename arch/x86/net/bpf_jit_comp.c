@@ -3842,10 +3842,7 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	struct exception_table_entry *ex, *rw_ex;
 	u8 *image, *rw, *p, *body;
 	u32 i;
-	bool callee_regs[4];
-
-	for (i = 0; i < ARRAY_SIZE(callee_regs); i++)
-		callee_regs[i] = native->callee_saved_mask & BIT(i);
+	bool callee_regs[4] = { true, true, true, true };
 	header = bpf_jit_binary_pack_alloc(size + native->nr_sites * sizeof(*ex),
 					   &image, align, &rw_header, &rw,
 					   jit_fill_hole);
@@ -3856,6 +3853,8 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	emit_prologue(&p, image, 0, bpf_prog_was_classic(prog),
 		      prog->aux->tail_call_reachable, false, false);
 	push_callee_regs(&p, callee_regs);
+	push_r12(&p);
+	*p++ = 0x55; /* preserve the frame pointer across P */
 	body = image + (p - rw);
 	memcpy(p, native->bytes, native->len);
 	if (bpf_native_relocate(prog, native, p, body)) {
@@ -3863,6 +3862,8 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 		goto out;
 	}
 	p += native->len;
+	*p++ = 0x5D; /* recover the stock frame pointer before leave */
+	pop_r12(&p);
 	pop_callee_regs(&p, callee_regs);
 	*p++ = 0xC9; /* leave */
 	emit_return(&p, image + (p - rw));
