@@ -10,11 +10,13 @@
 #include <linux/arm-smccc.h>
 #include <linux/bitfield.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
 #include <linux/cfi.h>
 #include <linux/filter.h>
 #include <linux/memory.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <asm/asm-extable.h>
 #include <asm/byteorder.h>
@@ -78,6 +80,7 @@ static const int bpf2a64[] = {
 
 struct jit_ctx {
 	const struct bpf_prog *prog;
+	const struct bpf_native_image *native;
 	int idx;
 	int epilogue_offset;
 	int *offset;
@@ -378,6 +381,10 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 	const struct bpf_insn *insn = &prog->insnsi[0];
 	int reg_used = 0;
 
+	if (ctx->native) {
+		reg_used = ctx->native->callee_saved_mask;
+		goto selected;
+	}
 	for (i = 0; i < prog->len; i++, insn++) {
 		if (insn->dst_reg == BPF_REG_6 || insn->src_reg == BPF_REG_6)
 			reg_used |= 1;
@@ -397,6 +404,7 @@ static void find_used_callee_regs(struct jit_ctx *ctx)
 		}
 	}
 
+selected:
 	i = 0;
 	if (reg_used & 1)
 		ctx->used_callee_reg[i++] = bpf2a64[BPF_REG_6];
@@ -596,7 +604,7 @@ static int build_prologue(struct jit_ctx *ctx, bool ebpf_from_cbpf)
 	}
 
 	/* Stack must be multiples of 16B */
-	ctx->stack_size = round_up(prog->aux->stack_depth, 16);
+	ctx->stack_size = ctx->native ? 0 : round_up(prog->aux->stack_depth, 16);
 
 	if (ctx->fp_used) {
 		if (ctx->priv_sp_used) {
@@ -1096,6 +1104,16 @@ bool ex_handler_bpf(const struct exception_table_entry *ex,
 	bool is_write = (dst_reg == DONT_CLEAR);
 	unsigned long addr;
 
+	if (ex->fixup & BPF_NATIVE_ARM64_LOAD) {
+		u32 second = (ex->fixup >> 16) & 31;
+
+		if (dst_reg < 31)
+			regs->regs[dst_reg] = 0;
+		if ((ex->fixup & BPF_NATIVE_ARM64_PAIR) && second < 31)
+			regs->regs[second] = 0;
+		regs->pc += AARCH64_INSN_SIZE;
+		return true;
+	}
 	if (is_arena) {
 		addr = regs->regs[arena_reg] + off;
 		bpf_prog_report_arena_violation(is_write, addr, regs->pc);
@@ -2006,10 +2024,138 @@ struct arm64_jit_data {
 	struct jit_ctx ctx;
 };
 
+static int bpf_native_relocate(const struct bpf_prog *prog,
+							   const struct bpf_native_image *native,
+							   u8 *rw, const u8 *rx)
+{
+	u32 i, j;
+
+	for (i = 0; i < native->nr_relocs; i++) {
+		const struct bpf_native_reloc *r = &native->relocs[i];
+		struct bpf_map *map = NULL;
+		u64 value = r->target;
+		s64 imm;
+		u32 word;
+		int err;
+
+		switch (r->kind) {
+		case BPF_NATIVE_RELOC_READONLY_DATA:
+		case BPF_NATIVE_RELOC_EXCLUSIVE_FAILURE:
+			continue;
+		case BPF_NATIVE_RELOC_MAP_POINTER:
+		case BPF_NATIVE_RELOC_MAP_VALUE:
+			for (j = 0; j < prog->aux->used_map_cnt; j++)
+				if (prog->aux->used_maps[j]->id == (u32)r->target)
+					map = prog->aux->used_maps[j];
+			if (!map)
+				return -ENOENT;
+			value = (unsigned long)map;
+			if (r->kind == BPF_NATIVE_RELOC_MAP_VALUE) {
+				if (!map->ops->map_direct_value_addr)
+					return -EINVAL;
+				err = map->ops->map_direct_value_addr(map, &value, r->target >> 32);
+				if (err)
+					return err;
+				value += r->target >> 32;
+			}
+			fallthrough;
+		case BPF_NATIVE_RELOC_HELPER_POINTER:
+			if ((u64)r->offset + sizeof(value) > native->len)
+				return -ERANGE;
+			put_unaligned_le64(value, rw + r->offset);
+			continue;
+		case BPF_NATIVE_RELOC_ARM64_PERCPU:
+			if ((u64)r->offset + sizeof(word) > native->len)
+				return -ERANGE;
+			word = cpus_have_cap(ARM64_HAS_VIRT_HOST_EXTN) ?
+				0xd53cd04aU : 0xd538d08aU;
+			put_unaligned_le32(word, rw + r->offset);
+			continue;
+		case BPF_NATIVE_RELOC_ARM64_CALL:
+		case BPF_NATIVE_RELOC_ARM64_BL26:
+			if ((u64)r->offset + (r->kind == BPF_NATIVE_RELOC_ARM64_CALL ? 16 : 4) > native->len)
+				return -ERANGE;
+			imm = (s64)r->target - (s64)(rx + r->offset);
+			if (imm & 3)
+				return -EINVAL;
+			imm /= 4;
+			if (imm >= -(1LL << 25) && imm < (1LL << 25)) {
+				put_unaligned_le32(0x94000000U | ((u32)imm & 0x03ffffff), rw + r->offset);
+			} else {
+				if (r->kind == BPF_NATIVE_RELOC_ARM64_BL26 || (value >> 48) != 0xffff)
+					return -ERANGE;
+				put_unaligned_le32(0x9280000aU | ((u32)(~value & 0xffff) << 5), rw + r->offset);
+				put_unaligned_le32(0xf2a0000aU | ((u32)((value >> 16) & 0xffff) << 5), rw + r->offset + 4);
+				put_unaligned_le32(0xf2c0000aU | ((u32)((value >> 32) & 0xffff) << 5), rw + r->offset + 8);
+				put_unaligned_le32(0xd63f0140U, rw + r->offset + 12);
+			}
+			continue;
+		default:
+			return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+/* The stock entry/return surround the kernel copy of linked P. */
+static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
+									 struct bpf_native_image *native)
+{
+	u32 align = __alignof__(struct exception_table_entry);
+	u32 offset = roundup(native->len + 256, align);
+	struct bpf_binary_header *header, *rw_header;
+	struct exception_table_entry *ex, *rw_ex;
+	struct jit_ctx ctx = { .prog = prog, .native = native, .write = true };
+	u8 *image, *rw, *body;
+	u32 i, body_idx, prog_size;
+
+	header = bpf_jit_binary_pack_alloc(offset + native->nr_sites * sizeof(*ex),
+									  &image, align, &rw_header, &rw,
+									  jit_fill_hole);
+	if (!header)
+		goto out;
+	ctx.image = (__le32 *)rw;
+	ctx.ro_image = (__le32 *)image;
+	if (build_prologue(&ctx, bpf_prog_was_classic(prog)))
+		goto free_header;
+	body_idx = ctx.idx;
+	body = image + body_idx * AARCH64_INSN_SIZE;
+	memcpy(rw + body_idx * AARCH64_INSN_SIZE, native->bytes, native->len);
+	if (bpf_native_relocate(prog, native, rw + body_idx * AARCH64_INSN_SIZE, body))
+		goto free_header;
+	ctx.idx += native->len / AARCH64_INSN_SIZE;
+	emit(A64_MOV(1, bpf2a64[BPF_REG_0], A64_R(0)), &ctx);
+	build_epilogue(&ctx, bpf_prog_was_classic(prog));
+	build_plt(&ctx);
+	prog_size = ctx.idx * AARCH64_INSN_SIZE;
+	ex = (void *)image + offset;
+	rw_ex = (void *)rw + offset;
+	for (i = 0; i < native->nr_sites; i++) {
+		rw_ex[i].insn = body + native->sites[i].offset - (u8 *)&ex[i].insn;
+		rw_ex[i].fixup = native->sites[i].fixup;
+		rw_ex[i].type = EX_TYPE_BPF;
+	}
+	if (bpf_jit_binary_pack_finalize(header, rw_header))
+		goto out;
+	bpf_flush_icache(header, ctx.ro_image + ctx.idx);
+	prog->aux->extable = ex;
+	prog->aux->num_exentries = native->nr_sites;
+	prog->bpf_func = (void *)image + cfi_get_offset();
+	prog->jited = 1;
+	prog->jited_len = prog_size - cfi_get_offset();
+	goto out;
+free_header:
+	bpf_jit_binary_pack_free(header, rw_header);
+out:
+	bpf_native_image_free(native);
+	return prog;
+}
+
 struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 {
 	int image_size, prog_size, extable_size, extable_align, extable_offset;
 	struct bpf_prog *tmp, *orig_prog = prog;
+	struct bpf_native_image *native;
 	struct bpf_binary_header *header;
 	struct bpf_binary_header *ro_header = NULL;
 	struct arm64_jit_data *jit_data;
@@ -2026,6 +2172,10 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
 
 	if (!prog->jit_requested)
 		return orig_prog;
+
+	native = bpf_native_image_take(prog);
+	if (native)
+		return bpf_native_jit(prog, native);
 
 	tmp = bpf_jit_blind_constants(prog);
 	/* If blinding was requested and we failed during blinding,

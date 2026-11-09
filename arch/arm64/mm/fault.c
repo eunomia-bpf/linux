@@ -7,6 +7,7 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 
+#include <linux/bpf.h>
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
 #include <linux/extable.h>
@@ -612,6 +613,11 @@ static int __kprobes do_page_fault(unsigned long far, unsigned long esr,
 	}
 
 	if (is_ttbr0_addr(addr) && is_el1_permission_fault(addr, esr, regs)) {
+		/* Native BPF load sites use the stock exception-table recovery. */
+		if (!is_el1_instruction_abort(esr) &&
+		    search_bpf_extables(regs->pc) && fixup_exception(regs, esr))
+			return 0;
+
 		if (is_el1_instruction_abort(esr))
 			die_kernel_fault("execution of user memory",
 					 addr, esr, regs);

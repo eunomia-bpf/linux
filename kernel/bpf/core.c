@@ -24,6 +24,7 @@
 #include <linux/vmalloc.h>
 #include <linux/prandom.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
 #include <linux/btf.h>
 #include <linux/hex.h>
 #include <linux/objtool.h>
@@ -44,6 +45,70 @@
 
 #include <asm/barrier.h>
 #include <linux/unaligned.h>
+
+static DEFINE_SPINLOCK(bpf_native_lock);
+static struct bpf_native_image *bpf_native_pending;
+
+void bpf_native_image_free(struct bpf_native_image *image)
+{
+	if (!image)
+		return;
+	put_task_struct(image->owner);
+	kvfree(image->bytes);
+	kvfree(image->relocs);
+	kvfree(image->sites);
+	kfree(image);
+}
+
+/* The next program the calling task verifies gets this image; NULL disarms. */
+void bpf_native_image_arm(struct bpf_native_image *image)
+{
+	struct bpf_native_image *old;
+
+	if (image)
+		image->owner = get_task_struct(current);
+	spin_lock(&bpf_native_lock);
+	old = bpf_native_pending;
+	bpf_native_pending = image;
+	spin_unlock(&bpf_native_lock);
+	bpf_native_image_free(old);
+}
+EXPORT_SYMBOL_NS_GPL(bpf_native_image_arm, "BPF_INTERNAL");
+
+struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog)
+{
+	struct bpf_native_image *image;
+
+	spin_lock(&bpf_native_lock);
+	image = bpf_native_pending;
+	if (image && image->owner == current && !prog->is_func)
+		bpf_native_pending = NULL;
+	else
+		image = NULL;
+	spin_unlock(&bpf_native_lock);
+	return image;
+}
+
+/* Keep the armed entry across load errors, including diagnostic retries. */
+int bpf_native_image_prepare(const struct bpf_prog *prog)
+{
+	u32 i;
+	int err = 0;
+
+	spin_lock(&bpf_native_lock);
+	if (bpf_native_pending && bpf_native_pending->owner == current) {
+		for (i = 0; i < prog->len; i++) {
+			if ((prog->insnsi[i].code == (BPF_JMP | BPF_CALL) &&
+			     prog->insnsi[i].src_reg == BPF_PSEUDO_CALL) ||
+			    bpf_pseudo_func(&prog->insnsi[i])) {
+				err = -EOPNOTSUPP;
+				break;
+			}
+		}
+	}
+	spin_unlock(&bpf_native_lock);
+	return err;
+}
 
 /* Registers */
 #define BPF_R0	regs[BPF_REG_0]

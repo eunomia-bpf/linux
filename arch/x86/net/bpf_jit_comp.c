@@ -709,6 +709,43 @@ static void emit_return(u8 **pprog, u8 *ip)
 	*pprog = prog;
 }
 
+/* Compiler external thunks and native tail transfers use this same policy. */
+extern void bpf_native_plain_return(void);
+asm(".pushsection .text\n"
+    ".type bpf_native_plain_return,@function\n"
+    "bpf_native_plain_return:\n"
+    ANNOTATE_NOENDBR "\n"
+    ANNOTATE_RETPOLINE_SAFE "\n"
+    "ret\nint3\n"
+    ".size bpf_native_plain_return,.-bpf_native_plain_return\n"
+    ".popsection\n");
+
+void *bpf_x86_native_thunk(u32 selector, bool call);
+void *bpf_x86_native_thunk(u32 selector, bool call)
+{
+    if (selector == 16)
+        return cpu_wants_rethunk() ? (void *)x86_return_thunk :
+                                    (void *)bpf_native_plain_return;
+    if (selector >= 16)
+        return ERR_PTR(-EINVAL);
+    if (cpu_feature_enabled(X86_FEATURE_INDIRECT_THUNK_ITS))
+        return its_static_thunk(selector);
+#ifdef CONFIG_MITIGATION_CALL_DEPTH_TRACKING
+    if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
+        !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE) &&
+        cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
+        return call ? (void *)__x86_indirect_call_thunk_array[selector] :
+                      (void *)__x86_indirect_jump_thunk_array[selector];
+#endif
+#ifdef CONFIG_MITIGATION_RETPOLINE
+    /* This array receives the stock LFENCE/retpoline/direct alternatives. */
+    return __x86_indirect_thunk_array[selector];
+#else
+    return ERR_PTR(-EOPNOTSUPP);
+#endif
+}
+EXPORT_SYMBOL_GPL(bpf_x86_native_thunk);
+
 #define BPF_TAIL_CALL_CNT_PTR_STACK_OFF(stack)	(-16 - round_up(stack, 8))
 
 /*
@@ -3715,49 +3752,6 @@ struct x64_jit_data {
 #define MAX_PASSES 20
 #define PADDING_PASSES (MAX_PASSES - 5)
 
-static DEFINE_SPINLOCK(bpf_native_lock);
-static struct bpf_native_image *bpf_native_pending;
-
-static void bpf_native_image_free(struct bpf_native_image *image)
-{
-	if (!image)
-		return;
-	put_task_struct(image->owner);
-	kvfree(image->bytes);
-	kvfree(image->relocs);
-	kvfree(image->sites);
-	kfree(image);
-}
-
-/* The next program the calling task verifies gets this image; NULL disarms. */
-void bpf_native_image_arm(struct bpf_native_image *image)
-{
-	struct bpf_native_image *old;
-
-	if (image)
-		image->owner = get_task_struct(current);
-	spin_lock(&bpf_native_lock);
-	old = bpf_native_pending;
-	bpf_native_pending = image;
-	spin_unlock(&bpf_native_lock);
-	bpf_native_image_free(old);
-}
-EXPORT_SYMBOL_NS_GPL(bpf_native_image_arm, "BPF_INTERNAL");
-
-static struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog)
-{
-	struct bpf_native_image *image;
-
-	spin_lock(&bpf_native_lock);
-	image = bpf_native_pending;
-	if (image && image->owner == current && !prog->is_func)
-		bpf_native_pending = NULL;
-	else
-		image = NULL;
-	spin_unlock(&bpf_native_lock);
-	return image;
-}
-
 static int bpf_native_relocate(const struct bpf_prog *prog,
 			       const struct bpf_native_image *native,
 			       u8 *rw, const u8 *rx)
@@ -3773,6 +3767,29 @@ static int bpf_native_relocate(const struct bpf_prog *prog,
 		int err;
 
 		switch (r->kind) {
+		case BPF_NATIVE_RELOC_X86_TAIL_COUNT:
+		case BPF_NATIVE_RELOC_X86_TAIL_STACK:
+			/* This wrapper's physical BPF stack depth is zero. */
+			if ((u64)r->offset + sizeof(rel) > native->len)
+				return -ERANGE;
+			rel = r->kind == BPF_NATIVE_RELOC_X86_TAIL_COUNT ? -16 : 0;
+			memcpy(rw + r->offset, &rel, sizeof(rel));
+			continue;
+		case BPF_NATIVE_RELOC_X86_THUNK: {
+			void *target = bpf_x86_native_thunk(r->target & 0xff,
+							(r->target & 0x100) != 0);
+
+			if (IS_ERR(target))
+				return PTR_ERR(target);
+			if ((u64)r->offset + sizeof(rel) > native->len)
+				return -ERANGE;
+			disp = (s64)(unsigned long)target - (s64)(rx + r->offset + 4);
+			rel = disp;
+			if (rel != disp)
+				return -ERANGE;
+			memcpy(rw + r->offset, &rel, sizeof(rel));
+			continue;
+		}
 		case BPF_NATIVE_RELOC_READONLY_DATA:
 			continue;
 		case BPF_NATIVE_RELOC_CALL_REL32:
@@ -3825,7 +3842,10 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	struct exception_table_entry *ex, *rw_ex;
 	u8 *image, *rw, *p, *body;
 	u32 i;
+	bool callee_regs[4];
 
+	for (i = 0; i < ARRAY_SIZE(callee_regs); i++)
+		callee_regs[i] = native->callee_saved_mask & BIT(i);
 	header = bpf_jit_binary_pack_alloc(size + native->nr_sites * sizeof(*ex),
 					   &image, align, &rw_header, &rw,
 					   jit_fill_hole);
@@ -3835,7 +3855,7 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	p = rw;
 	emit_prologue(&p, image, 0, bpf_prog_was_classic(prog),
 		      prog->aux->tail_call_reachable, false, false);
-	push_callee_regs(&p, all_callee_regs_used);
+	push_callee_regs(&p, callee_regs);
 	body = image + (p - rw);
 	memcpy(p, native->bytes, native->len);
 	if (bpf_native_relocate(prog, native, p, body)) {
@@ -3843,7 +3863,7 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 		goto out;
 	}
 	p += native->len;
-	pop_callee_regs(&p, all_callee_regs_used);
+	pop_callee_regs(&p, callee_regs);
 	*p++ = 0xC9; /* leave */
 	emit_return(&p, image + (p - rw));
 

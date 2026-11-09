@@ -3,6 +3,7 @@
  */
 #include <crypto/sha2.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/bpf_trace.h>
 #include <linux/bpf_lirc.h>
@@ -3084,6 +3085,10 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	err = security_bpf_prog_load(prog, attr, token, uattr.is_kernel);
 	if (err)
 		goto free_prog_sec;
+
+	err = bpf_native_image_prepare(prog);
+	if (err)
+		goto free_used_maps;
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
