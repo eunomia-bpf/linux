@@ -709,43 +709,6 @@ static void emit_return(u8 **pprog, u8 *ip)
 	*pprog = prog;
 }
 
-/* Compiler external thunks and native tail transfers use this same policy. */
-extern void bpf_native_plain_return(void);
-asm(".pushsection .text\n"
-    ".type bpf_native_plain_return,@function\n"
-    "bpf_native_plain_return:\n"
-    ANNOTATE_NOENDBR "\n"
-    ANNOTATE_RETPOLINE_SAFE "\n"
-    "ret\nint3\n"
-    ".size bpf_native_plain_return,.-bpf_native_plain_return\n"
-    ".popsection\n");
-
-void *bpf_x86_native_thunk(u32 selector, bool call);
-void *bpf_x86_native_thunk(u32 selector, bool call)
-{
-    if (selector == 16)
-        return cpu_wants_rethunk() ? (void *)x86_return_thunk :
-                                    (void *)bpf_native_plain_return;
-    if (selector >= 16)
-        return ERR_PTR(-EINVAL);
-    if (cpu_feature_enabled(X86_FEATURE_INDIRECT_THUNK_ITS))
-        return its_static_thunk(selector);
-#ifdef CONFIG_MITIGATION_CALL_DEPTH_TRACKING
-    if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
-        !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE) &&
-        cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
-        return call ? (void *)__x86_indirect_call_thunk_array[selector] :
-                      (void *)__x86_indirect_jump_thunk_array[selector];
-#endif
-#ifdef CONFIG_MITIGATION_RETPOLINE
-    /* This array receives the stock LFENCE/retpoline/direct alternatives. */
-    return __x86_indirect_thunk_array[selector];
-#else
-    return ERR_PTR(-EOPNOTSUPP);
-#endif
-}
-EXPORT_SYMBOL_GPL(bpf_x86_native_thunk);
-
 #define BPF_TAIL_CALL_CNT_PTR_STACK_OFF(stack)	(-16 - round_up(stack, 8))
 
 /*
@@ -3775,21 +3738,6 @@ static int bpf_native_relocate(const struct bpf_prog *prog,
 			rel = r->kind == BPF_NATIVE_RELOC_X86_TAIL_COUNT ? -16 : 0;
 			memcpy(rw + r->offset, &rel, sizeof(rel));
 			continue;
-		case BPF_NATIVE_RELOC_X86_THUNK: {
-			void *target = bpf_x86_native_thunk(r->target & 0xff,
-							(r->target & 0x100) != 0);
-
-			if (IS_ERR(target))
-				return PTR_ERR(target);
-			if ((u64)r->offset + sizeof(rel) > native->len)
-				return -ERANGE;
-			disp = (s64)(unsigned long)target - (s64)(rx + r->offset + 4);
-			rel = disp;
-			if (rel != disp)
-				return -ERANGE;
-			memcpy(rw + r->offset, &rel, sizeof(rel));
-			continue;
-		}
 		case BPF_NATIVE_RELOC_READONLY_DATA:
 			continue;
 		case BPF_NATIVE_RELOC_CALL_REL32:
