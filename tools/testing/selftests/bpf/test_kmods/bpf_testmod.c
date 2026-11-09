@@ -925,15 +925,66 @@ BTF_ID_FLAGS(func, bpf_kfunc_kasan_poison)
 BTF_ID_FLAGS(func, bpf_kfunc_kasan_unpoison)
 BTF_ID_FLAGS(func, bpf_testmod_oob_alloc, KF_ACQUIRE | KF_RET_NULL)
 BTF_ID_FLAGS(func, bpf_testmod_oob_free, KF_RELEASE)
+BTF_ID_FLAGS(func, bpf_testmod_inline_mov)
+BTF_ID_FLAGS(func, bpf_testmod_inline_xor)
+BTF_ID_FLAGS(func, bpf_testmod_inline_div)
 BTF_KFUNCS_END(bpf_testmod_common_kfunc_ids)
 
 BTF_ID_LIST(bpf_testmod_dtor_ids)
 BTF_ID(struct, bpf_testmod_ctx)
 BTF_ID(func, bpf_testmod_ctx_release_dtor)
 
+/*
+ * Kfuncs with a body. The JIT copies the first two and not the third, which
+ * divides, so that its body runs.
+ */
+__bpf_kfunc u64 bpf_testmod_inline_mov(u64 x)
+{
+	return x;
+}
+
+__bpf_kfunc u64 bpf_testmod_inline_xor(u64 a, u64 b)
+{
+	return a ^ b;
+}
+
+__bpf_kfunc u64 bpf_testmod_inline_div(u64 a, u64 b)
+{
+	return b ? a / b : 0;
+}
+
+BTF_ID_LIST(bpf_testmod_body_ids)
+BTF_ID(func, bpf_testmod_inline_mov)
+BTF_ID(func, bpf_testmod_inline_xor)
+BTF_ID(func, bpf_testmod_inline_div)
+
+static const struct bpf_insn mov_body[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+};
+
+static const struct bpf_insn xor_body[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_XOR, BPF_REG_0, BPF_REG_2),
+};
+
+static const struct bpf_insn div_body[] = {
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_DIV, BPF_REG_0, BPF_REG_2),
+};
+
+#define BODY(i, op)	{ &bpf_testmod_body_ids[i], op##_body, ARRAY_SIZE(op##_body) }
+
+static const struct bpf_kfunc_body bpf_testmod_bodies[] = {
+	BODY(0, mov),
+	BODY(1, xor),
+	BODY(2, div),
+};
+
 static const struct btf_kfunc_id_set bpf_testmod_common_kfunc_set = {
 	.owner = THIS_MODULE,
 	.set   = &bpf_testmod_common_kfunc_ids,
+	.bodies = bpf_testmod_bodies,
+	.body_cnt = ARRAY_SIZE(bpf_testmod_bodies),
 };
 
 __bpf_kfunc u64 bpf_kfunc_call_test1(struct sock *sk, u32 a, u64 b, u32 c, u64 d)

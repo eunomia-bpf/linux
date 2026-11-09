@@ -29,6 +29,7 @@
 #include <linux/task_work.h>
 #include <linux/irq_work.h>
 #include <linux/buildid.h>
+#include <linux/unaligned.h>
 
 #include "../../lib/kstrtox.h"
 
@@ -5000,6 +5001,47 @@ __bpf_kfunc int bpf_timer_cancel_async(struct bpf_timer *timer)
 	}
 }
 
+/*
+ * Kfuncs that BPF programs can use like instructions. The verifier checks
+ * each call as the kfunc's body below, and the JIT inlines native code for
+ * it where it can. Arguments named __k must be known constants.
+ */
+__bpf_kfunc u64 bpf_rol64(u64 x, u32 n__k)
+{
+	return rol64(x, n__k);
+}
+
+__bpf_kfunc u64 bpf_select64(u64 cond, u64 a, u64 b)
+{
+	return cond ? a : b;
+}
+
+__bpf_kfunc u64 bpf_extract64(u64 x, u32 start__k, u32 len__k)
+{
+	return x << (64 - start__k - len__k) >> (64 - len__k);
+}
+
+__bpf_kfunc u64 bpf_load_be64(const void *p, s32 off__k)
+{
+	return get_unaligned_be64(p + off__k);
+}
+
+__bpf_kfunc void bpf_prefetch(const void *p)
+{
+	/* not prefetch(), which boot-time alternatives may rewrite */
+	__builtin_prefetch(p);
+}
+
+__bpf_kfunc void bpf_copy16(void *dst, const void *src)
+{
+	memcpy(dst, src, 16);
+}
+
+__bpf_kfunc u64 bpf_lea64(u64 base, u64 index, u32 scale__k, s32 disp__k)
+{
+	return base + index * scale__k + disp__k;
+}
+
 __bpf_kfunc_end_defs();
 
 static void bpf_task_work_cancel_scheduled(struct irq_work *irq_work)
@@ -5205,11 +5247,104 @@ BTF_ID_FLAGS(func, bpf_call_rcu_tasks_trace, KF_IMPLICIT_ARGS)
 BTF_ID_FLAGS(func, bpf_dynptr_from_file)
 BTF_ID_FLAGS(func, bpf_dynptr_file_discard, KF_RELEASE)
 BTF_ID_FLAGS(func, bpf_timer_cancel_async)
+BTF_ID_FLAGS(func, bpf_rol64)
+BTF_ID_FLAGS(func, bpf_select64)
+BTF_ID_FLAGS(func, bpf_extract64)
+BTF_ID_FLAGS(func, bpf_load_be64)
+BTF_ID_FLAGS(func, bpf_prefetch)
+BTF_ID_FLAGS(func, bpf_copy16)
+BTF_ID_FLAGS(func, bpf_lea64)
 BTF_KFUNCS_END(common_btf_ids)
 
+/* x << n | x >> (-n & 63) */
+static const struct bpf_insn rol64_body[] = {
+	BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 63),
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_LSH, BPF_REG_0, BPF_REG_2),
+	BPF_ALU64_IMM(BPF_NEG, BPF_REG_2, 0),
+	BPF_ALU64_IMM(BPF_AND, BPF_REG_2, 63),
+	BPF_ALU64_REG(BPF_RSH, BPF_REG_1, BPF_REG_2),
+	BPF_ALU64_REG(BPF_OR, BPF_REG_0, BPF_REG_1),
+};
+
+/* the jump lands within the body, here on its last instruction */
+static const struct bpf_insn select64_body[] = {
+	BPF_JMP_IMM(BPF_JNE, BPF_REG_1, 0, 1),
+	BPF_MOV64_REG(BPF_REG_2, BPF_REG_3),
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_2),
+};
+
+/* x << (64 - start - len) >> (64 - len) */
+static const struct bpf_insn extract64_body[] = {
+	BPF_MOV32_IMM(BPF_REG_4, 64),
+	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_2),
+	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_3),
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_REG(BPF_LSH, BPF_REG_0, BPF_REG_4),
+	BPF_MOV32_IMM(BPF_REG_4, 64),
+	BPF_ALU32_REG(BPF_SUB, BPF_REG_4, BPF_REG_3),
+	BPF_ALU64_REG(BPF_RSH, BPF_REG_0, BPF_REG_4),
+};
+
+/* the offset is an s32 */
+static const struct bpf_insn load_be64_body[] = {
+	BPF_ALU64_IMM(BPF_LSH, BPF_REG_2, 32),
+	BPF_ALU64_IMM(BPF_ARSH, BPF_REG_2, 32),
+	BPF_ALU64_REG(BPF_ADD, BPF_REG_1, BPF_REG_2),
+	BPF_LDX_MEM(BPF_DW, BPF_REG_0, BPF_REG_1, 0),
+	BPF_ENDIAN(BPF_TO_BE, BPF_REG_0, 64),
+};
+
+/* a load whose value is not used, of memory that the program may read */
+static const struct bpf_insn prefetch_body[] = {
+	BPF_LDX_MEM(BPF_B, BPF_REG_1, BPF_REG_1, 0),
+};
+
+/* two loads, then two stores */
+static const struct bpf_insn copy16_body[] = {
+	BPF_LDX_MEM(BPF_DW, BPF_REG_4, BPF_REG_2, 0),
+	BPF_LDX_MEM(BPF_DW, BPF_REG_5, BPF_REG_2, 8),
+	BPF_STX_MEM(BPF_DW, BPF_REG_1, BPF_REG_4, 0),
+	BPF_STX_MEM(BPF_DW, BPF_REG_1, BPF_REG_5, 8),
+};
+
+/* base + index * scale + disp, scale a u32 and disp an s32 */
+static const struct bpf_insn lea64_body[] = {
+	BPF_MOV32_REG(BPF_REG_3, BPF_REG_3),
+	BPF_MOV64_REG(BPF_REG_0, BPF_REG_2),
+	BPF_ALU64_REG(BPF_MUL, BPF_REG_0, BPF_REG_3),
+	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_1),
+	BPF_ALU64_IMM(BPF_LSH, BPF_REG_4, 32),
+	BPF_ALU64_IMM(BPF_ARSH, BPF_REG_4, 32),
+	BPF_ALU64_REG(BPF_ADD, BPF_REG_0, BPF_REG_4),
+};
+
+BTF_ID_LIST(kfunc_body_ids)
+BTF_ID(func, bpf_rol64)
+BTF_ID(func, bpf_select64)
+BTF_ID(func, bpf_extract64)
+BTF_ID(func, bpf_load_be64)
+BTF_ID(func, bpf_prefetch)
+BTF_ID(func, bpf_copy16)
+BTF_ID(func, bpf_lea64)
+
+#define KFUNC_BODY(i, op)	{ &kfunc_body_ids[i], op##_body, ARRAY_SIZE(op##_body) }
+
+static const struct bpf_kfunc_body common_kfunc_bodies[] = {
+	KFUNC_BODY(0, rol64),
+	KFUNC_BODY(1, select64),
+	KFUNC_BODY(2, extract64),
+	KFUNC_BODY(3, load_be64),
+	KFUNC_BODY(4, prefetch),
+	KFUNC_BODY(5, copy16),
+	KFUNC_BODY(6, lea64),
+};
+
 static const struct btf_kfunc_id_set common_kfunc_set = {
-	.owner = THIS_MODULE,
-	.set   = &common_btf_ids,
+	.owner    = THIS_MODULE,
+	.set      = &common_btf_ids,
+	.bodies   = common_kfunc_bodies,
+	.body_cnt = ARRAY_SIZE(common_kfunc_bodies),
 };
 
 static int __init kfunc_init(void)
