@@ -577,9 +577,33 @@ static int emit_call(u8 **pprog, void *func, void *ip)
 	return emit_patch(pprog, func, ip, 0xE8);
 }
 
+static u32 kinsn_program_exentries(const struct bpf_prog *prog)
+{
+    u32 count = 0, i;
+    for (i = 0; i < prog->len; i++) {
+        const struct bpf_insn *insn = &prog->insnsi[i];
+        u8 cls = BPF_CLASS(insn->code), mode = BPF_MODE(insn->code);
+        if ((cls == BPF_LDX && (mode == BPF_PROBE_MEM || mode == BPF_PROBE_MEMSX ||
+             mode == BPF_PROBE_MEM32 || mode == BPF_PROBE_MEM32SX)) ||
+            ((cls == BPF_ST || cls == BPF_STX) && mode == BPF_PROBE_MEM32) ||
+            (cls == BPF_STX && mode == BPF_PROBE_ATOMIC))
+            count++;
+        if (insn->code == (BPF_JMP | BPF_CALL) &&
+            insn->src_reg == BPF_PSEUDO_KINSN_CALL) {
+            const struct bpf_kinsn *kinsn;
+            u64 payload;
+            if (!bpf_jit_get_kinsn_payload(prog, insn, &kinsn, &payload) &&
+                kinsn->native_proof && kinsn->num_exentries)
+                count += kinsn->num_exentries(payload);
+        }
+    }
+    return count;
+}
+
 static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
 				const struct bpf_insn *insn, bool emit,
-				const u8 *final_ip)
+				const u8 *final_ip, u8 **native_image,
+				int *native_len)
 {
 	const struct bpf_kinsn *kinsn;
 	u8 scratch[BPF_MAX_INSN_SIZE];
@@ -593,6 +617,27 @@ static int emit_kinsn_desc_call(u8 **pprog, const struct bpf_prog *bpf_prog,
 		return ret;
 	if (!kinsn || !kinsn->emit_x86)
 		return -EOPNOTSUPP;
+	if (kinsn->native_proof) {
+		ret = kinsn->emit_x86(NULL, &off, false, payload, bpf_prog, NULL);
+		if (ret < 0)
+			return ret;
+		*native_len = off;
+		if (!emit)
+			return 0;
+		*native_image = kvzalloc(off, GFP_KERNEL);
+		if (!*native_image)
+			return -ENOMEM;
+		off = 0;
+		ret = kinsn->emit_x86(*native_image, &off, true, payload,
+				      bpf_prog, final_ip);
+		if (ret < 0) {
+			kvfree(*native_image);
+			*native_image = NULL;
+			return ret;
+		}
+		*native_len = off;
+		return 0;
+	}
 	if (kinsn->max_emit_bytes > BPF_MAX_INSN_SIZE)
 		return -E2BIG;
 
@@ -739,6 +784,44 @@ static void emit_return(u8 **pprog, u8 *ip)
 
 	*pprog = prog;
 }
+
+
+/* Compiler external thunks and native tail transfers use this same policy. */
+extern void bpf_native_plain_return(void);
+asm(".pushsection .text\n"
+    ".type bpf_native_plain_return,@function\n"
+    "bpf_native_plain_return:\n"
+    ANNOTATE_NOENDBR "\n"
+    ANNOTATE_RETPOLINE_SAFE "\n"
+    "ret\nint3\n"
+    ".size bpf_native_plain_return,.-bpf_native_plain_return\n"
+    ".popsection\n");
+
+void *bpf_x86_native_thunk(u32 selector, bool call);
+void *bpf_x86_native_thunk(u32 selector, bool call)
+{
+    if (selector == 16)
+        return cpu_wants_rethunk() ? (void *)x86_return_thunk :
+                                    (void *)bpf_native_plain_return;
+    if (selector >= 16)
+        return ERR_PTR(-EINVAL);
+    if (cpu_feature_enabled(X86_FEATURE_INDIRECT_THUNK_ITS))
+        return its_static_thunk(selector);
+#ifdef CONFIG_MITIGATION_CALL_DEPTH_TRACKING
+    if (cpu_feature_enabled(X86_FEATURE_RETPOLINE) &&
+        !cpu_feature_enabled(X86_FEATURE_RETPOLINE_LFENCE) &&
+        cpu_feature_enabled(X86_FEATURE_CALL_DEPTH))
+        return call ? (void *)__x86_indirect_call_thunk_array[selector] :
+                      (void *)__x86_indirect_jump_thunk_array[selector];
+#endif
+#ifdef CONFIG_MITIGATION_RETPOLINE
+    /* This array receives the stock LFENCE/retpoline/direct alternatives. */
+    return __x86_indirect_thunk_array[selector];
+#else
+    return ERR_PTR(-EOPNOTSUPP);
+#endif
+}
+EXPORT_SYMBOL_GPL(bpf_x86_native_thunk);
 
 #define BPF_TAIL_CALL_CNT_PTR_STACK_OFF(stack)	(-16 - round_up(stack, 8))
 
@@ -1813,8 +1896,8 @@ static int do_jit(struct bpf_prog *bpf_prog, int *addrs, u8 *image, u8 *rw_image
 		s64 jmp_offset;
 		s16 insn_off;
 		u8 jmp_cond;
-		u8 *func;
-		int nops;
+		u8 *func, *native_image = NULL;
+		int nops, native_len = -1;
 
 		if (priv_frame_ptr) {
 			if (src_reg == BPF_REG_FP)
@@ -2561,9 +2644,24 @@ populate_extable:
 			if (src_reg == BPF_PSEUDO_KINSN_CALL) {
 				err = emit_kinsn_desc_call(&prog, bpf_prog, insn,
 							    !!rw_image,
-							    image ? ip : NULL);
+							    image ? ip : NULL,
+							    &native_image, &native_len);
 				if (err)
 					return err;
+                if (rw_image) {
+                    const struct bpf_kinsn *kinsn;
+                    struct exception_table_entry *ex;
+                    u64 payload;
+                    err = bpf_jit_get_kinsn_payload(bpf_prog, insn, &kinsn, &payload);
+                    if (err) return err;
+                    if (kinsn->native_proof && kinsn->emit_exentries) {
+                        ex = &bpf_prog->aux->extable[excnt];
+                        err = kinsn->emit_exentries(payload,
+                            rw_image + ((u8 *)ex - image), ex, ip);
+                        if (err < 0) { kvfree(native_image); return err; }
+                        excnt += err;
+                    }
+                }
 				break;
 			}
 			if (src_reg == BPF_PSEUDO_CALL && tail_call_reachable) {
@@ -2882,8 +2980,8 @@ emit_jmp:
 			return -EINVAL;
 		}
 
-		ilen = prog - temp;
-		if (ilen > BPF_MAX_INSN_SIZE) {
+		ilen = native_len >= 0 ? native_len : prog - temp;
+		if (native_len < 0 && ilen > BPF_MAX_INSN_SIZE) {
 			pr_err("bpf_jit: fatal insn size error\n");
 			return -EFAULT;
 		}
@@ -2900,10 +2998,12 @@ emit_jmp:
 			if (unlikely(proglen + ilen > oldproglen ||
 				     proglen + ilen != addrs[i])) {
 				pr_err("bpf_jit: fatal error\n");
+				kvfree(native_image);
 				return -EFAULT;
 			}
-			memcpy(rw_image + proglen, temp, ilen);
+			memcpy(rw_image + proglen, native_image ? native_image : temp, ilen);
 		}
+		kvfree(native_image);
 		proglen += ilen;
 		addrs[i] = proglen;
 		prog = temp;
@@ -3931,6 +4031,7 @@ skip_init_addrs:
 	 * may converge on the last pass. In such case do one more
 	 * pass to emit the final image.
 	 */
+	prog->aux->num_exentries = kinsn_program_exentries(prog);
 	for (pass = 0; pass < MAX_PASSES || image; pass++) {
 		if (!padding && pass >= PADDING_PASSES)
 			padding = true;

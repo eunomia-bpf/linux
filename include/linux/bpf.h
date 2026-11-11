@@ -972,10 +972,9 @@ struct bpf_kinsn {
 	u16 native_stack_depth;
 	/* Full verifier-facing native artifact, rather than an instruction slice. */
 	bool native_proof;
-	int (*validate_native_program)(u64 payload, const struct bpf_prog *prog);
-	int (*validate_native_proof)(u64 payload, const struct bpf_verifier_env *env);
 
 	int (*instantiate_insn)(u64 payload, struct bpf_insn *insn_buf);
+
 
 	int (*emit_x86)(u8 *image, u32 *off, bool emit,
 			u64 payload, const struct bpf_prog *prog,
@@ -983,6 +982,9 @@ struct bpf_kinsn {
 	int (*emit_arm64)(u32 *image, int *idx, bool emit,
 			  u64 payload, const struct bpf_prog *prog,
 			  const u32 *final_ip);
+    u32 (*num_exentries)(u64 payload);
+    int (*emit_exentries)(u64 payload, void *rw_table, const void *rx_table,
+                         const void *native_ip);
 };
 
 /* Native artifacts query their generation-bound size with a NULL buffer.
@@ -993,7 +995,7 @@ static inline int bpf_kinsn_proof_capacity(const struct bpf_kinsn *kinsn, u64 pa
 	int count = kinsn->native_proof ?
 		kinsn->instantiate_insn(payload, NULL) : kinsn->max_insn_cnt;
 
-	if (count <= 0 || count > kinsn->max_insn_cnt)
+	if (count <= 0)
 		return count < 0 ? count : -EINVAL;
 	return count;
 }
