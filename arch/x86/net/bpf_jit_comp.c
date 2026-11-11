@@ -3801,8 +3801,6 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	emit_prologue(&p, image, 0, bpf_prog_was_classic(prog),
 		      prog->aux->tail_call_reachable, false, false);
 	push_callee_regs(&p, callee_regs);
-	push_r12(&p);
-	*p++ = 0x55; /* preserve the frame pointer across P */
 	body = image + (p - rw);
 	memcpy(p, native->bytes, native->len);
 	if (bpf_native_relocate(prog, native, p, body)) {
@@ -3810,8 +3808,6 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 		goto out;
 	}
 	p += native->len;
-	*p++ = 0x5D; /* recover the stock frame pointer before leave */
-	pop_r12(&p);
 	pop_callee_regs(&p, callee_regs);
 	*p++ = 0xC9; /* leave */
 	emit_return(&p, image + (p - rw));
