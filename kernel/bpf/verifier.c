@@ -23071,6 +23071,10 @@ static int fixup_call_args(struct bpf_verifier_env *env)
 #endif
 	int err = 0;
 
+	/* B has been verified; the architecture JIT emits the program's image. */
+	if (env->prog->aux->native_image)
+		return 0;
+
 	if (env->prog->jit_requested &&
 	    !bpf_prog_is_offloaded(env->prog->aux)) {
 		err = jit_subprogs(env);

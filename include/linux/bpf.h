@@ -1656,6 +1656,7 @@ struct bpf_stream_stage {
 
 struct bpf_prog_aux {
 	atomic64_t refcnt;
+	struct bpf_native_image *native_image;
 	u32 used_map_cnt;
 	u32 used_btf_cnt;
 	u32 max_ctx_offset;

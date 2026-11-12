@@ -1582,6 +1582,9 @@ struct task_struct {
 	/* Used for BPF run context */
 	struct bpf_run_ctx		*bpf_ctx;
 #endif
+#ifdef CONFIG_BPF
+	struct bpf_native_image		*bpf_native_image;
+#endif
 	/* Used by BPF for per-TASK xdp storage */
 	struct bpf_net_context		*bpf_net_context;
 

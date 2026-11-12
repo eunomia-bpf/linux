@@ -46,46 +46,40 @@
 #include <asm/barrier.h>
 #include <linux/unaligned.h>
 
-static DEFINE_SPINLOCK(bpf_native_lock);
-static struct bpf_native_image *bpf_native_pending;
-
 void bpf_native_image_free(struct bpf_native_image *image)
 {
 	if (!image)
 		return;
-	put_task_struct(image->owner);
 	kvfree(image->bytes);
 	kvfree(image->relocs);
 	kvfree(image->sites);
 	kfree(image);
 }
 
-/* The next program the calling task verifies gets this image; NULL disarms. */
+/* Pending images belong to the uploading task until an explicit load binds one. */
 void bpf_native_image_arm(struct bpf_native_image *image)
 {
-	struct bpf_native_image *old;
+	struct bpf_native_image *old = current->bpf_native_image;
 
-	if (image)
-		image->owner = get_task_struct(current);
-	spin_lock(&bpf_native_lock);
-	old = bpf_native_pending;
-	bpf_native_pending = image;
-	spin_unlock(&bpf_native_lock);
+	current->bpf_native_image = image;
 	bpf_native_image_free(old);
 }
 EXPORT_SYMBOL_NS_GPL(bpf_native_image_arm, "BPF_INTERNAL");
 
+int bpf_native_image_bind(struct bpf_prog *prog)
+{
+	if (!current->bpf_native_image)
+		return -ENOENT;
+	prog->aux->native_image = current->bpf_native_image;
+	current->bpf_native_image = NULL;
+	return 0;
+}
+
 struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog)
 {
-	struct bpf_native_image *image;
+	struct bpf_native_image *image = prog->aux->native_image;
 
-	spin_lock(&bpf_native_lock);
-	image = bpf_native_pending;
-	if (image && image->owner == current && !prog->is_func)
-		bpf_native_pending = NULL;
-	else
-		image = NULL;
-	spin_unlock(&bpf_native_lock);
+	prog->aux->native_image = NULL;
 	return image;
 }
 
@@ -2951,6 +2945,7 @@ static void bpf_prog_free_deferred(struct work_struct *work)
 	int i;
 
 	aux = container_of(work, struct bpf_prog_aux, work);
+	bpf_native_image_free(aux->native_image);
 #ifdef CONFIG_BPF_SYSCALL
 	bpf_free_kfunc_btf_tab(aux->kfunc_btf_tab);
 	bpf_prog_stream_free(aux->prog);

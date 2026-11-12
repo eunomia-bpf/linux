@@ -4,7 +4,6 @@
 
 #include <linux/types.h>
 
-struct task_struct;
 struct bpf_prog;
 
 #define BPF_NATIVE_RELOC_CALL_REL32	1
@@ -36,11 +35,11 @@ struct bpf_native_image {
 	const struct bpf_native_reloc *relocs;
 	const struct bpf_native_site *sites;
 	u32 len, nr_relocs, nr_sites, callee_saved_mask;
-	struct task_struct *owner;
 };
 
 void bpf_native_image_arm(struct bpf_native_image *image);
 void bpf_native_image_free(struct bpf_native_image *image);
+int bpf_native_image_bind(struct bpf_prog *prog);
 struct bpf_native_image *bpf_native_image_take(const struct bpf_prog *prog);
 
 #endif

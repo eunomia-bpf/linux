@@ -3,6 +3,7 @@
  */
 #include <crypto/sha2.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
 #include <linux/bpf-cgroup.h>
 #include <linux/bpf_trace.h>
 #include <linux/bpf_lirc.h>
@@ -2889,7 +2890,8 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 				 BPF_F_XDP_HAS_FRAGS |
 				 BPF_F_XDP_DEV_BOUND_ONLY |
 				 BPF_F_TEST_REG_INVARIANTS |
-				 BPF_F_TOKEN_FD))
+				 BPF_F_TOKEN_FD |
+				 BPF_F_NATIVE_IMAGE))
 		return -EINVAL;
 
 	bpf_prog_load_fixup_attach_type(attr);
@@ -3084,6 +3086,13 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	err = security_bpf_prog_load(prog, attr, token, uattr.is_kernel);
 	if (err)
 		goto free_prog_sec;
+	if (attr->prog_flags & BPF_F_NATIVE_IMAGE) {
+		err = bpf_native_image_bind(prog);
+		if (err) {
+			pr_warn_ratelimited("bpf: native image load has no image armed by this task\n");
+			goto free_prog_sec;
+		}
+	}
 
 	/* run eBPF verifier */
 	err = bpf_check(&prog, attr, uattr, uattr_size);
@@ -3093,6 +3102,12 @@ static int bpf_prog_load(union bpf_attr *attr, bpfptr_t uattr, u32 uattr_size)
 	prog = bpf_prog_select_runtime(prog, &err);
 	if (err < 0)
 		goto free_used_maps;
+	if ((attr->prog_flags & BPF_F_NATIVE_IMAGE) &&
+	    (!prog->jited || prog->aux->native_image)) {
+		pr_warn_ratelimited("bpf: native image JIT emission failed\n");
+		err = -EOPNOTSUPP;
+		goto free_used_maps;
+	}
 
 	err = bpf_prog_mark_insn_arrays_ready(prog);
 	if (err < 0)

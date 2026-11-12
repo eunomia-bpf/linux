@@ -99,6 +99,7 @@
 #include <linux/io_uring.h>
 #include <linux/io_uring_types.h>
 #include <linux/bpf.h>
+#include <linux/bpf_native.h>
 #include <linux/stackprotector.h>
 #include <linux/user_events.h>
 #include <linux/iommu.h>
@@ -553,6 +554,9 @@ void free_task(struct task_struct *tsk)
 	if (tsk->flags & PF_KTHREAD)
 		free_kthread_struct(tsk);
 	bpf_task_storage_free(tsk);
+#ifdef CONFIG_BPF
+	bpf_native_image_free(tsk->bpf_native_image);
+#endif
 	free_task_struct(tsk);
 }
 EXPORT_SYMBOL(free_task);
@@ -920,6 +924,9 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 	err = arch_dup_task_struct(tsk, orig);
 	if (err)
 		goto free_tsk;
+#ifdef CONFIG_BPF
+	tsk->bpf_native_image = NULL;
+#endif
 
 	err = alloc_thread_stack_node(tsk, node);
 	if (err)
