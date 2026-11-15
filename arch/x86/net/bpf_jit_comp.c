@@ -3767,13 +3767,14 @@ static int bpf_native_relocate(const struct bpf_prog *prog,
 					return err;
 				value += r->target >> 32;
 			}
-			fallthrough;
+			goto write_pointer;
 		case BPF_NATIVE_RELOC_IMAGE_POINTER:
 			if (r->target >= native->len)
 				return -ERANGE;
 			value = (unsigned long)(rx + r->target);
 			fallthrough;
 		case BPF_NATIVE_RELOC_HELPER_POINTER:
+		write_pointer:
 			if ((u64)r->offset + sizeof(value) > native->len)
 				return -ERANGE;
 			memcpy(rw + r->offset, &value, sizeof(value));
