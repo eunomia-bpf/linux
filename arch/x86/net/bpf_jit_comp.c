@@ -3768,6 +3768,11 @@ static int bpf_native_relocate(const struct bpf_prog *prog,
 				value += r->target >> 32;
 			}
 			fallthrough;
+		case BPF_NATIVE_RELOC_IMAGE_POINTER:
+			if (r->target >= native->len)
+				return -ERANGE;
+			value = (unsigned long)(rx + r->target);
+			fallthrough;
 		case BPF_NATIVE_RELOC_HELPER_POINTER:
 			if ((u64)r->offset + sizeof(value) > native->len)
 				return -ERANGE;
