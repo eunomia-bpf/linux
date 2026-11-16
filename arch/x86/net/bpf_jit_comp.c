@@ -3796,7 +3796,9 @@ static struct bpf_prog *bpf_native_jit(struct bpf_prog *prog,
 	struct exception_table_entry *ex, *rw_ex;
 	u8 *image, *rw, *p, *body;
 	u32 i;
-	bool callee_regs[4] = { true, true, true, true };
+	bool callee_regs[4];
+	for (i = 0; i < ARRAY_SIZE(callee_regs); i++)
+		callee_regs[i] = native->callee_saved_mask & BIT(i);
 	header = bpf_jit_binary_pack_alloc(size + native->nr_sites * sizeof(*ex),
 					   &image, align, &rw_header, &rw,
 					   jit_fill_hole);
